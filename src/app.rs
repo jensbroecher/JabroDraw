@@ -203,6 +203,11 @@ pub struct JabroApp {
     /// Light type a Lights-tool click adds, and the light being edited.
     new_light_kind: LightKind,
     light_sel: Option<usize>,
+    /// The document as it was last saved / opened (to detect unsaved changes).
+    saved_doc: Document,
+    close_dialog: bool,
+    allow_close: bool,
+    title: String,
     tool: Tool,
     color_a: Rgba,
     color_b: Rgba,
@@ -250,6 +255,7 @@ impl JabroApp {
     fn with_worker(worker: NprWorker) -> Self {
         let doc = demo::demo_document();
         let (new_w, new_h) = (doc.width, doc.height);
+        let saved_doc = doc.clone();
         Self {
             doc,
             selected: None,
@@ -262,6 +268,10 @@ impl JabroApp {
             trans_kind: TransparencyKind::Linear,
             new_light_kind: LightKind::Point,
             light_sel: None,
+            saved_doc,
+            close_dialog: false,
+            allow_close: false,
+            title: String::new(),
             tool: Tool::Select,
             color_a: [220, 60, 50, 255],
             color_b: [40, 90, 200, 255],
@@ -642,6 +652,7 @@ impl JabroApp {
 
     fn replace_doc(&mut self, doc: Document) {
         self.checkpoint();
+        self.saved_doc = doc.clone();
         self.doc = doc;
         self.renderer.clear();
         self.selected = None;
@@ -677,7 +688,8 @@ impl JabroApp {
         }
     }
 
-    fn save(&mut self, save_as: bool) {
+    /// Returns true when the document was written.
+    fn save(&mut self, save_as: bool) -> bool {
         let path = match (&self.path, save_as) {
             (Some(p), false) => p.clone(),
             _ => {
@@ -686,7 +698,7 @@ impl JabroApp {
                     .set_file_name("drawing.jabro")
                     .save_file()
                 else {
-                    return;
+                    return false;
                 };
                 p
             }
@@ -695,8 +707,88 @@ impl JabroApp {
             Ok(()) => {
                 self.status = format!("Saved {}", path.display());
                 self.path = Some(path);
+                self.saved_doc = self.doc.clone();
+                true
             }
-            Err(e) => self.status = format!("Could not save: {e}"),
+            Err(e) => {
+                self.status = format!("Could not save: {e}");
+                false
+            }
+        }
+    }
+
+    fn has_unsaved_changes(&self) -> bool {
+        self.pen.is_some() || !self.doc.same_content(&self.saved_doc)
+    }
+
+    fn doc_name(&self) -> String {
+        self.path
+            .as_ref()
+            .and_then(|p| p.file_stem())
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "Untitled".into())
+    }
+
+    /// Window close (X button, Alt+F4 or File › Quit): ask first if there is unsaved work.
+    fn handle_close(&mut self, ctx: &egui::Context) {
+        if ctx.input(|i| i.viewport().close_requested()) && !self.allow_close && self.has_unsaved_changes() {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.close_dialog = true;
+        }
+        if !self.close_dialog {
+            return;
+        }
+        let mut choice = None;
+        let modal = egui::Modal::new(egui::Id::new("close_dialog")).show(ctx, |ui| {
+            ui.set_width(340.0);
+            ui.heading("Save changes?");
+            ui.add_space(6.0);
+            ui.label(format!("“{}” has changes that are not saved yet.", self.doc_name()));
+            ui.add_space(10.0);
+            ui.horizontal(|ui| {
+                if ui.button("  Save  ").clicked() {
+                    choice = Some(0);
+                }
+                if ui.button("Don't save").clicked() {
+                    choice = Some(1);
+                }
+                if ui.button("Cancel").clicked() {
+                    choice = Some(2);
+                }
+            });
+        });
+        if modal.should_close() && choice.is_none() {
+            choice = Some(2);
+        }
+        match choice {
+            Some(0) => {
+                if self.save(false) {
+                    self.close_dialog = false;
+                    self.allow_close = true;
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+                // save dialog cancelled or failed: keep the question open
+            }
+            Some(1) => {
+                self.close_dialog = false;
+                self.allow_close = true;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+            Some(_) => self.close_dialog = false,
+            None => {}
+        }
+    }
+
+    /// "name* — Jabro Draw" while there are unsaved changes.
+    fn update_title(&mut self, ctx: &egui::Context) {
+        let title = format!(
+            "{}{} — Jabro Draw",
+            self.doc_name(),
+            if self.has_unsaved_changes() { "*" } else { "" }
+        );
+        if title != self.title {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Title(title.clone()));
+            self.title = title;
         }
     }
 
@@ -3161,6 +3253,8 @@ fn doc_props(
 
 impl eframe::App for JabroApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.handle_close(ctx);
+        self.update_title(ctx);
         self.shortcuts(ctx);
         self.read_pressure(ctx);
         egui::TopBottomPanel::top("menu").show(ctx, |ui| self.menu_bar(ui, ctx));
@@ -3453,6 +3547,23 @@ mod tests {
         let s = &app.doc.objects[0].effects.lighting.lights[1];
         assert_eq!(s.kind, LightKind::Spot);
         assert!((s.pos[0] - 0.1).abs() < 1e-3 && (s.target[1] - 0.9).abs() < 1e-3, "{s:?}");
+    }
+
+    #[test]
+    fn unsaved_changes_are_tracked_until_saved() {
+        let mut app = app_with(vec![rect(1, 10.0, 10.0)]);
+        app.saved_doc = app.doc.clone();
+        assert!(!app.has_unsaved_changes());
+        app.tool = Tool::Select;
+        drag(&mut app, Pt::new(20.0, 20.0), Pt::new(60.0, 20.0), Modifiers::NONE);
+        assert!(app.has_unsaved_changes(), "moving an object is a change");
+        let path = std::env::temp_dir().join("jabro_close_test.jabro");
+        app.path = Some(path.clone());
+        assert!(app.save(false));
+        let _ = std::fs::remove_file(&path);
+        assert!(!app.has_unsaved_changes(), "saving clears it");
+        app.undo();
+        assert!(app.has_unsaved_changes(), "undoing past the save is a change again");
     }
 
     #[test]
