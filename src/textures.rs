@@ -125,6 +125,8 @@ pub fn sample(kind: TextureKind, x: f32, y: f32, seed: u32) -> f32 {
             let speck = fbm(x / 4.0, y / 4.0, seed + 9, 2);
             (border * (tone * 0.8 + speck * 0.2)).clamp(0.0, 1.0)
         }
+        // pictures are sampled by the renderer itself
+        TextureKind::Image => 0.5,
     }
 }
 

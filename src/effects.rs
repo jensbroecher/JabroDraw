@@ -357,10 +357,15 @@ pub fn transparency_at(t: &Transparency, x: f32, y: f32, f: &LightFrame, seed: u
             lerp((px - p0).dot(d) / d.dot(d).max(1e-6))
         }
         TransparencyKind::Radial => lerp(px.dist(p0) / p1.dist(p0).max(1e-3)),
-        TransparencyKind::Texture => {
-            let s = 1.0 / t.tex_scale.max(0.05);
-            lerp(crate::textures::sample(t.texture, x * s, y * s, seed))
-        }
+        TransparencyKind::Texture => match (&t.texture, &t.image) {
+            (crate::doc::TextureKind::Image, Some(img)) => {
+                lerp(crate::imageops::luminance_at(&img.0, px.x, px.y, f.w, f.h))
+            }
+            _ => {
+                let s = 1.0 / t.tex_scale.max(0.05);
+                lerp(crate::textures::sample(t.texture, x * s, y * s, seed))
+            }
+        },
     }
     .clamp(0.0, 1.0)
 }

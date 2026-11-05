@@ -11,15 +11,24 @@ pub enum BrushKind {
     Chalk,
     Smudge,
     Eraser,
+    /// Paints the object's transparency mask: hides what is under the brush.
+    Hide,
+    /// Paints the mask back: reveals hidden parts again.
+    Reveal,
+    /// Click to hide a connected area of similar colour (pictures / paint layers).
+    MagicWand,
 }
 
 impl BrushKind {
-    pub const ALL: [BrushKind; 5] = [
+    pub const ALL: [BrushKind; 8] = [
         BrushKind::Round,
         BrushKind::Airbrush,
         BrushKind::Chalk,
         BrushKind::Smudge,
         BrushKind::Eraser,
+        BrushKind::Hide,
+        BrushKind::Reveal,
+        BrushKind::MagicWand,
     ];
     pub fn label(self) -> &'static str {
         match self {
@@ -27,8 +36,15 @@ impl BrushKind {
             BrushKind::Airbrush => "Airbrush",
             BrushKind::Chalk => "Chalk",
             BrushKind::Smudge => "Smudge",
-            BrushKind::Eraser => "Eraser",
+            BrushKind::Eraser => "Eraser (deletes paint)",
+            BrushKind::Hide => "Transparency: hide",
+            BrushKind::Reveal => "Transparency: reveal",
+            BrushKind::MagicWand => "Magic wand (click to hide an area)",
         }
+    }
+    /// Works on the transparency mask instead of the paint.
+    pub fn is_mask(self) -> bool {
+        matches!(self, BrushKind::Hide | BrushKind::Reveal)
     }
 }
 

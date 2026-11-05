@@ -4,7 +4,9 @@
 //!   -> canvas layer (projective warp + drop shadow + glow)                — cached by placement
 //!   -> composite onto the document.
 
-use crate::doc::{DashKind, Document, FillKind, FillStyle, LightKind, Object, StrokePos, StrokeStyle};
+use crate::doc::{
+    DashKind, Document, FillKind, FillStyle, LightKind, Object, StrokePos, StrokeStyle, TextureKind,
+};
 use crate::effects;
 use crate::geom::{point_in_poly, Pt};
 use crate::raster;
@@ -34,7 +36,13 @@ fn color(c: [u8; 4]) -> Color {
     Color::from_rgba8(c[0], c[1], c[2], c[3])
 }
 
-fn fill_shader_paint<'a>(fill: &FillStyle, w: f32, h: f32, pad: f32, tex: Option<&'a Pixmap>) -> Option<Paint<'a>> {
+fn fill_shader_paint<'a>(
+    fill: &FillStyle,
+    w: f32,
+    h: f32,
+    pad: f32,
+    tex: Option<(&'a Pixmap, Transform)>,
+) -> Option<Paint<'a>> {
     let mut paint = Paint {
         anti_alias: true,
         ..Default::default()
@@ -69,14 +77,8 @@ fn fill_shader_paint<'a>(fill: &FillStyle, w: f32, h: f32, pad: f32, tex: Option
             )?;
         }
         FillKind::Texture => {
-            let t = tex?;
-            paint.shader = Pattern::new(
-                t.as_ref(),
-                SpreadMode::Repeat,
-                FilterQuality::Nearest,
-                1.0,
-                Transform::identity(),
-            );
+            let (t, ts) = tex?;
+            paint.shader = Pattern::new(t.as_ref(), SpreadMode::Repeat, FilterQuality::Bilinear, 1.0, ts);
         }
     }
     Some(paint)
@@ -136,20 +138,27 @@ pub fn render_local(obj: &Object, light: [f32; 3], ex: Pt, ey: Pt) -> (Pixmap, f
 
     // 1. fill
     if let Some(path) = &path {
-        let tex = if obj.fill.kind == FillKind::Texture {
-            textures::generate(
-                obj.fill.texture,
-                pw,
-                ph,
-                obj.fill.tex_scale,
-                obj.fill.a,
-                obj.fill.b,
-                (obj.id as u32).wrapping_mul(7919),
-            )
+        let f = &obj.fill;
+        let picture = f.image.as_ref().filter(|_| f.texture == TextureKind::Image);
+        let generated = if f.kind == FillKind::Texture && f.texture != TextureKind::Image {
+            textures::generate(f.texture, pw, ph, f.tex_scale, f.a, f.b, (obj.id as u32).wrapping_mul(7919))
         } else {
             None
         };
-        if let Some(paint) = fill_shader_paint(&obj.fill, wf, hf, pad, tex.as_ref()) {
+        let tex: Option<(&Pixmap, Transform)> = match picture {
+            Some(img) => {
+                let img: &Pixmap = &img.0;
+                let ts = if f.image_stretch {
+                    Transform::from_row(wf / img.width() as f32, 0.0, 0.0, hf / img.height() as f32, pad, pad)
+                } else {
+                    let s = f.tex_scale.max(0.01);
+                    Transform::from_row(s, 0.0, 0.0, s, pad, pad)
+                };
+                Some((img, ts))
+            }
+            None => generated.as_ref().map(|g| (g, Transform::identity())),
+        };
+        if let Some(paint) = fill_shader_paint(f, wf, hf, pad, tex) {
             pm.fill_path(path, &paint, FillRule::Winding, Transform::identity(), None);
         }
     }
@@ -176,11 +185,27 @@ pub fn render_local(obj: &Object, light: [f32; 3], ex: Pt, ey: Pt) -> (Pixmap, f
         }
     }
 
-    // 3. outline (vector stroke, or traced around the paint of a paint layer)
-    if obj.stroke.enabled && obj.stroke.width > 0.0 {
-        match &path {
-            Some(path) => draw_outline(&mut pm, path, &obj.stroke),
-            None => effects::alpha_outline(&mut pm, &obj.stroke),
+    // 3. outline + painted transparency mask. A paint layer / picture is masked first so
+    //    its outline hugs what is left (sticker look after a background removal); a vector
+    //    shape is masked after, so its outline gets hidden along with it.
+    let mask: Option<&Pixmap> = obj.mask.as_deref();
+    let outline = obj.stroke.enabled && obj.stroke.width > 0.0;
+    match &path {
+        Some(path) => {
+            if outline {
+                draw_outline(&mut pm, path, &obj.stroke);
+            }
+            if let Some(m) = mask {
+                apply_mask(&mut pm, m, pad, wf, hf);
+            }
+        }
+        None => {
+            if let Some(m) = mask {
+                apply_mask(&mut pm, m, pad, wf, hf);
+            }
+            if outline {
+                effects::alpha_outline(&mut pm, &obj.stroke);
+            }
         }
     }
 
@@ -188,7 +213,7 @@ pub fn render_local(obj: &Object, light: [f32; 3], ex: Pt, ey: Pt) -> (Pixmap, f
     let mut heights = None;
     if obj.effects.bevel.enabled {
         let coverage = match (&path, obj.fill.kind) {
-            (Some(path), k) if k != FillKind::None => shape_coverage(path, obj, pw, ph, &pm),
+            (Some(path), k) if k != FillKind::None && mask.is_none() => shape_coverage(path, obj, pw, ph, &pm),
             _ => None,
         };
         heights = effects::apply_bevel(&mut pm, &obj.effects.bevel, light, coverage.as_deref());
@@ -209,6 +234,29 @@ pub fn render_local(obj: &Object, light: [f32; 3], ex: Pt, ey: Pt) -> (Pixmap, f
     // 6. transparency
     effects::apply_transparency(&mut pm, &obj.transparency, &frame, (obj.id as u32).wrapping_mul(31));
     (pm, pad)
+}
+
+/// Multiply the local raster by a grey mask stretched over the object's box.
+fn apply_mask(pm: &mut Pixmap, mask: &Pixmap, pad: f32, w: f32, h: f32) {
+    let pw = pm.width() as usize;
+    let (mw, mh) = (mask.width() as f32, mask.height() as f32);
+    let md = mask.data();
+    let data = pm.data_mut();
+    for (i, px) in data.chunks_exact_mut(4).enumerate() {
+        if px[3] == 0 {
+            continue;
+        }
+        let x = (i % pw) as f32 + 0.5 - pad;
+        let y = (i / pw) as f32 + 0.5 - pad;
+        let u = (x / w.max(1e-3) * mw).clamp(0.5, mw - 0.5);
+        let v = (y / h.max(1e-3) * mh).clamp(0.5, mh - 0.5);
+        let k = raster::sample_bilinear(md, mask.width() as i32, mask.height() as i32, u, v)[0] / 255.0;
+        if k < 0.999 {
+            for c in px.iter_mut() {
+                *c = (*c as f32 * k + 0.5) as u8;
+            }
+        }
+    }
 }
 
 /// Opaque coverage of the shape (+ outline), merged with whatever paint lies on top.

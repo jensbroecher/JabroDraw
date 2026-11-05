@@ -52,6 +52,14 @@ Styles: `none watercolor oil impressionist pointillism pencil colorpencil comic`
   panel (corner radius, star sides/depth, text + **Font**). **Double-click** an object to reshape it:
   rectangles, ellipses and stars become editable paths in the node tool, and text jumps to its text
   field. With the Text tool active, the left panel's Font list also changes the selected text.
+- **Pictures**: File › Import picture (Ctrl+I), or drag image files onto the window (PNG, JPEG, WebP,
+  BMP, GIF, TIFF, TGA, ICO). A picture is a normal object, so you can bevel, outline, light, paint
+  on and perspective-bend it. Its **Remove background** button hides everything around the subject
+  that has the border's colour. The Brush tool's **Magic wand** clicks away single areas, and
+  **Transparency: hide / reveal** paints transparency by hand on any object. All of this goes into a
+  mask, so the original pixels are never destroyed (Clear / Invert under Transparency).
+- **Picture textures**: Fill › Texture › Image file… fills any shape with a picture (stretched or
+  tiled). Transparency › Texture › Image file… uses a picture's brightness as opacity.
 - **Transparency** (properties panel): flat, linear, radial or texture, with start and end opacity,
   like a fill. It follows the object's perspective and also thins its shadow and glow.
 - **Lights** (properties panel): any number of coloured point, spot and distant lights per object,

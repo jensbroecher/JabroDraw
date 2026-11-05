@@ -136,6 +136,36 @@ impl FillKind {
     }
 }
 
+/// An imported picture shared between documents / undo steps (compared by identity).
+#[derive(Clone)]
+pub struct ImageData(pub Arc<Pixmap>);
+
+impl PartialEq for ImageData {
+    fn eq(&self, o: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &o.0)
+    }
+}
+
+impl std::fmt::Debug for ImageData {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "ImageData({}x{})", self.0.width(), self.0.height())
+    }
+}
+
+impl Serialize for ImageData {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        pixmap_serde::serialize(&Some(self.0.clone()), s)
+    }
+}
+
+impl<'de> Deserialize<'de> for ImageData {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        pixmap_serde::deserialize(d)?
+            .map(ImageData)
+            .ok_or_else(|| serde::de::Error::custom("missing image"))
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TextureKind {
     Clouds,
@@ -145,10 +175,13 @@ pub enum TextureKind {
     Paper,
     BrushedMetal,
     Cells,
+    /// An imported picture (see `FillStyle::image` / `Transparency::image`).
+    Image,
 }
 
 impl TextureKind {
-    pub const ALL: [TextureKind; 7] = [
+    pub const ALL: [TextureKind; 8] = [
+        TextureKind::Image,
         TextureKind::Clouds,
         TextureKind::Wood,
         TextureKind::Marble,
@@ -166,6 +199,7 @@ impl TextureKind {
             TextureKind::Paper => "Paper",
             TextureKind::BrushedMetal => "Brushed metal",
             TextureKind::Cells => "Stone cells",
+            TextureKind::Image => "Image file…",
         }
     }
 }
@@ -180,6 +214,10 @@ pub struct FillStyle {
     pub angle: f32,
     pub texture: TextureKind,
     pub tex_scale: f32,
+    /// Picture used when `texture` is `Image`.
+    pub image: Option<ImageData>,
+    /// Stretch the picture over the object instead of tiling it.
+    pub image_stretch: bool,
 }
 
 impl Default for FillStyle {
@@ -191,6 +229,8 @@ impl Default for FillStyle {
             angle: 90.0,
             texture: TextureKind::Clouds,
             tex_scale: 1.0,
+            image: None,
+            image_stretch: true,
         }
     }
 }
@@ -309,6 +349,8 @@ pub struct Transparency {
     pub p1: [f32; 2],
     pub texture: TextureKind,
     pub tex_scale: f32,
+    /// Picture whose brightness drives the opacity when `texture` is `Image`.
+    pub image: Option<ImageData>,
 }
 
 impl Default for Transparency {
@@ -321,6 +363,7 @@ impl Default for Transparency {
             p1: [0.5, 1.0],
             texture: TextureKind::Clouds,
             tex_scale: 1.0,
+            image: None,
         }
     }
 }
@@ -572,6 +615,10 @@ pub struct Object {
     pub visible: bool,
     #[serde(default, with = "pixmap_serde")]
     pub paint: Option<Arc<Pixmap>>,
+    /// Painted transparency mask (grey: white = visible, black = hidden), stretched over the
+    /// object. Background removal and the Hide / Reveal brushes write here, never into pixels.
+    #[serde(default, with = "pixmap_serde")]
+    pub mask: Option<Arc<Pixmap>>,
     #[serde(skip)]
     pub rev: u64,
 }
@@ -593,6 +640,7 @@ impl Object {
             opacity: 1.0,
             visible: true,
             paint: None,
+            mask: None,
             rev: next_rev(),
         }
     }
@@ -698,11 +746,12 @@ impl Object {
 
     /// Compare everything the user can edit (ignores the cache revision).
     pub fn same_content(&self, o: &Object) -> bool {
-        let paint_same = match (&self.paint, &o.paint) {
+        let same = |a: &Option<Arc<Pixmap>>, b: &Option<Arc<Pixmap>>| match (a, b) {
             (None, None) => true,
             (Some(a), Some(b)) => Arc::ptr_eq(a, b),
             _ => false,
         };
+        let paint_same = same(&self.paint, &o.paint) && same(&self.mask, &o.mask);
         self.id == o.id
             && self.name == o.name
             && self.kind == o.kind

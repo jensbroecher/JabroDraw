@@ -6,7 +6,7 @@ use crate::geom::{simplify, Pt};
 use crate::npr::{self, NprJob, NprWorker};
 use crate::render::Renderer;
 use crate::vector::{self, BoolOp};
-use crate::{demo, io, shapes, styles};
+use crate::{demo, imageops, io, shapes, styles};
 use eframe::egui::{self, Color32, Modifiers, Pos2, Rect, Sense, Shape, Stroke, Vec2};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -112,12 +112,17 @@ enum Drag {
     Corner { id: u64, idx: usize },
     Create { start: Pt, cur: Pt },
     Freehand { pts: Vec<Pt> },
-    Paint { id: u64, last: (f32, f32), state: StrokeState },
+    Paint { id: u64, last: (f32, f32), state: StrokeState, mask: bool },
 }
 
 enum PropAction {
     ConvertToPath,
     EditNodes,
+    LoadFillImage,
+    LoadTransImage,
+    RemoveBackground,
+    MaskInvert,
+    MaskClear,
     ResetPerspective,
     FlipH,
     FlipV,
@@ -154,14 +159,46 @@ fn reorder_ids(list: &[u64], moving: &[u64], gap: usize) -> Vec<u64> {
 }
 
 /// Canvas point -> (paint-layer pixel, paint pixels per canvas pixel).
+/// The layer a brush works on: the paint, or the transparency mask.
+fn brush_layer(obj: &mut Object, mask: bool) -> Option<&mut Arc<Pixmap>> {
+    if mask {
+        obj.mask.as_mut()
+    } else {
+        obj.paint.as_mut()
+    }
+}
+
+/// Give the object a (fully visible) transparency mask if it has none. Pictures get one at
+/// their own resolution so the magic wand works pixel by pixel.
+fn ensure_mask(obj: &mut Object) {
+    if obj.mask.is_none() {
+        let (w, h) = match (&obj.kind, &obj.paint) {
+            (ShapeKind::Bitmap, Some(p)) => (p.width(), p.height()),
+            _ => obj.raster_size(),
+        };
+        obj.mask = imageops::new_mask(w, h).map(Arc::new);
+    }
+}
+
 fn doc_to_paint(obj: &Object, p: Pt) -> Option<((f32, f32), f32)> {
     let paint = obj.paint.as_ref()?;
+    doc_to_layer(obj, p, paint.width(), paint.height())
+}
+
+fn doc_to_mask(obj: &Object, p: Pt) -> Option<((f32, f32), f32)> {
+    let mask = obj.mask.as_ref()?;
+    doc_to_layer(obj, p, mask.width(), mask.height())
+}
+
+/// Canvas point -> (pixel in a layer of lw x lh stretched over the object, layer pixels per
+/// canvas pixel).
+fn doc_to_layer(obj: &Object, p: Pt, lw: u32, lh: u32) -> Option<((f32, f32), f32)> {
     let inv = obj.homography().inverse()?;
     let (lx, ly) = inv.apply(p.x as f64, p.y as f64)?;
     let (lx2, ly2) = inv.apply(p.x as f64 + 1.0, p.y as f64)?;
     let (lx3, ly3) = inv.apply(p.x as f64, p.y as f64 + 1.0)?;
-    let kx = paint.width() as f64 / obj.size[0].max(1.0) as f64;
-    let ky = paint.height() as f64 / obj.size[1].max(1.0) as f64;
+    let kx = lw as f64 / obj.size[0].max(1.0) as f64;
+    let ky = lh as f64 / obj.size[1].max(1.0) as f64;
     let sx = ((lx2 - lx) * kx).hypot((ly2 - ly) * ky);
     let sy = ((lx3 - lx) * kx).hypot((ly3 - ly) * ky);
     Some((((lx * kx) as f32, (ly * ky) as f32), ((sx + sy) * 0.5) as f32))
@@ -203,6 +240,9 @@ pub struct JabroApp {
     /// Light type a Lights-tool click adds, and the light being edited.
     new_light_kind: LightKind,
     light_sel: Option<usize>,
+    /// Colour tolerance (0..1) and edge feather (px) for background removal / magic wand.
+    bg_tol: f32,
+    bg_feather: f32,
     /// The document as it was last saved / opened (to detect unsaved changes).
     saved_doc: Document,
     close_dialog: bool,
@@ -268,6 +308,8 @@ impl JabroApp {
             trans_kind: TransparencyKind::Linear,
             new_light_kind: LightKind::Point,
             light_sel: None,
+            bg_tol: 0.15,
+            bg_feather: 1.5,
             saved_doc,
             close_dialog: false,
             allow_close: false,
@@ -672,12 +714,15 @@ impl JabroApp {
     }
 
     fn open(&mut self) {
-        let Some(path) = rfd::FileDialog::new()
+        if let Some(path) = rfd::FileDialog::new()
             .add_filter("Jabro Draw", &["jabro"])
             .pick_file()
-        else {
-            return;
-        };
+        {
+            self.open_path(path);
+        }
+    }
+
+    fn open_path(&mut self, path: PathBuf) {
         match io::load(&path) {
             Ok(d) => {
                 self.replace_doc(d);
@@ -1256,30 +1301,201 @@ impl JabroApp {
             self.drag = Drag::None;
             return;
         }
+        if self.brush.kind == BrushKind::MagicWand {
+            self.drag = Drag::None;
+            self.magic_wand_at(p);
+            return;
+        }
+        let mask = self.brush.kind.is_mask();
         let target = self
             .selected
             .filter(|id| self.doc.find(*id).map_or(false, |o| o.visible));
-        let id = match target {
-            Some(id) => id,
-            None => self.new_paint_layer(),
+        let id = match (target, mask) {
+            (Some(id), _) => id,
+            // the transparency brushes need an object to work on
+            (None, true) => match self.hit_test(p) {
+                Some(id) => {
+                    self.select_only(Some(id));
+                    id
+                }
+                None => {
+                    self.status = "Click on an object to paint its transparency.".into();
+                    self.drag = Drag::None;
+                    return;
+                }
+            },
+            (None, false) => self.new_paint_layer(),
         };
         self.commit_snapshot();
         let base_r = self.brush_radius_base();
-        let mut settings = self.brush.clone();
-        settings.color = self.color_a;
+        let settings = self.brush_settings();
         let Some(obj) = self.doc.find_mut(id) else { return };
-        if obj.paint.is_none() {
+        if mask {
+            ensure_mask(obj);
+        } else if obj.paint.is_none() {
             let (w, h) = obj.raster_size();
             obj.paint = Pixmap::new(w, h).map(Arc::new);
         }
-        let Some((pc, scale)) = doc_to_paint(obj, p) else { return };
+        let mapped = if mask { doc_to_mask(obj, p) } else { doc_to_paint(obj, p) };
+        let Some((pc, scale)) = mapped else { return };
         let mut state = StrokeState::new();
-        if let Some(layer) = obj.paint.as_mut() {
+        if let Some(layer) = brush_layer(obj, mask) {
             brush::segment(Arc::make_mut(layer), pc, pc, base_r * scale, &settings, &mut state);
         }
         obj.touch();
         self.dirty = true;
-        self.drag = Drag::Paint { id, last: pc, state };
+        self.drag = Drag::Paint { id, last: pc, state, mask };
+    }
+
+    /// Brush settings for the next stamp: the transparency brushes paint black / white
+    /// into the mask with a plain round tip.
+    fn brush_settings(&self) -> BrushSettings {
+        let mut s = self.brush.clone();
+        s.color = match s.kind {
+            BrushKind::Hide => [0, 0, 0, 255],
+            BrushKind::Reveal => [255, 255, 255, 255],
+            _ => self.color_a,
+        };
+        if s.kind.is_mask() {
+            s.kind = BrushKind::Round;
+        }
+        s
+    }
+
+    /// The picture (or paint layer) the magic wand / background removal works on.
+    fn picture_target(&self, p: Option<Pt>) -> Option<u64> {
+        let has_paint = |id: u64| self.doc.find(id).is_some_and(|o| o.paint.is_some());
+        p.and_then(|p| self.hit_test(p))
+            .filter(|id| has_paint(*id))
+            .or(self.selected.filter(|id| has_paint(*id)))
+    }
+
+    fn magic_wand_at(&mut self, p: Pt) {
+        let Some(id) = self.picture_target(Some(p)) else {
+            self.status = "The magic wand works on pictures and paint layers — click on one.".into();
+            return;
+        };
+        self.select_only(Some(id));
+        let (tol, feather) = (self.bg_tol, self.bg_feather);
+        self.checkpoint();
+        let mut removed = 0;
+        if let Some(o) = self.doc.find_mut(id) {
+            ensure_mask(o);
+            if let (Some((pc, _)), Some(img)) = (doc_to_paint(o, p), o.paint.clone()) {
+                if let Some(mask) = o.mask.as_mut() {
+                    let m = Arc::make_mut(mask);
+                    if m.width() == img.width() && m.height() == img.height() {
+                        removed = imageops::magic_wand(&img, m, pc.0 as usize, pc.1 as usize, tol, feather);
+                    }
+                }
+            }
+            o.touch();
+        }
+        self.dirty = true;
+        self.status = if removed > 0 {
+            format!("Hid {removed} pixels. Raise Tolerance to take more, or paint them back with Transparency: reveal.")
+        } else {
+            "Nothing hidden there.".into()
+        };
+    }
+
+    fn remove_background(&mut self, id: u64) {
+        let (tol, feather) = (self.bg_tol, self.bg_feather);
+        let mut removed = 0;
+        if let Some(o) = self.doc.find_mut(id) {
+            let Some(img) = o.paint.clone() else { return };
+            ensure_mask(o);
+            if let Some(mask) = o.mask.as_mut() {
+                let m = Arc::make_mut(mask);
+                if m.width() == img.width() && m.height() == img.height() {
+                    removed = imageops::remove_background(&img, m, tol, feather);
+                }
+            }
+            o.touch();
+        }
+        self.dirty = true;
+        self.status = format!(
+            "Background removed ({removed} pixels hidden). Touch up with the Transparency hide / reveal brushes."
+        );
+    }
+
+    /// Import a picture as a new object, scaled to fit the page (`at` = where to centre it).
+    fn import_image_object(&mut self, path: &std::path::Path, at: Option<Pt>) {
+        let img = match imageops::load_image(path) {
+            Ok(i) => i,
+            Err(e) => {
+                self.status = format!("Could not import {}: {e}", path.display());
+                return;
+            }
+        };
+        let (iw, ih) = (img.width() as f32, img.height() as f32);
+        let (dw, dh) = (self.doc.width as f32, self.doc.height as f32);
+        let k = (0.8 * dw / iw).min(0.8 * dh / ih).min(1.0);
+        let (w, h) = ((iw * k).max(1.0), (ih * k).max(1.0));
+        let c = at.unwrap_or(Pt::new(dw * 0.5, dh * 0.5));
+        self.checkpoint();
+        let id = self.doc.alloc_id();
+        let mut obj = Object::new(id, ShapeKind::Bitmap, c.x - w * 0.5, c.y - h * 0.5, w, h);
+        obj.fill.kind = FillKind::None;
+        obj.paint = Some(Arc::new(img));
+        obj.name = path
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "Picture".into());
+        self.doc.objects.push(obj);
+        self.select_only(Some(id));
+        self.set_tool(Tool::Select);
+        self.dirty = true;
+        self.status = format!(
+            "Imported {} ({}×{} px). Remove its background in the properties panel.",
+            path.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default(),
+            iw as u32,
+            ih as u32
+        );
+    }
+
+    fn import_image_dialog(&mut self) {
+        if let Some(path) = rfd::FileDialog::new()
+            .add_filter("Pictures", &imageops::IMAGE_EXTENSIONS)
+            .pick_file()
+        {
+            self.import_image_object(&path, None);
+        }
+    }
+
+    fn pick_image_file(&mut self) -> Option<ImageData> {
+        let path = rfd::FileDialog::new()
+            .add_filter("Pictures", &imageops::IMAGE_EXTENSIONS)
+            .pick_file()?;
+        match imageops::load_image(&path) {
+            Ok(img) => Some(ImageData(Arc::new(img))),
+            Err(e) => {
+                self.status = format!("Could not load {}: {e}", path.display());
+                None
+            }
+        }
+    }
+
+    /// Files dropped onto the window: pictures become objects where they land, .jabro files open.
+    fn handle_dropped_files(&mut self, ctx: &egui::Context) {
+        let dropped = ctx.input(|i| i.raw.dropped_files.clone());
+        if dropped.is_empty() {
+            return;
+        }
+        let at = ctx
+            .input(|i| i.pointer.latest_pos())
+            .filter(|p| self.canvas_rect.contains(*p))
+            .map(|p| self.to_doc(p));
+        for f in dropped {
+            let Some(path) = f.path else { continue };
+            if path.extension().is_some_and(|e| e.eq_ignore_ascii_case("jabro")) {
+                self.open_path(path);
+            } else if imageops::is_image_path(&path) {
+                self.import_image_object(&path, at);
+            } else {
+                self.status = format!("Can't import {}", path.display());
+            }
+        }
     }
 
     fn on_drag(&mut self, p: Pt, mods: Modifiers) {
@@ -1506,14 +1722,14 @@ impl JabroApp {
                 }
                 Drag::Freehand { pts }
             }
-            Drag::Paint { id, last, mut state } => {
+            Drag::Paint { id, last, mut state, mask } => {
                 let base_r = self.brush_radius_base();
-                let mut settings = self.brush.clone();
-                settings.color = self.color_a;
+                let settings = self.brush_settings();
                 let mut new_last = last;
                 if let Some(obj) = self.doc.find_mut(id) {
-                    if let Some((pc, scale)) = doc_to_paint(obj, p) {
-                        if let Some(layer) = obj.paint.as_mut() {
+                    let mapped = if mask { doc_to_mask(obj, p) } else { doc_to_paint(obj, p) };
+                    if let Some((pc, scale)) = mapped {
+                        if let Some(layer) = brush_layer(obj, mask) {
                             brush::segment(Arc::make_mut(layer), last, pc, base_r * scale, &settings, &mut state);
                         }
                         obj.touch();
@@ -1521,7 +1737,7 @@ impl JabroApp {
                     }
                 }
                 self.dirty = true;
-                Drag::Paint { id, last: new_last, state }
+                Drag::Paint { id, last: new_last, state, mask }
             }
             Drag::None => Drag::None,
         };
@@ -1762,6 +1978,9 @@ impl JabroApp {
         if cmd(Key::E) {
             self.export_png();
         }
+        if cmd(Key::I) {
+            self.import_image_dialog();
+        }
         if ctx.wants_keyboard_input() {
             return;
         }
@@ -1865,6 +2084,10 @@ impl JabroApp {
                     self.save(true);
                 }
                 ui.separator();
+                if ui.button("Import picture…  (Ctrl+I)").clicked() {
+                    ui.close_menu();
+                    self.import_image_dialog();
+                }
                 if ui.button("Export PNG…  (Ctrl+E)").clicked() {
                     ui.close_menu();
                     self.export_png();
@@ -2152,17 +2375,27 @@ impl JabroApp {
                 for k in BrushKind::ALL {
                     ui.radio_value(&mut self.brush.kind, k, k.label());
                 }
-                ui.add(egui::Slider::new(&mut self.brush.size, 1.0..=300.0).logarithmic(true).text("Size"));
-                ui.add(egui::Slider::new(&mut self.brush.hardness, 0.0..=1.0).text("Hardness"));
-                ui.add(egui::Slider::new(&mut self.brush.flow, 0.02..=1.0).text("Flow"));
-                ui.add(egui::Slider::new(&mut self.brush.spacing, 0.02..=1.0).text("Spacing"));
-                ui.checkbox(&mut self.brush.pressure, "Pen pressure");
-                if ui.button("New paint layer").clicked() {
-                    self.checkpoint();
-                    self.new_paint_layer();
-                    self.dirty = true;
+                if self.brush.kind == BrushKind::MagicWand {
+                    ui.add(egui::Slider::new(&mut self.bg_tol, 0.01..=0.6).text("Tolerance"));
+                    ui.add(egui::Slider::new(&mut self.bg_feather, 0.0..=8.0).text("Soft edge"));
+                    ui.small("Click a picture: the connected area of similar colour becomes transparent. Nothing is deleted — paint it back with Transparency: reveal.");
+                } else {
+                    ui.add(egui::Slider::new(&mut self.brush.size, 1.0..=300.0).logarithmic(true).text("Size"));
+                    ui.add(egui::Slider::new(&mut self.brush.hardness, 0.0..=1.0).text("Hardness"));
+                    ui.add(egui::Slider::new(&mut self.brush.flow, 0.02..=1.0).text("Flow"));
+                    ui.add(egui::Slider::new(&mut self.brush.spacing, 0.02..=1.0).text("Spacing"));
+                    ui.checkbox(&mut self.brush.pressure, "Pen pressure");
                 }
-                ui.small("Paints into the selected object (clipped to its shape). With nothing selected a new paint layer is created. Alt+click = colour picker.");
+                if self.brush.kind.is_mask() {
+                    ui.small("Paints the selected object's transparency: hide makes it see-through, reveal brings it back. Works on pictures, shapes and text. Low flow = partly transparent.");
+                } else if self.brush.kind != BrushKind::MagicWand {
+                    if ui.button("New paint layer").clicked() {
+                        self.checkpoint();
+                        self.new_paint_layer();
+                        self.dirty = true;
+                    }
+                    ui.small("Paints into the selected object (clipped to its shape). With nothing selected a new paint layer is created. Alt+click = colour picker.");
+                }
             }
             _ => {
                 ui.small("Tip: select an object and pick a style preset on the right, then paint on it with the Brush and bend it with the Perspective tool.");
@@ -2338,14 +2571,16 @@ impl JabroApp {
         let selected = self.selected;
         let focus_text = std::mem::take(&mut self.focus_text);
         let mut edit_nodes = false;
+        let mut bg = (self.bg_tol, self.bg_feather);
         egui::ScrollArea::vertical().id_salt("props").show(ui, |ui| {
             match selected.and_then(|id| self.doc.find_mut(id)) {
-                Some(obj) => object_props(ui, obj, &mut actions, has_clip, focus_text),
+                Some(obj) => object_props(ui, obj, &mut actions, has_clip, focus_text, &mut bg),
                 None => {
                     doc_props(ui, &mut self.doc, &mut self.new_w, &mut self.new_h, &mut resize);
                 }
             }
         });
+        (self.bg_tol, self.bg_feather) = bg;
 
         for a in actions {
             match a {
@@ -2355,6 +2590,39 @@ impl JabroApp {
                     }
                 }
                 PropAction::EditNodes => edit_nodes = true,
+                PropAction::LoadFillImage => {
+                    if let Some(img) = self.pick_image_file() {
+                        if let Some(o) = selected.and_then(|id| self.doc.find_mut(id)) {
+                            o.fill.kind = FillKind::Texture;
+                            o.fill.texture = TextureKind::Image;
+                            o.fill.image = Some(img);
+                        }
+                    }
+                }
+                PropAction::LoadTransImage => {
+                    if let Some(img) = self.pick_image_file() {
+                        if let Some(o) = selected.and_then(|id| self.doc.find_mut(id)) {
+                            o.transparency.kind = TransparencyKind::Texture;
+                            o.transparency.texture = TextureKind::Image;
+                            o.transparency.image = Some(img);
+                        }
+                    }
+                }
+                PropAction::RemoveBackground => {
+                    if let Some(id) = selected {
+                        self.remove_background(id);
+                    }
+                }
+                PropAction::MaskInvert => {
+                    if let Some(m) = selected.and_then(|id| self.doc.find_mut(id)).and_then(|o| o.mask.as_mut()) {
+                        imageops::invert_mask(Arc::make_mut(m));
+                    }
+                }
+                PropAction::MaskClear => {
+                    if let Some(o) = selected.and_then(|id| self.doc.find_mut(id)) {
+                        o.mask = None;
+                    }
+                }
                 PropAction::ResetPerspective => {
                     if let Some(o) = selected.and_then(|id| self.doc.find_mut(id)) {
                         o.reset_perspective();
@@ -2879,6 +3147,7 @@ fn object_props(
     actions: &mut Vec<PropAction>,
     has_clip: bool,
     focus_text: bool,
+    bg: &mut (f32, f32),
 ) {
     ui.horizontal(|ui| {
         ui.strong(obj.kind.label());
@@ -3016,9 +3285,25 @@ fn object_props(
                                 ui.selectable_value(&mut obj.fill.texture, t, t.label());
                             }
                         });
-                    rgba_label(ui, "Dark", &mut obj.fill.a);
-                    rgba_label(ui, "Light", &mut obj.fill.b);
-                    ui.add(egui::Slider::new(&mut obj.fill.tex_scale, 0.2..=5.0).logarithmic(true).text("Scale"));
+                    if obj.fill.texture == TextureKind::Image {
+                        ui.horizontal(|ui| {
+                            let label = if obj.fill.image.is_some() { "Change picture…" } else { "Load picture…" };
+                            if ui.button(label).clicked() {
+                                actions.push(PropAction::LoadFillImage);
+                            }
+                            if let Some(img) = &obj.fill.image {
+                                ui.label(format!("{}×{}", img.0.width(), img.0.height()));
+                            }
+                        });
+                        ui.checkbox(&mut obj.fill.image_stretch, "Stretch to fit the shape");
+                        if !obj.fill.image_stretch {
+                            ui.add(egui::Slider::new(&mut obj.fill.tex_scale, 0.05..=5.0).logarithmic(true).text("Tile size"));
+                        }
+                    } else {
+                        rgba_label(ui, "Dark", &mut obj.fill.a);
+                        rgba_label(ui, "Light", &mut obj.fill.b);
+                        ui.add(egui::Slider::new(&mut obj.fill.tex_scale, 0.2..=5.0).logarithmic(true).text("Scale"));
+                    }
                 }
             }
         });
@@ -3085,12 +3370,53 @@ fn object_props(
                             ui.selectable_value(&mut t.texture, k, k.label());
                         }
                     });
+                if t.texture == TextureKind::Image {
+                    ui.horizontal(|ui| {
+                        let label = if t.image.is_some() { "Change picture…" } else { "Load picture…" };
+                        if ui.button(label).clicked() {
+                            actions.push(PropAction::LoadTransImage);
+                        }
+                    });
+                    ui.small("The picture's brightness sets the opacity (stretched over the object).");
+                } else {
+                    ui.add(egui::Slider::new(&mut t.tex_scale, 0.2..=5.0).logarithmic(true).text("Scale"));
+                }
                 ui.add(pct_slider(&mut t.start).text("Opacity (dark)"));
                 ui.add(pct_slider(&mut t.end).text("Opacity (light)"));
-                ui.add(egui::Slider::new(&mut t.tex_scale, 0.2..=5.0).logarithmic(true).text("Scale"));
             }
         }
+        ui.separator();
+        if obj.mask.is_some() {
+            ui.horizontal_wrapped(|ui| {
+                ui.label("Painted transparency:");
+                if ui.small_button("Invert").clicked() {
+                    actions.push(PropAction::MaskInvert);
+                }
+                if ui.small_button("Clear").on_hover_text("Make everything visible again").clicked() {
+                    actions.push(PropAction::MaskClear);
+                }
+            });
+        }
+        ui.small("Paint transparency by hand with the Brush tool's Transparency: hide / reveal brushes.");
     });
+
+    if obj.paint.is_some() && obj.kind == ShapeKind::Bitmap {
+        egui::CollapsingHeader::new("Picture").default_open(true).show(ui, |ui| {
+            if let Some(p) = &obj.paint {
+                ui.label(format!("{} × {} px", p.width(), p.height()));
+            }
+            ui.add(egui::Slider::new(&mut bg.0, 0.01..=0.6).text("Tolerance"));
+            ui.add(egui::Slider::new(&mut bg.1, 0.0..=8.0).text("Soft edge"));
+            if ui
+                .button("Remove background")
+                .on_hover_text("Hides everything that touches the border and has the border's colour")
+                .clicked()
+            {
+                actions.push(PropAction::RemoveBackground);
+            }
+            ui.small("Works best on plain or studio backgrounds. Click leftovers away with the Brush tool's Magic wand, or paint them with Transparency: hide / reveal. The original pixels are kept.");
+        });
+    }
 
     egui::CollapsingHeader::new("Bevel & material").default_open(true).show(ui, |ui| {
         let b = &mut obj.effects.bevel;
@@ -3254,6 +3580,7 @@ fn doc_props(
 impl eframe::App for JabroApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.handle_close(ctx);
+        self.handle_dropped_files(ctx);
         self.update_title(ctx);
         self.shortcuts(ctx);
         self.read_pressure(ctx);
@@ -3564,6 +3891,57 @@ mod tests {
         assert!(!app.has_unsaved_changes(), "saving clears it");
         app.undo();
         assert!(app.has_unsaved_changes(), "undoing past the save is a change again");
+    }
+
+    fn picture_file() -> std::path::PathBuf {
+        let mut pm = Pixmap::new(200, 100).unwrap();
+        pm.fill(tiny_skia::Color::WHITE);
+        let mut paint = tiny_skia::Paint::default();
+        paint.set_color_rgba8(30, 160, 60, 255);
+        let r = tiny_skia::Rect::from_xywh(70.0, 20.0, 60.0, 60.0).unwrap();
+        pm.fill_rect(r, &paint, tiny_skia::Transform::identity(), None);
+        let path = std::env::temp_dir().join(format!("jabro_pic_{}.png", std::process::id()));
+        pm.save_png(&path).unwrap();
+        path
+    }
+
+    #[test]
+    fn import_picture_then_magic_wand_and_hide_brush() {
+        let mut app = app_with(vec![]);
+        let path = picture_file();
+        app.import_image_object(&path, Some(Pt::new(400.0, 300.0)));
+        let _ = std::fs::remove_file(&path);
+        let o = &app.doc.objects[0];
+        assert_eq!(o.kind, ShapeKind::Bitmap);
+        assert_eq!(o.paint.as_ref().unwrap().width(), 200);
+        assert!(o.center().dist(Pt::new(400.0, 300.0)) < 0.5, "placed where it was dropped");
+        let id = o.id;
+
+        // magic wand on the white background
+        app.tool = Tool::Brush;
+        app.brush.kind = BrushKind::MagicWand;
+        click(&mut app, Pt::new(305.0, 255.0), Modifiers::NONE);
+        let m = app.doc.objects[0].mask.as_ref().expect("mask created");
+        assert_eq!(m.pixel(2, 2).unwrap().red(), 0, "background hidden");
+        assert_eq!(m.pixel(100, 50).unwrap().red(), 255, "green square kept");
+        app.undo();
+        assert!(app.doc.objects[0].mask.is_none(), "one undo step");
+
+        // paint transparency by hand onto the square
+        app.brush.kind = BrushKind::Hide;
+        app.brush.size = 20.0;
+        app.brush.flow = 1.0;
+        app.brush.hardness = 1.0;
+        app.selected = Some(id);
+        click(&mut app, Pt::new(400.0, 300.0), Modifiers::NONE);
+        let m = app.doc.objects[0].mask.as_ref().unwrap();
+        assert!(m.pixel(100, 50).unwrap().red() < 10, "hidden where painted");
+        assert_eq!(m.pixel(10, 10).unwrap().red(), 255, "untouched elsewhere");
+        app.brush.kind = BrushKind::Reveal;
+        click(&mut app, Pt::new(400.0, 300.0), Modifiers::NONE);
+        let m = app.doc.objects[0].mask.as_ref().unwrap();
+        assert!(m.pixel(100, 50).unwrap().red() > 245, "revealed again");
+        assert!(app.doc.objects[0].paint.as_ref().unwrap().pixel(100, 50).unwrap().green() > 100, "pixels untouched");
     }
 
     #[test]

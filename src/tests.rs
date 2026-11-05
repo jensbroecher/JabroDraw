@@ -339,3 +339,133 @@ fn outline_positions_inside_outside_and_around_paint() {
     assert!(red(&out, 50, 32), "ring just outside the painted dot");
     assert!(!red(&out, 50, 50), "dot itself stays blue");
 }
+
+// ------------------------------------------------------------------ pictures, masks, background removal
+
+use crate::imageops;
+
+/// White picture with a red disc in the middle (and a second small red square in the corner).
+fn test_picture() -> tiny_skia::Pixmap {
+    let mut pm = tiny_skia::Pixmap::new(120, 80).unwrap();
+    pm.fill(tiny_skia::Color::WHITE);
+    let mut paint = tiny_skia::Paint::default();
+    paint.set_color_rgba8(220, 30, 30, 255);
+    let disc = tiny_skia::PathBuilder::from_circle(60.0, 40.0, 25.0).unwrap();
+    pm.fill_path(&disc, &paint, tiny_skia::FillRule::Winding, tiny_skia::Transform::identity(), None);
+    let sq = tiny_skia::PathBuilder::from_rect(tiny_skia::Rect::from_xywh(5.0, 5.0, 10.0, 10.0).unwrap());
+    pm.fill_path(&sq, &paint, tiny_skia::FillRule::Winding, tiny_skia::Transform::identity(), None);
+    pm
+}
+
+fn mask_at(m: &tiny_skia::Pixmap, x: u32, y: u32) -> u8 {
+    m.pixel(x, y).unwrap().red()
+}
+
+#[test]
+fn remove_background_hides_the_border_colour_only() {
+    let img = test_picture();
+    let mut mask = imageops::new_mask(120, 80).unwrap();
+    let n = imageops::remove_background(&img, &mut mask, 0.15, 1.0);
+    assert!(n > 5000, "most of the white is gone ({n})");
+    assert_eq!(mask_at(&mask, 2, 2), 0, "corner background hidden");
+    assert_eq!(mask_at(&mask, 60, 40), 255, "subject kept");
+    assert_eq!(mask_at(&mask, 10, 10), 255, "red square kept too");
+}
+
+#[test]
+fn magic_wand_hides_only_the_clicked_area() {
+    let img = test_picture();
+    let mut mask = imageops::new_mask(120, 80).unwrap();
+    imageops::magic_wand(&img, &mut mask, 10, 10, 0.1, 0.0); // click the small red square
+    assert_eq!(mask_at(&mask, 10, 10), 0);
+    assert_eq!(mask_at(&mask, 60, 40), 255, "the disc is not connected, so it stays");
+    assert_eq!(mask_at(&mask, 100, 70), 255, "white stays");
+}
+
+#[test]
+fn load_image_reads_a_png() {
+    let path = std::env::temp_dir().join("jabro_load_test.png");
+    test_picture().save_png(&path).unwrap();
+    let img = imageops::load_image(&path).unwrap();
+    let _ = std::fs::remove_file(&path);
+    assert_eq!((img.width(), img.height()), (120, 80));
+    let c = img.pixel(60, 40).unwrap();
+    assert!(c.red() > 200 && c.green() < 60);
+}
+
+#[test]
+fn mask_hides_part_of_an_object() {
+    let mut o = Object::new(1, ShapeKind::Rect { corner: 0.0 }, 0.0, 0.0, 100.0, 100.0);
+    o.fill.a = [0, 0, 0, 255];
+    let mut m = imageops::new_mask(10, 10).unwrap();
+    for (i, px) in m.data_mut().chunks_exact_mut(4).enumerate() {
+        if i % 10 < 5 {
+            px[0] = 0;
+            px[1] = 0;
+            px[2] = 0;
+        }
+    }
+    o.mask = Some(Arc::new(m));
+    let out = render_one(o, 100, 100);
+    assert!(lum(&out, 20, 50) > 0.95, "left half hidden");
+    assert!(lum(&out, 80, 50) < 0.05, "right half visible");
+}
+
+#[test]
+fn picture_textures_for_fill_and_transparency() {
+    // 2x1 picture: red | blue
+    let mut pic = tiny_skia::Pixmap::new(2, 1).unwrap();
+    pic.data_mut().copy_from_slice(&[255, 0, 0, 255, 0, 0, 255, 255]);
+    let pic = ImageData(Arc::new(pic));
+    let mut o = Object::new(1, ShapeKind::Rect { corner: 0.0 }, 0.0, 0.0, 100.0, 50.0);
+    o.fill = FillStyle {
+        kind: FillKind::Texture,
+        texture: TextureKind::Image,
+        image: Some(pic.clone()),
+        image_stretch: true,
+        ..Default::default()
+    };
+    let out = render_one(o.clone(), 100, 50);
+    let c = |x| out.pixel(x, 25).unwrap().demultiply();
+    assert!(c(15).red() > 200 && c(15).blue() < 60, "left is red");
+    assert!(c(85).blue() > 200 && c(85).red() < 60, "right is blue");
+
+    // brightness as opacity: black | white picture, dark = see-through
+    let mut bw = tiny_skia::Pixmap::new(2, 1).unwrap();
+    bw.data_mut().copy_from_slice(&[0, 0, 0, 255, 255, 255, 255, 255]);
+    o.fill = FillStyle {
+        kind: FillKind::Solid,
+        a: [0, 0, 0, 255],
+        ..Default::default()
+    };
+    o.transparency = Transparency {
+        kind: TransparencyKind::Texture,
+        texture: TextureKind::Image,
+        image: Some(ImageData(Arc::new(bw))),
+        start: 0.0,
+        end: 1.0,
+        ..Default::default()
+    };
+    let out = render_one(o, 100, 50);
+    assert!(lum(&out, 10, 25) > 0.9, "dark part of the picture = transparent");
+    assert!(lum(&out, 90, 25) < 0.1, "bright part = opaque");
+}
+
+#[test]
+fn pictures_and_masks_survive_save_and_load() {
+    let mut doc = Document::new(200, 200);
+    let mut o = Object::new(1, ShapeKind::Bitmap, 10.0, 10.0, 120.0, 80.0);
+    o.paint = Some(Arc::new(test_picture()));
+    let mut m = imageops::new_mask(120, 80).unwrap();
+    imageops::remove_background(o.paint.as_ref().unwrap(), &mut m, 0.15, 0.0);
+    o.mask = Some(Arc::new(m));
+    o.fill.image = Some(ImageData(Arc::new(test_picture())));
+    doc.objects.push(o);
+    let path = std::env::temp_dir().join("jabro_pic_roundtrip.jabro");
+    crate::io::save(&doc, &path).unwrap();
+    let back = crate::io::load(&path).unwrap();
+    let _ = std::fs::remove_file(&path);
+    let b = &back.objects[0];
+    assert_eq!(mask_at(b.mask.as_ref().unwrap(), 2, 2), 0);
+    assert_eq!(b.fill.image.as_ref().unwrap().0.width(), 120);
+}
