@@ -50,6 +50,8 @@ Styles: `none watercolor oil impressionist pointillism pencil colorpencil comic`
   panel (corner radius, star sides/depth, text + **Font**). **Double-click** an object to reshape it:
   rectangles, ellipses and stars become editable paths in the node tool, and text jumps to its text
   field. With the Text tool active, the left panel's Font list also changes the selected text.
+- **Objects list**: drag a row up or down to change the stacking order; dragging a selected row
+  moves the whole selection. Shift+click adds to the selection, and the checkbox hides an object.
 - **Path menu**: Union / Subtract / Intersect / Exclude on 2+ selected objects (also in the properties
   panel). The result is one editable path that keeps the bottom object's style. **Convert to path**
   (Ctrl+Shift+C) turns rectangles, ellipses, stars and text into editable nodes, and keeps perspective.

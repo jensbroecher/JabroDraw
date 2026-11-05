@@ -124,6 +124,18 @@ fn handle_pos(q: &[Pt; 4], i: usize) -> Pt {
     }
 }
 
+/// Move the `moving` ids as one block (keeping their relative order) to before position `gap`
+/// of `list` (gap == list.len() means the end).
+fn reorder_ids(list: &[u64], moving: &[u64], gap: usize) -> Vec<u64> {
+    let gap = gap.min(list.len());
+    let before = list[..gap].iter().filter(|id| moving.contains(id)).count();
+    let block: Vec<u64> = list.iter().copied().filter(|id| moving.contains(id)).collect();
+    let mut rest: Vec<u64> = list.iter().copied().filter(|id| !moving.contains(id)).collect();
+    let at = (gap - before).min(rest.len());
+    rest.splice(at..at, block);
+    rest
+}
+
 /// Canvas point -> (paint-layer pixel, paint pixels per canvas pixel).
 fn doc_to_paint(obj: &Object, p: Pt) -> Option<((f32, f32), f32)> {
     let paint = obj.paint.as_ref()?;
@@ -163,6 +175,8 @@ pub struct JabroApp {
     stroke_width: f32,
     /// Put the keyboard focus into the text field of the properties panel next frame.
     focus_text: bool,
+    /// Objects being dragged in the object list (ids in list order).
+    list_drag: Option<Vec<u64>>,
     tool: Tool,
     color_a: Rgba,
     color_b: Rgba,
@@ -218,6 +232,7 @@ impl JabroApp {
             pen: None,
             stroke_width: 4.0,
             focus_text: false,
+            list_drag: None,
             tool: Tool::Select,
             color_a: [220, 60, 50, 255],
             color_b: [40, 90, 200, 255],
@@ -1414,6 +1429,25 @@ impl JabroApp {
         }
     }
 
+    /// Drop `moving` (ids, in list order) into the object list before display row `gap`
+    /// (row 0 is the topmost object). One undo step; nothing happens if the order is unchanged.
+    fn reorder_display(&mut self, moving: &[u64], gap: usize) {
+        let display: Vec<u64> = self.doc.objects.iter().rev().map(|o| o.id).collect();
+        let new_display = reorder_ids(&display, moving, gap);
+        if new_display == display {
+            return;
+        }
+        self.checkpoint();
+        let mut pool: std::collections::HashMap<u64, Object> =
+            std::mem::take(&mut self.doc.objects).into_iter().map(|o| (o.id, o)).collect();
+        self.doc.objects = new_display.iter().rev().filter_map(|id| pool.remove(id)).collect();
+        self.dirty = true;
+        self.status = match moving.len() {
+            1 => "Moved in the stacking order".into(),
+            n => format!("Moved {n} objects in the stacking order"),
+        };
+    }
+
     fn apply_to_selected(&mut self, f: impl FnOnce(&mut Object)) {
         if let Some(id) = self.selected {
             if self.doc.find(id).is_some() {
@@ -1818,28 +1852,113 @@ impl JabroApp {
         enum A {
             Vis(u64),
             Sel(u64, bool),
+            DragStart(u64),
         }
         let mut action = None;
-        egui::ScrollArea::vertical()
+        let dragging = self.list_drag.clone();
+        // (object id, row rect) top to bottom, as displayed
+        let mut rows: Vec<(u64, Rect)> = Vec::new();
+        let out = egui::ScrollArea::vertical()
             .id_salt("objlist")
-            .max_height(190.0)
+            .max_height(220.0)
             .show(ui, |ui| {
                 for obj in self.doc.objects.iter().rev() {
-                    ui.horizontal(|ui| {
+                    let moving = dragging.as_ref().is_some_and(|d| d.contains(&obj.id));
+                    let row = ui.horizontal(|ui| {
                         let mut vis = obj.visible;
                         if ui.checkbox(&mut vis, "").on_hover_text("Visible").changed() {
                             action = Some(A::Vis(obj.id));
                         }
                         let sel = self.selected == Some(obj.id) || self.multi.contains(&obj.id);
+                        let text = if moving {
+                            egui::RichText::new(obj.name.as_str()).weak().italics()
+                        } else {
+                            egui::RichText::new(obj.name.as_str())
+                        };
                         let r = ui
-                            .selectable_label(sel, obj.name.as_str())
-                            .on_hover_text("Shift+click to add to the selection");
+                            .add(egui::SelectableLabel::new(sel, text))
+                            .interact(Sense::click_and_drag())
+                            .on_hover_text("Drag to change the stacking order · Shift+click to add to the selection");
                         if r.clicked() {
                             action = Some(A::Sel(obj.id, ui.input(|i| i.modifiers.shift)));
                         }
+                        if r.drag_started() {
+                            action = Some(A::DragStart(obj.id));
+                        }
+                        if r.hovered() || r.dragged() {
+                            ui.ctx().set_cursor_icon(if r.dragged() {
+                                egui::CursorIcon::Grabbing
+                            } else {
+                                egui::CursorIcon::Grab
+                            });
+                        }
                     });
+                    rows.push((obj.id, row.response.rect));
+                }
+                // scroll the list when dragging close to its top or bottom edge
+                if dragging.is_some() {
+                    if let Some(p) = ui.ctx().pointer_latest_pos() {
+                        let clip = ui.clip_rect();
+                        if p.y < clip.top() + 18.0 {
+                            ui.scroll_with_delta(Vec2::new(0.0, 6.0));
+                        } else if p.y > clip.bottom() - 18.0 {
+                            ui.scroll_with_delta(Vec2::new(0.0, -6.0));
+                        }
+                    }
                 }
             });
+        let list_rect = out.inner_rect;
+        if let Some(A::DragStart(id)) = action {
+            // dragging a selected object carries the whole selection along
+            let moving: Vec<u64> = if self.is_selected(id) {
+                rows.iter().map(|(i, _)| *i).filter(|i| self.is_selected(*i)).collect()
+            } else {
+                vec![id]
+            };
+            self.list_drag = Some(moving);
+            action = None;
+        }
+        if let Some(moving) = self.list_drag.clone() {
+            let (pos, down) = ui.input(|i| (i.pointer.latest_pos(), i.pointer.primary_down()));
+            let gap = pos.map(|p| {
+                rows.iter()
+                    .position(|(_, r)| p.y < r.center().y)
+                    .unwrap_or(rows.len())
+            });
+            let over_list = pos.is_some_and(|p| list_rect.expand2(Vec2::new(24.0, 30.0)).contains(p));
+            if let (Some(g), true) = (gap, over_list) {
+                let y = match rows.get(g) {
+                    Some((_, r)) => r.top() - 1.0,
+                    None => rows.last().map_or(list_rect.top(), |(_, r)| r.bottom() + 1.0),
+                };
+                let y = y.clamp(list_rect.top(), list_rect.bottom());
+                let accent = Color32::from_rgb(0, 170, 255);
+                let painter = ui.painter_at(list_rect.expand(3.0));
+                painter.line_segment(
+                    [Pos2::new(list_rect.left() + 2.0, y), Pos2::new(list_rect.right() - 2.0, y)],
+                    Stroke::new(2.5_f32, accent),
+                );
+                painter.circle_filled(Pos2::new(list_rect.left() + 3.0, y), 3.5, accent);
+            }
+            if let Some(p) = pos {
+                let label = match moving.as_slice() {
+                    [one] => self.doc.find(*one).map(|o| o.name.clone()).unwrap_or_default(),
+                    many => format!("{} objects", many.len()),
+                };
+                let layer = egui::LayerId::new(egui::Order::Tooltip, egui::Id::new("objlist_ghost"));
+                let painter = ui.ctx().layer_painter(layer);
+                let galley = painter.layout_no_wrap(label, egui::FontId::proportional(13.0), Color32::WHITE);
+                let r = Rect::from_min_size(p + Vec2::new(14.0, 6.0), galley.size()).expand(4.0);
+                painter.rect_filled(r, 4.0, Color32::from_rgba_unmultiplied(0, 120, 200, 220));
+                painter.galley(r.min + Vec2::splat(4.0), galley, Color32::WHITE);
+            }
+            if !down {
+                if let (Some(g), true) = (gap, over_list) {
+                    self.reorder_display(&moving, g);
+                }
+                self.list_drag = None;
+            }
+        }
         match action {
             Some(A::Vis(id)) => {
                 self.checkpoint();
@@ -1850,7 +1969,7 @@ impl JabroApp {
             }
             Some(A::Sel(id, true)) => self.toggle_in_selection(id),
             Some(A::Sel(id, false)) => self.select_only(Some(id)),
-            None => {}
+            Some(A::DragStart(_)) | None => {}
         }
         ui.horizontal(|ui| {
             let has = self.selected.is_some();
@@ -2783,6 +2902,31 @@ mod tests {
         assert_eq!(app.text_font, FontChoice::Impact, "also the default for new text");
         app.undo();
         assert!(matches!(&app.doc.objects[0].kind, ShapeKind::Text { font: FontChoice::Sans, .. }));
+    }
+
+    #[test]
+    fn reorder_ids_moves_blocks_to_a_gap() {
+        let list = [4, 3, 2, 1];
+        assert_eq!(reorder_ids(&list, &[1], 0), vec![1, 4, 3, 2], "bottom row to the top");
+        assert_eq!(reorder_ids(&list, &[4], 4), vec![3, 2, 1, 4], "top row to the end");
+        assert_eq!(reorder_ids(&list, &[4], 2), vec![3, 4, 2, 1], "down past one row");
+        assert_eq!(reorder_ids(&list, &[3, 1], 0), vec![3, 1, 4, 2], "a selection moves as a block");
+        assert_eq!(reorder_ids(&list, &[3], 1), list.to_vec(), "dropping in place changes nothing");
+        assert_eq!(reorder_ids(&list, &[3], 2), list.to_vec(), "gap right below itself too");
+    }
+
+    #[test]
+    fn dragging_in_the_object_list_restacks_with_one_undo_step() {
+        let mut app = app_with(vec![rect(1, 0.0, 0.0), rect(2, 10.0, 0.0), rect(3, 20.0, 0.0)]);
+        let order = |app: &JabroApp| app.doc.objects.iter().map(|o| o.id).collect::<Vec<_>>();
+        // list shows 3,2,1 (top first); drop object 1 above everything
+        app.reorder_display(&[1], 0);
+        assert_eq!(order(&app), vec![2, 3, 1], "object 1 is now drawn on top");
+        let undo_len = app.undo.len();
+        app.reorder_display(&[1], 0);
+        assert_eq!(app.undo.len(), undo_len, "a no-op drop records no undo step");
+        app.undo();
+        assert_eq!(order(&app), vec![1, 2, 3]);
     }
 
     #[test]
