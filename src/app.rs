@@ -69,7 +69,7 @@ impl Tool {
     }
     fn hint(self) -> &'static str {
         match self {
-            Tool::Select => "Click to select, Shift+click or drag a box to select several. Handles scale (Shift keeps aspect), the round handle rotates.",
+            Tool::Select => "Click to select, Shift+click or drag a box to select several. Handles scale, the round handle rotates. Double-click to edit the shape (or the text).",
             Tool::Node => "Drag nodes and handles (Alt breaks a smooth handle). Click a segment to add a node, double-click a node for smooth/corner, Del removes it.",
             Tool::Pen => "Click for corners, click+drag for curves. Click the first node to close, Enter to finish an open path, Backspace undoes a node, Esc cancels.",
             Tool::Perspective => "Drag any corner of the selected object to put it in perspective — paint follows along.",
@@ -100,6 +100,7 @@ enum Drag {
 
 enum PropAction {
     ConvertToPath,
+    EditNodes,
     ResetPerspective,
     FlipH,
     FlipV,
@@ -160,6 +161,8 @@ pub struct JabroApp {
     node_sel: Option<(u64, usize, usize)>,
     pen: Option<PenDraft>,
     stroke_width: f32,
+    /// Put the keyboard focus into the text field of the properties panel next frame.
+    focus_text: bool,
     tool: Tool,
     color_a: Rgba,
     color_b: Rgba,
@@ -214,6 +217,7 @@ impl JabroApp {
             node_sel: None,
             pen: None,
             stroke_width: 4.0,
+            focus_text: false,
             tool: Tool::Select,
             color_a: [220, 60, 50, 255],
             color_b: [40, 90, 200, 255],
@@ -773,6 +777,53 @@ impl JabroApp {
 
     // ---------------------------------------------------------------- tools
 
+    /// "Edit this object's shape": text goes to its text field, paths go to the node tool,
+    /// other shapes are turned into an editable path first (one undo step).
+    fn edit_shape(&mut self, id: u64) {
+        let Some(kind) = self.doc.find(id).map(|o| o.kind.clone()) else { return };
+        self.select_only(Some(id));
+        match kind {
+            ShapeKind::Text { .. } => {
+                self.focus_text = true;
+                self.status = "Type the new text in the properties panel; the font is right below it.".into();
+            }
+            ShapeKind::Bitmap => {
+                self.status = "Paint layers have no outline — reshape them with the Brush (eraser) instead.".into();
+            }
+            ShapeKind::Path { .. } => {
+                self.set_tool(Tool::Node);
+                self.status = "Drag nodes and handles. Click a segment to add a node.".into();
+            }
+            _ => {
+                self.checkpoint();
+                if let Some(o) = self.doc.find_mut(id) {
+                    vector::convert_to_path(o);
+                }
+                self.dirty = true;
+                self.set_tool(Tool::Node);
+                self.status = format!("{} turned into an editable path — drag the nodes.", kind.label());
+            }
+        }
+    }
+
+    /// Font from the tool panel: applies to the selected text object as well as to new text.
+    fn set_font(&mut self, f: FontChoice) {
+        self.text_font = f;
+        let Some(id) = self.selected else { return };
+        if !matches!(self.doc.find(id).map(|o| &o.kind), Some(ShapeKind::Text { .. })) {
+            return;
+        }
+        self.checkpoint();
+        if let Some(o) = self.doc.find_mut(id) {
+            if let ShapeKind::Text { font, .. } = &mut o.kind {
+                *font = f;
+            }
+            o.fit_text_width();
+            o.touch();
+        }
+        self.dirty = true;
+    }
+
     fn set_tool(&mut self, t: Tool) {
         if self.tool == Tool::Pen && t != Tool::Pen && self.pen.is_some() {
             self.finish_pen(false);
@@ -883,12 +934,18 @@ impl JabroApp {
         let hit = self.hit_test(p);
         self.select_only(hit);
         self.drag = Drag::None;
-        if let Some(o) = hit.and_then(|id| self.doc.find(id)) {
-            self.status = match o.kind {
-                ShapeKind::Path { .. } => "Drag a node or handle; click a segment to add a node.".into(),
-                ShapeKind::Bitmap => "Paint layers have no nodes.".into(),
-                _ => format!("{} — use Path › Convert to path (Ctrl+Shift+C) to edit its nodes.", o.kind.label()),
-            };
+        let Some(id) = hit else { return };
+        match self.doc.find(id).map(|o| &o.kind) {
+            Some(ShapeKind::Text { .. }) => {
+                self.status = "Text keeps its letters editable — use Convert to path in the properties panel to reshape the outlines.".into();
+            }
+            Some(ShapeKind::Bitmap) => self.status = "Paint layers have no nodes.".into(),
+            Some(ShapeKind::Path { .. }) => {
+                self.status = "Drag a node or handle; click a segment to add a node.".into()
+            }
+            // rectangles, ellipses, stars, freehand: make them editable on the spot
+            Some(_) => self.edit_shape(id),
+            None => {}
         }
     }
 
@@ -1705,13 +1762,33 @@ impl JabroApp {
             }
             Tool::Text => {
                 ui.strong("Text");
-                egui::ComboBox::from_id_salt("tool_font")
-                    .selected_text(self.text_font.label())
-                    .show_ui(ui, |ui| {
-                        for f in FontChoice::ALL {
-                            ui.selectable_value(&mut self.text_font, f, f.label());
-                        }
+                let selected_font = self
+                    .selected
+                    .and_then(|id| self.doc.find(id))
+                    .and_then(|o| match &o.kind {
+                        ShapeKind::Text { font, .. } => Some(*font),
+                        _ => None,
                     });
+                let current = selected_font.unwrap_or(self.text_font);
+                let mut f = current;
+                ui.horizontal(|ui| {
+                    ui.label("Font");
+                    egui::ComboBox::from_id_salt("tool_font")
+                        .selected_text(f.label())
+                        .show_ui(ui, |ui| {
+                            for c in FontChoice::ALL {
+                                ui.selectable_value(&mut f, c, c.label());
+                            }
+                        });
+                });
+                if f != current {
+                    self.set_font(f);
+                }
+                ui.small(if selected_font.is_some() {
+                    "Changes the selected text (and the next text you create)."
+                } else {
+                    "Font for new text. Select a text object to change its font."
+                });
             }
             Tool::Brush => {
                 ui.strong("Brush");
@@ -1817,9 +1894,11 @@ impl JabroApp {
         let mut resize: Option<(u32, u32)> = None;
         let has_clip = self.style_clipboard.is_some();
         let selected = self.selected;
+        let focus_text = std::mem::take(&mut self.focus_text);
+        let mut edit_nodes = false;
         egui::ScrollArea::vertical().id_salt("props").show(ui, |ui| {
             match selected.and_then(|id| self.doc.find_mut(id)) {
-                Some(obj) => object_props(ui, obj, &mut actions, has_clip),
+                Some(obj) => object_props(ui, obj, &mut actions, has_clip, focus_text),
                 None => {
                     doc_props(ui, &mut self.doc, &mut self.new_w, &mut self.new_h, &mut resize);
                 }
@@ -1833,6 +1912,7 @@ impl JabroApp {
                         vector::convert_to_path(o);
                     }
                 }
+                PropAction::EditNodes => edit_nodes = true,
                 PropAction::ResetPerspective => {
                     if let Some(o) = selected.and_then(|id| self.doc.find_mut(id)) {
                         o.reset_perspective();
@@ -1908,6 +1988,10 @@ impl JabroApp {
         if !busy {
             self.prop_edit_open = false;
         }
+        // runs after change detection because it records its own undo step
+        if let (true, Some(id)) = (edit_nodes, selected) {
+            self.edit_shape(id);
+        }
     }
 
     // ---------------------------------------------------------------- canvas
@@ -1971,7 +2055,11 @@ impl JabroApp {
             self.pressing = false;
         }
         let dbl = ctx.input(|i| i.pointer.button_double_clicked(egui::PointerButton::Primary));
-        if dbl && resp.hovered() && self.tool == Tool::Node {
+        if dbl && resp.hovered() && self.tool == Tool::Select {
+            if let Some(id) = latest.map(|p| self.to_doc(p)).and_then(|d| self.hit_test(d)) {
+                self.edit_shape(id);
+            }
+        } else if dbl && resp.hovered() && self.tool == Tool::Node {
             if let Some(Drag::Node { id, sp, ni, .. }) = latest.and_then(|p| self.pick_node(p)) {
                 self.checkpoint();
                 if let Some(o) = self.doc.find_mut(id) {
@@ -2227,7 +2315,13 @@ impl JabroApp {
 
 // -------------------------------------------------------------------- property panels
 
-fn object_props(ui: &mut egui::Ui, obj: &mut Object, actions: &mut Vec<PropAction>, has_clip: bool) {
+fn object_props(
+    ui: &mut egui::Ui,
+    obj: &mut Object,
+    actions: &mut Vec<PropAction>,
+    has_clip: bool,
+    focus_text: bool,
+) {
     ui.horizontal(|ui| {
         ui.strong(obj.kind.label());
         ui.text_edit_singleline(&mut obj.name);
@@ -2235,52 +2329,88 @@ fn object_props(ui: &mut egui::Ui, obj: &mut Object, actions: &mut Vec<PropActio
     ui.add(egui::Slider::new(&mut obj.opacity, 0.0..=1.0).text("Opacity"));
 
     let mut refit_text = false;
-    match &mut obj.kind {
-        ShapeKind::Rect { corner } => {
-            ui.add(egui::Slider::new(corner, 0.0..=1.0).text("Corner radius"));
-        }
-        ShapeKind::Polygon { sides, inner } => {
-            ui.add(egui::Slider::new(sides, 3..=24).text("Sides"));
-            ui.add(egui::Slider::new(inner, 0.1..=1.0).text("Star depth"));
-        }
-        ShapeKind::Text { text, font } => {
-            if ui.text_edit_multiline(text).changed() {
-                refit_text = true;
+    egui::CollapsingHeader::new("Shape").default_open(true).show(ui, |ui| {
+        match &mut obj.kind {
+            ShapeKind::Rect { corner } => {
+                ui.add(egui::Slider::new(corner, 0.0..=1.0).text("Corner radius"));
             }
-            let before = *font;
-            egui::ComboBox::from_id_salt("obj_font")
-                .selected_text(font.label())
-                .show_ui(ui, |ui| {
-                    for f in FontChoice::ALL {
-                        ui.selectable_value(font, f, f.label());
-                    }
+            ShapeKind::Polygon { sides, inner } => {
+                ui.add(egui::Slider::new(sides, 3..=24).text("Sides"));
+                ui.add(egui::Slider::new(inner, 0.1..=1.0).text("Star depth"));
+            }
+            ShapeKind::Ellipse => {
+                ui.label("Ellipse — use the handles to resize, or Edit nodes to reshape it freely.");
+            }
+            ShapeKind::Freehand { .. } => {
+                ui.label("Freehand shape.");
+            }
+            ShapeKind::Text { text, font } => {
+                ui.label("Text");
+                let r = ui.add(
+                    egui::TextEdit::multiline(text)
+                        .id(egui::Id::new("jabro_text_field"))
+                        .desired_rows(2)
+                        .desired_width(f32::INFINITY),
+                );
+                if focus_text {
+                    r.request_focus();
+                }
+                if r.changed() {
+                    refit_text = true;
+                }
+                let before = *font;
+                ui.horizontal(|ui| {
+                    ui.label("Font");
+                    egui::ComboBox::from_id_salt("obj_font")
+                        .selected_text(font.label())
+                        .show_ui(ui, |ui| {
+                            for f in FontChoice::ALL {
+                                ui.selectable_value(font, f, f.label());
+                            }
+                        });
                 });
-            if *font != before {
-                refit_text = true;
-            }
-        }
-        ShapeKind::Path { subpaths } => {
-            let nodes: usize = subpaths.iter().map(|s| s.nodes.len()).sum();
-            ui.label(format!("{} nodes in {} sub-path(s) — edit them with the node tool (A).", nodes, subpaths.len()));
-            let mut all_closed = subpaths.iter().all(|s| s.closed);
-            if ui.checkbox(&mut all_closed, "Closed").changed() {
-                for s in subpaths.iter_mut() {
-                    s.closed = all_closed;
+                if *font != before {
+                    refit_text = true;
                 }
             }
+            ShapeKind::Path { subpaths } => {
+                let nodes: usize = subpaths.iter().map(|s| s.nodes.len()).sum();
+                ui.label(format!("Path with {} nodes in {} sub-path(s).", nodes, subpaths.len()));
+                let mut all_closed = subpaths.iter().all(|s| s.closed);
+                if ui.checkbox(&mut all_closed, "Closed").changed() {
+                    for s in subpaths.iter_mut() {
+                        s.closed = all_closed;
+                    }
+                }
+            }
+            ShapeKind::Bitmap => {
+                ui.label("Paint layer — its shape is whatever you paint on it.");
+            }
         }
-        _ => {}
-    }
+        ui.horizontal_wrapped(|ui| match obj.kind {
+            ShapeKind::Bitmap => {}
+            ShapeKind::Text { .. } => {
+                if ui
+                    .button("Convert to path")
+                    .on_hover_text("Turns the letters into editable outlines. Afterwards the text can no longer be retyped.")
+                    .clicked()
+                {
+                    actions.push(PropAction::ConvertToPath);
+                }
+            }
+            _ => {
+                if ui
+                    .button("Edit nodes")
+                    .on_hover_text("Reshape the outline with the node tool (A). Shapes are turned into an editable path first.")
+                    .clicked()
+                {
+                    actions.push(PropAction::EditNodes);
+                }
+            }
+        });
+    });
     if refit_text {
         obj.fit_text_width();
-    }
-    if !matches!(obj.kind, ShapeKind::Path { .. } | ShapeKind::Bitmap)
-        && ui
-            .button("Convert to path")
-            .on_hover_text("Turn this shape into editable Bézier nodes (keeps perspective)")
-            .clicked()
-    {
-        actions.push(PropAction::ConvertToPath);
     }
 
     ui.add_space(4.0);
@@ -2618,5 +2748,50 @@ mod tests {
         // and delete it again
         app.delete_node();
         assert_eq!(path_of(&app.doc.objects[0])[0].nodes.len(), before);
+    }
+
+    fn text_obj(id: u64, s: &str) -> Object {
+        let kind = ShapeKind::Text {
+            text: s.into(),
+            font: FontChoice::Sans,
+        };
+        Object::new(id, kind, 300.0, 100.0, 160.0, 60.0)
+    }
+
+    #[test]
+    fn edit_shape_makes_rectangles_editable_and_text_retypable() {
+        let mut app = app_with(vec![rect(1, 50.0, 50.0), text_obj(2, "Hi")]);
+        app.edit_shape(1);
+        assert!(matches!(app.doc.objects[0].kind, ShapeKind::Path { .. }));
+        assert_eq!(app.tool, Tool::Node);
+        app.undo();
+        assert!(matches!(app.doc.objects[0].kind, ShapeKind::Rect { .. }), "one undo step");
+
+        app.tool = Tool::Select;
+        app.edit_shape(2);
+        assert!(app.focus_text, "text goes to its text field");
+        assert!(matches!(app.doc.objects[1].kind, ShapeKind::Text { .. }), "text stays text");
+    }
+
+    #[test]
+    fn font_dropdown_changes_the_selected_text() {
+        let mut app = app_with(vec![text_obj(2, "Hello")]);
+        app.select_only(Some(2));
+        app.set_font(FontChoice::Impact);
+        assert!(matches!(&app.doc.objects[0].kind,
+            ShapeKind::Text { font: FontChoice::Impact, text } if text == "Hello"));
+        assert_eq!(app.text_font, FontChoice::Impact, "also the default for new text");
+        app.undo();
+        assert!(matches!(&app.doc.objects[0].kind, ShapeKind::Text { font: FontChoice::Sans, .. }));
+    }
+
+    #[test]
+    fn node_tool_click_converts_an_ellipse_on_the_spot() {
+        let mut app = app_with(vec![Object::new(1, ShapeKind::Ellipse, 100.0, 100.0, 200.0, 100.0)]);
+        app.tool = Tool::Node;
+        click(&mut app, Pt::new(200.0, 150.0), Modifiers::NONE);
+        assert!(matches!(&app.doc.objects[0].kind,
+            ShapeKind::Path { subpaths } if subpaths[0].nodes.len() == 4));
+        assert_eq!(app.selected, Some(1));
     }
 }
