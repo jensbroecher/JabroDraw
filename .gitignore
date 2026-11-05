@@ -1,3 +1,5 @@
 /target
 *.png
 !docs/*.png
+# AI model weights (176 MB, above GitHub's file limit): fetched + verified by crates/jabro-models/build.rs
+/crates/jabro-models/models/*.onnx

@@ -4,6 +4,7 @@ use crate::brush::{self, BrushKind, BrushSettings, StrokeState};
 use crate::doc::*;
 use crate::geom::{simplify, Pt};
 use crate::npr::{self, NprJob, NprWorker};
+use crate::ai::{self, AiJob, AiModel, AiWorker};
 use crate::render::Renderer;
 use crate::vector::{self, BoolOp};
 use crate::{demo, imageops, io, shapes, styles};
@@ -126,11 +127,28 @@ enum PropAction {
     ResetPerspective,
     FlipH,
     FlipV,
-    ClearPaint,
+    ResetBrushWork,
+    AiRemoveBackground,
     CopyStyle,
     PasteStyle,
     Front,
     Back,
+}
+
+/// Settings of the properties panel's Picture section.
+struct PictureUi {
+    tol: f32,
+    feather: f32,
+    ai_model: AiModel,
+    ai_busy: bool,
+}
+
+/// Undo all brush work on an object: pictures go back to how they were imported, other
+/// objects lose their painting; painted transparency is cleared either way.
+fn reset_brush_work(o: &mut Object) {
+    o.paint = o.original.as_ref().map(|i| i.0.clone());
+    o.mask = None;
+    o.touch();
 }
 
 fn handle_pos(q: &[Pt; 4], i: usize) -> Pt {
@@ -243,6 +261,10 @@ pub struct JabroApp {
     /// Colour tolerance (0..1) and edge feather (px) for background removal / magic wand.
     bg_tol: f32,
     bg_feather: f32,
+    ai: AiWorker,
+    ai_model: AiModel,
+    /// Object the AI is currently working on.
+    ai_busy: Option<u64>,
     /// The document as it was last saved / opened (to detect unsaved changes).
     saved_doc: Document,
     close_dialog: bool,
@@ -289,10 +311,14 @@ impl JabroApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         cc.egui_ctx.set_visuals(egui::Visuals::dark());
         let ctx = cc.egui_ctx.clone();
-        Self::with_worker(NprWorker::new(move || ctx.request_repaint()))
+        let ctx2 = ctx.clone();
+        Self::with_worker(
+            NprWorker::new(move || ctx.request_repaint()),
+            AiWorker::new(move || ctx2.request_repaint()),
+        )
     }
 
-    fn with_worker(worker: NprWorker) -> Self {
+    fn with_worker(worker: NprWorker, ai: AiWorker) -> Self {
         let doc = demo::demo_document();
         let (new_w, new_h) = (doc.width, doc.height);
         let saved_doc = doc.clone();
@@ -310,6 +336,9 @@ impl JabroApp {
             light_sel: None,
             bg_tol: 0.15,
             bg_feather: 1.5,
+            ai,
+            ai_model: AiModel::Best,
+            ai_busy: None,
             saved_doc,
             close_dialog: false,
             allow_close: false,
@@ -1399,6 +1428,49 @@ impl JabroApp {
         };
     }
 
+    /// Send the picture to the AI worker; the result arrives in `poll_ai`.
+    fn start_ai_removal(&mut self, id: u64) {
+        if self.ai_busy.is_some() {
+            return;
+        }
+        let Some(img) = self.doc.find(id).and_then(|o| o.paint.clone()) else {
+            self.status = "AI background removal works on pictures — import one first.".into();
+            return;
+        };
+        self.ai.submit(AiJob {
+            id,
+            model: self.ai_model,
+            img,
+        });
+        self.ai_busy = Some(id);
+        self.status = "AI is looking for the subject…".into();
+    }
+
+    fn poll_ai(&mut self) {
+        while let Ok(ev) = self.ai.rx.try_recv() {
+            self.ai_busy = None;
+            match ev {
+                ai::AiEvent::Mask { id, mask } => {
+                    let fits = self.doc.find(id).and_then(|o| o.paint.as_ref()).is_some_and(|p| {
+                        p.width() == mask.width() && p.height() == mask.height()
+                    });
+                    if !fits {
+                        continue; // picture deleted or changed meanwhile
+                    }
+                    self.checkpoint();
+                    if let Some(o) = self.doc.find_mut(id) {
+                        o.mask = Some(Arc::new(mask));
+                        o.touch();
+                    }
+                    self.dirty = true;
+                    self.status =
+                        "Background removed. Touch up with the Brush tool's Transparency: hide / reveal.".into();
+                }
+                ai::AiEvent::Error(e) => self.status = format!("AI background removal failed: {e}"),
+            }
+        }
+    }
+
     fn remove_background(&mut self, id: u64) {
         let (tol, feather) = (self.bg_tol, self.bg_feather);
         let mut removed = 0;
@@ -1437,7 +1509,9 @@ impl JabroApp {
         let id = self.doc.alloc_id();
         let mut obj = Object::new(id, ShapeKind::Bitmap, c.x - w * 0.5, c.y - h * 0.5, w, h);
         obj.fill.kind = FillKind::None;
-        obj.paint = Some(Arc::new(img));
+        let img = Arc::new(img);
+        obj.original = Some(ImageData(img.clone()));
+        obj.paint = Some(img);
         obj.name = path
             .file_stem()
             .map(|s| s.to_string_lossy().into_owned())
@@ -2386,6 +2460,19 @@ impl JabroApp {
                     ui.add(egui::Slider::new(&mut self.brush.spacing, 0.02..=1.0).text("Spacing"));
                     ui.checkbox(&mut self.brush.pressure, "Pen pressure");
                 }
+                let has_work = self
+                    .selected
+                    .and_then(|id| self.doc.find(id))
+                    .is_some_and(|o| o.mask.is_some() || o.paint.is_some() && o.original.as_ref().is_none_or(|orig| !o.paint.as_ref().is_some_and(|p| Arc::ptr_eq(p, &orig.0))));
+                if has_work
+                    && ui
+                        .button("Reset brush work")
+                        .on_hover_text("Back to the original: removes painting and painted transparency on the selected object")
+                        .clicked()
+                {
+                    self.apply_to_selected(reset_brush_work);
+                    self.status = "Brush work reset — back to the original.".into();
+                }
                 if self.brush.kind.is_mask() {
                     ui.small("Paints the selected object's transparency: hide makes it see-through, reveal brings it back. Works on pictures, shapes and text. Low flow = partly transparent.");
                 } else if self.brush.kind != BrushKind::MagicWand {
@@ -2571,16 +2658,21 @@ impl JabroApp {
         let selected = self.selected;
         let focus_text = std::mem::take(&mut self.focus_text);
         let mut edit_nodes = false;
-        let mut bg = (self.bg_tol, self.bg_feather);
+        let mut pic = PictureUi {
+            tol: self.bg_tol,
+            feather: self.bg_feather,
+            ai_model: self.ai_model,
+            ai_busy: self.ai_busy.is_some(),
+        };
         egui::ScrollArea::vertical().id_salt("props").show(ui, |ui| {
             match selected.and_then(|id| self.doc.find_mut(id)) {
-                Some(obj) => object_props(ui, obj, &mut actions, has_clip, focus_text, &mut bg),
+                Some(obj) => object_props(ui, obj, &mut actions, has_clip, focus_text, &mut pic),
                 None => {
                     doc_props(ui, &mut self.doc, &mut self.new_w, &mut self.new_h, &mut resize);
                 }
             }
         });
-        (self.bg_tol, self.bg_feather) = bg;
+        (self.bg_tol, self.bg_feather, self.ai_model) = (pic.tol, pic.feather, pic.ai_model);
 
         for a in actions {
             match a {
@@ -2640,9 +2732,15 @@ impl JabroApp {
                         o.quad = [q[3], q[2], q[1], q[0]];
                     }
                 }
-                PropAction::ClearPaint => {
+                PropAction::ResetBrushWork => {
                     if let Some(o) = selected.and_then(|id| self.doc.find_mut(id)) {
-                        o.paint = None;
+                        reset_brush_work(o);
+                        self.status = "Brush work reset — back to the original.".into();
+                    }
+                }
+                PropAction::AiRemoveBackground => {
+                    if let Some(id) = selected {
+                        self.start_ai_removal(id);
                     }
                 }
                 PropAction::CopyStyle => {
@@ -3147,7 +3245,7 @@ fn object_props(
     actions: &mut Vec<PropAction>,
     has_clip: bool,
     focus_text: bool,
-    bg: &mut (f32, f32),
+    pic: &mut PictureUi,
 ) {
     ui.horizontal(|ui| {
         ui.strong(obj.kind.label());
@@ -3405,16 +3503,46 @@ fn object_props(
             if let Some(p) = &obj.paint {
                 ui.label(format!("{} × {} px", p.width(), p.height()));
             }
-            ui.add(egui::Slider::new(&mut bg.0, 0.01..=0.6).text("Tolerance"));
-            ui.add(egui::Slider::new(&mut bg.1, 0.0..=8.0).text("Soft edge"));
+            ui.add_space(4.0);
+            ui.strong("Remove background with AI");
+            ui.horizontal(|ui| {
+                for m in AiModel::ALL {
+                    ui.radio_value(&mut pic.ai_model, m, m.label());
+                }
+            });
+            if pic.ai_busy {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label("Finding the subject…");
+                });
+            } else if ui
+                .button("Remove background (AI)")
+                .on_hover_text("Finds the main subject and hides everything else. Works on busy photos too.")
+                .clicked()
+            {
+                actions.push(PropAction::AiRemoveBackground);
+            }
+            ui.small(ai::ATTRIBUTION);
+            ui.add_space(6.0);
+            ui.strong("Remove background by colour");
+            ui.add(egui::Slider::new(&mut pic.tol, 0.01..=0.6).text("Tolerance"));
+            ui.add(egui::Slider::new(&mut pic.feather, 0.0..=8.0).text("Soft edge"));
             if ui
-                .button("Remove background")
+                .button("Remove background (colour)")
                 .on_hover_text("Hides everything that touches the border and has the border's colour")
                 .clicked()
             {
                 actions.push(PropAction::RemoveBackground);
             }
-            ui.small("Works best on plain or studio backgrounds. Click leftovers away with the Brush tool's Magic wand, or paint them with Transparency: hide / reveal. The original pixels are kept.");
+            ui.small("Best for plain or studio backgrounds. Touch up with the Brush tool's Magic wand or Transparency: hide / reveal — the original pixels are always kept.");
+            ui.add_space(6.0);
+            if ui
+                .button("Reset brush work")
+                .on_hover_text("Back to the picture as imported: removes painting and all hidden / revealed areas")
+                .clicked()
+            {
+                actions.push(PropAction::ResetBrushWork);
+            }
         });
     }
 
@@ -3539,13 +3667,18 @@ fn object_props(
         match &obj.paint {
             Some(p) => {
                 ui.label(format!("Paint layer: {} × {} px", p.width(), p.height()));
-                if ui.button("Clear paint").clicked() {
-                    actions.push(PropAction::ClearPaint);
-                }
             }
             None => {
                 ui.label("No paint yet — use the Brush tool on this object.");
             }
+        }
+        if (obj.paint.is_some() || obj.mask.is_some())
+            && ui
+                .button("Reset brush work")
+                .on_hover_text("Removes everything painted on this object and its painted transparency")
+                .clicked()
+        {
+            actions.push(PropAction::ResetBrushWork);
         }
     });
 }
@@ -3581,6 +3714,7 @@ impl eframe::App for JabroApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.handle_close(ctx);
         self.handle_dropped_files(ctx);
+        self.poll_ai();
         self.update_title(ctx);
         self.shortcuts(ctx);
         self.read_pressure(ctx);
@@ -3607,7 +3741,15 @@ impl eframe::App for JabroApp {
                 .show(ctx, |ui| {
                     ui.heading("Jabro Draw 0.1");
                     ui.label("A hybrid vector + paint editor: shapes you can paint on, bevel, texture, bend into perspective and render with NPR looks.");
-                    ui.label("Inspired by the classic VectorBit idea. Written in Rust with egui + tiny-skia.");
+                    ui.label("Written in Rust with egui, tiny-skia, tract and image.");
+                    ui.separator();
+                    ui.strong("Credits & licenses");
+                    ui.label(ai::ATTRIBUTION);
+                    ui.label(
+                        "Built from open-source libraries under permissive licenses (MIT, Apache-2.0, BSD and \
+                         similar). See THIRD_PARTY_NOTICES.md and the licenses folder that come with the program.",
+                    );
+                    ui.label("Text objects use the fonts installed on this computer; they are not part of Jabro Draw.");
                 });
             self.show_about = open;
         }
@@ -3620,7 +3762,7 @@ mod tests {
     use super::*;
 
     fn app_with(objects: Vec<Object>) -> JabroApp {
-        let mut app = JabroApp::with_worker(NprWorker::new(|| {}));
+        let mut app = JabroApp::with_worker(NprWorker::new(|| {}), AiWorker::new(|| {}));
         let mut doc = Document::new(800, 600);
         doc.next_id = 100;
         doc.objects = objects;
@@ -3942,6 +4084,61 @@ mod tests {
         let m = app.doc.objects[0].mask.as_ref().unwrap();
         assert!(m.pixel(100, 50).unwrap().red() > 245, "revealed again");
         assert!(app.doc.objects[0].paint.as_ref().unwrap().pixel(100, 50).unwrap().green() > 100, "pixels untouched");
+    }
+
+    #[test]
+    fn reset_brush_work_and_ai_removal_on_a_picture() {
+        let mut app = app_with(vec![]);
+        let path = picture_file();
+        app.import_image_object(&path, Some(Pt::new(400.0, 300.0)));
+        let _ = std::fs::remove_file(&path);
+        let id = app.doc.objects[0].id;
+
+        // paint on the picture and hide part of it
+        app.tool = Tool::Brush;
+        app.brush.kind = BrushKind::Round;
+        drag(&mut app, Pt::new(320.0, 270.0), Pt::new(480.0, 330.0), Modifiers::NONE);
+        app.brush.kind = BrushKind::Hide;
+        click(&mut app, Pt::new(330.0, 330.0), Modifiers::NONE);
+        let o = &app.doc.objects[0];
+        assert!(!Arc::ptr_eq(o.paint.as_ref().unwrap(), &o.original.as_ref().unwrap().0), "pixels painted");
+        assert!(o.mask.is_some());
+
+        app.apply_to_selected(reset_brush_work);
+        let o = &app.doc.objects[0];
+        assert!(Arc::ptr_eq(o.paint.as_ref().unwrap(), &o.original.as_ref().unwrap().0), "back to the original");
+        assert!(o.mask.is_none());
+
+        // AI background removal runs on the worker thread
+        app.ai_model = AiModel::Fast;
+        app.start_ai_removal(id);
+        assert_eq!(app.ai_busy, Some(id));
+        let t0 = std::time::Instant::now();
+        while app.ai_busy.is_some() && t0.elapsed().as_secs() < 60 {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            app.poll_ai();
+        }
+        let m = app.doc.objects[0].mask.as_ref().expect("AI produced a mask");
+        assert!(m.pixel(100, 50).unwrap().red() > 200, "green square kept");
+        assert!(m.pixel(3, 3).unwrap().red() < 60, "white background hidden");
+        app.undo();
+        assert!(app.doc.objects[0].mask.is_none(), "AI result is one undo step");
+    }
+
+    #[test]
+    fn untouched_pictures_are_saved_once() {
+        let mut app = app_with(vec![]);
+        let path = picture_file();
+        app.import_image_object(&path, None);
+        let _ = std::fs::remove_file(&path);
+        let file = std::env::temp_dir().join(format!("jabro_dedupe_{}.jabro", std::process::id()));
+        io::save(&app.doc, &file).unwrap();
+        let text = std::fs::read_to_string(&file).unwrap();
+        let back = io::load(&file).unwrap();
+        let _ = std::fs::remove_file(&file);
+        assert!(text.contains("\"paint\":null") && text.contains("paint_is_original"), "stored once");
+        let o = &back.objects[0];
+        assert!(Arc::ptr_eq(o.paint.as_ref().unwrap(), &o.original.as_ref().unwrap().0));
     }
 
     #[test]

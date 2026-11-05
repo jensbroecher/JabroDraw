@@ -1,7 +1,7 @@
 # Jabro Draw
 
-A hybrid **vector + paint** graphics editor written in Rust. It is inspired by the classic
-Real-DRAW PRO "VectorBit" idea:
+A hybrid **vector + paint** graphics editor written in Rust, inspired by the workflow of classic
+hybrid editors such as Real-DRAW PRO (an independent program — no code or assets are shared):
 
 - draw **vector shapes and text** that stay editable
 - give them **materials**: bevels (round, chisel, cove, ridge, pillow), gloss, chrome reflection,
@@ -55,7 +55,9 @@ Styles: `none watercolor oil impressionist pointillism pencil colorpencil comic`
 - **Pictures**: File › Import picture (Ctrl+I), or drag image files onto the window (PNG, JPEG, WebP,
   BMP, GIF, TIFF, TGA, ICO). A picture is a normal object, so you can bevel, outline, light, paint
   on and perspective-bend it. Its **Remove background** button hides everything around the subject
-  that has the border's colour. The Brush tool's **Magic wand** clicks away single areas, and
+  that has the border's colour, and **Remove background (AI)** finds the main subject even on busy
+  photos (U²-Net, built in and run offline; Best or Fast). **Reset brush work** returns a picture
+  to how it was imported. The Brush tool's **Magic wand** clicks away single areas, and
   **Transparency: hide / reveal** paints transparency by hand on any object. All of this goes into a
   mask, so the original pixels are never destroyed (Clear / Invert under Transparency).
 - **Picture textures**: Fill › Texture › Image file… fills any shape with a picture (stretched or
@@ -84,3 +86,13 @@ cargo test --release
 
 See [docs/DESIGN.md](docs/DESIGN.md) for the research notes on Real-DRAW PRO, the architecture
 and the roadmap.
+
+## Licenses
+
+Jabro Draw has no license chosen yet (all rights reserved by its author). The open-source parts it
+is built from, including the embedded U²-Net AI model, are listed with their licenses in
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md). Ship that file and the `licenses/` folder with
+every copy of the program you distribute.
+
+The AI model files (176 MB) are too big for git. The first build downloads them once from the
+rembg project and verifies their checksums (`crates/jabro-models/build.rs`).

@@ -619,6 +619,12 @@ pub struct Object {
     /// object. Background removal and the Hide / Reveal brushes write here, never into pixels.
     #[serde(default, with = "pixmap_serde")]
     pub mask: Option<Arc<Pixmap>>,
+    /// The picture as imported, so brush work on it can be reset.
+    #[serde(default)]
+    pub original: Option<ImageData>,
+    /// Save-file shortcut: the paint layer is still the untouched original (stored once).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub paint_is_original: bool,
     #[serde(skip)]
     pub rev: u64,
 }
@@ -641,6 +647,8 @@ impl Object {
             visible: true,
             paint: None,
             mask: None,
+            original: None,
+            paint_is_original: false,
             rev: next_rev(),
         }
     }
@@ -761,6 +769,7 @@ impl Object {
             && self.stroke == o.stroke
             && self.effects == o.effects
             && self.transparency == o.transparency
+            && self.original == o.original
             && self.opacity == o.opacity
             && self.visible == o.visible
             && paint_same

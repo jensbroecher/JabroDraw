@@ -1,10 +1,11 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-//! Jabro Draw — a hybrid vector + paint editor inspired by the classic "VectorBit" idea:
-//! every object is an editable vector shape that also carries its own paint layer,
+//! Jabro Draw — a hybrid vector + paint editor: every object is an editable vector shape
+//! that also carries its own paint layer, transparency mask, lights and other
 //! non-destructive material effects (bevel, shadow, glow, textures), a free perspective
 //! quad, and the whole picture can be rendered through an NPR "look".
 
+mod ai;
 mod app;
 mod brush;
 mod demo;
@@ -33,6 +34,16 @@ fn main() -> eframe::Result {
         let style = args.get(3).map(|s| s.as_str()).unwrap_or("none");
         if let Err(e) = demo::render_demo_to_png(&args[2], style) {
             eprintln!("render failed: {e}");
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
+
+    // Headless AI cut-out: jabro-draw --ai-cutout in.jpg out.png [fast|best]
+    if args.len() >= 4 && args[1] == "--ai-cutout" {
+        let model = if args.get(4).map(|s| s.as_str()) == Some("fast") { ai::AiModel::Fast } else { ai::AiModel::Best };
+        if let Err(e) = ai::cutout_file(&args[2], &args[3], model) {
+            eprintln!("cut-out failed: {e}");
             std::process::exit(1);
         }
         return Ok(());

@@ -95,6 +95,20 @@ pen pressure (if the tablet driver reports it through Windows touch/pen events);
   multiple coloured lights, bump map from texture.
 - Import PNG / JPG as bitmap objects; use any image as a texture.
 
+- ✅ **v0.3** Real-DRAW-style object **transparency** (flat, linear, radial, texture, picture),
+  per-object **lights** (point, spot, distant, which also shade the bevel relief), richer **outlines**
+  (inside, centred or outside; dashed or dotted; traced around paint), **pictures** (import or drop
+  a file, use as a fill or transparency texture), a non-destructive painted **transparency mask**
+  (hide and reveal brushes), background removal by colour, magic wand and **AI**, reset brush
+  work, and a save-before-close prompt.
+  - Render order per object: fill → paint → (mask → trace outline for pictures | outline → mask
+    for shapes) → bevel → lights → transparency → warp → shadow and glow.
+  - AI: U²-Net (Apache-2.0) runs through the pure-Rust `tract` ONNX engine on a worker thread.
+    Its 320×320 prediction is upscaled and refined with a guided filter, so edges snap to the
+    photo, and the result is written into the object's mask. The weights are embedded through the
+    `jabro-models` crate. Its build script fetches them with SHA-256 checks, because they can't
+    go into git.
+
 ### Phase 3: painting
 - Proper Wintab / Windows Ink pressure + tilt.
 - Image-hose (nozzle) brushes, clone brush, *liquify* ("liquid shape") brushes.
