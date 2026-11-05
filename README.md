@@ -39,7 +39,7 @@ Styles: `none watercolor oil impressionist pointillism pencil colorpencil comic`
 |---|---|
 | V | Select. Drag to move; handles scale (Shift keeps the aspect); the round handle rotates (Shift snaps to 15°). Shift+click or drag a box on empty canvas to select several objects. |
 | A | Edit nodes. Drag nodes and Bézier handles (Alt breaks a smooth handle). Click a segment to add a node, double-click a node to switch smooth/corner, Del removes it. |
-| P | Pen. Click for corners, click+drag for curves. Click the first node to close (fills it), Enter for an open stroke, Backspace removes the last node, Esc cancels. |
+| P | Pen. Click for corners, click+drag for curves. **Right-click** (or click the first node) closes the gap and fills the shape, Enter for an open stroke, Backspace removes the last node, Esc cancels. |
 | Q | Perspective. Drag the 4 orange corners. |
 | R / E / S | Rectangle / ellipse / star-polygon. Drag to draw, or click for a default size. |
 | F | Freehand closed shape (becomes a smooth vector curve). |

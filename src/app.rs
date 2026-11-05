@@ -71,7 +71,7 @@ impl Tool {
         match self {
             Tool::Select => "Click to select, Shift+click or drag a box to select several. Handles scale, the round handle rotates. Double-click to edit the shape (or the text).",
             Tool::Node => "Drag nodes and handles (Alt breaks a smooth handle). Click a segment to add a node, double-click a node for smooth/corner, Del removes it.",
-            Tool::Pen => "Click for corners, click+drag for curves. Click the first node to close, Enter to finish an open path, Backspace undoes a node, Esc cancels.",
+            Tool::Pen => "Click for corners, click+drag for curves. Right-click (or click the first node) closes the shape, Enter finishes an open path, Backspace undoes a node, Esc cancels.",
             Tool::Perspective => "Drag any corner of the selected object to put it in perspective — paint follows along.",
             Tool::Rect => "Drag to draw a rectangle (Shift = square). Click for a default size.",
             Tool::Ellipse => "Drag to draw an ellipse (Shift = circle).",
@@ -472,6 +472,15 @@ impl JabroApp {
         self.select_only(Some(id));
         self.dirty = true;
         self.status = if closed { "Closed path created." } else { "Open path created (stroke only)." }.into();
+    }
+
+    /// Right-click with the pen: join the last node back to the first and finish the shape.
+    fn close_pen_path(&mut self) {
+        match self.pen.as_ref().map(|d| d.nodes.len()) {
+            Some(n) if n >= 2 => self.finish_pen(true),
+            Some(_) => self.status = "Place at least two nodes before closing the path.".into(),
+            None => {}
+        }
     }
 
     /// Node / handle positions of a path object in screen space.
@@ -1745,7 +1754,7 @@ impl JabroApp {
             Tool::Pen => {
                 ui.strong("Pen");
                 ui.add(egui::Slider::new(&mut self.stroke_width, 0.5..=40.0).text("Line width"));
-                ui.small("Closed paths are filled with the first colour; open paths become strokes of this width.");
+                ui.small("Right-click closes the shape (filled with the first colour). Enter leaves it open as a stroke of this width.");
                 if self.pen.is_some() {
                     ui.horizontal(|ui| {
                         if ui.button("Finish open").clicked() {
@@ -2172,6 +2181,10 @@ impl JabroApp {
         if self.pressing && (released || !down) {
             self.on_release(mods);
             self.pressing = false;
+        }
+        let right = ctx.input(|i| i.pointer.button_pressed(egui::PointerButton::Secondary));
+        if right && resp.hovered() && self.tool == Tool::Pen {
+            self.close_pen_path();
         }
         let dbl = ctx.input(|i| i.pointer.button_double_clicked(egui::PointerButton::Primary));
         if dbl && resp.hovered() && self.tool == Tool::Select {
@@ -2794,6 +2807,26 @@ mod tests {
         let h = node_doc(o, sp.nodes[1].h_out);
         assert!(h.dist(Pt::new(350.0, 160.0)) < 0.5, "handle follows the drag: {h:?}");
         assert_eq!(app.selected, Some(o.id));
+        app.undo();
+        assert!(app.doc.objects.is_empty());
+    }
+
+    #[test]
+    fn pen_right_click_closes_the_gap() {
+        let mut app = app_with(vec![]);
+        app.tool = Tool::Pen;
+        click(&mut app, Pt::new(100.0, 100.0), Modifiers::NONE);
+        app.close_pen_path(); // only one node: keeps drawing
+        assert!(app.pen.is_some() && app.doc.objects.is_empty());
+        click(&mut app, Pt::new(300.0, 120.0), Modifiers::NONE);
+        click(&mut app, Pt::new(220.0, 300.0), Modifiers::NONE);
+        app.close_pen_path(); // what a right-click does
+        assert!(app.pen.is_none());
+        let o = &app.doc.objects[0];
+        let sp = &path_of(o)[0];
+        assert!(sp.closed);
+        assert_eq!(sp.nodes.len(), 3, "no extra node added at the right-click");
+        assert_eq!(o.fill.kind, FillKind::Solid, "closed shapes are filled");
         app.undo();
         assert!(app.doc.objects.is_empty());
     }
