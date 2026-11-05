@@ -1,0 +1,672 @@
+//! Document model. Every object is a "hybrid" object:
+//! a vector shape (resolution independent) + an optional paint layer (pixels, in the
+//! object's own local space, clipped by the shape) + non-destructive effects + a free
+//! placement quad that allows move / scale / rotate / perspective.
+
+use crate::geom::{Homography, Pt};
+use serde::{Deserialize, Serialize};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use tiny_skia::Pixmap;
+
+/// Unmultiplied sRGB colour.
+pub type Rgba = [u8; 4];
+
+static REV: AtomicU64 = AtomicU64::new(1);
+
+/// Globally unique content revision, used as a render-cache key.
+pub fn next_rev() -> u64 {
+    REV.fetch_add(1, Ordering::Relaxed)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FontChoice {
+    Sans,
+    Bold,
+    Black,
+    Serif,
+    Impact,
+    Script,
+}
+
+impl FontChoice {
+    pub const ALL: [FontChoice; 6] = [
+        FontChoice::Sans,
+        FontChoice::Bold,
+        FontChoice::Black,
+        FontChoice::Serif,
+        FontChoice::Impact,
+        FontChoice::Script,
+    ];
+    pub fn label(self) -> &'static str {
+        match self {
+            FontChoice::Sans => "Sans",
+            FontChoice::Bold => "Sans Bold",
+            FontChoice::Black => "Black",
+            FontChoice::Serif => "Serif",
+            FontChoice::Impact => "Impact",
+            FontChoice::Script => "Script",
+        }
+    }
+}
+
+/// One Bézier node; all coordinates normalised to the object's local box (0..1).
+/// A straight segment has its handles sitting on the nodes.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct PathNode {
+    pub p: [f32; 2],
+    pub h_in: [f32; 2],
+    pub h_out: [f32; 2],
+    #[serde(default)]
+    pub smooth: bool,
+}
+
+impl PathNode {
+    pub fn corner(p: [f32; 2]) -> Self {
+        Self {
+            p,
+            h_in: p,
+            h_out: p,
+            smooth: false,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SubPath {
+    pub nodes: Vec<PathNode>,
+    pub closed: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub enum ShapeKind {
+    /// `corner` = corner radius as a fraction (0..1) of half the shorter side.
+    Rect { corner: f32 },
+    Ellipse,
+    /// `inner` = 1 gives a regular polygon, < 1 a star.
+    Polygon { sides: u32, inner: f32 },
+    /// Closed smooth curve through normalised (0..1) points.
+    Freehand { points: Vec<[f32; 2]> },
+    Text { text: String, font: FontChoice },
+    /// Pure paint object; its shape is the alpha of its paint layer.
+    Bitmap,
+    /// Editable Bézier path (pen tool, boolean results, converted shapes).
+    Path { subpaths: Vec<SubPath> },
+}
+
+impl ShapeKind {
+    pub fn label(&self) -> &'static str {
+        match self {
+            ShapeKind::Rect { .. } => "Rectangle",
+            ShapeKind::Ellipse => "Ellipse",
+            ShapeKind::Polygon { .. } => "Star",
+            ShapeKind::Freehand { .. } => "Shape",
+            ShapeKind::Text { .. } => "Text",
+            ShapeKind::Bitmap => "Paint layer",
+            ShapeKind::Path { .. } => "Path",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FillKind {
+    None,
+    Solid,
+    Linear,
+    Radial,
+    Texture,
+}
+
+impl FillKind {
+    pub const ALL: [FillKind; 5] = [
+        FillKind::None,
+        FillKind::Solid,
+        FillKind::Linear,
+        FillKind::Radial,
+        FillKind::Texture,
+    ];
+    pub fn label(self) -> &'static str {
+        match self {
+            FillKind::None => "None",
+            FillKind::Solid => "Solid",
+            FillKind::Linear => "Linear gradient",
+            FillKind::Radial => "Radial gradient",
+            FillKind::Texture => "Texture",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TextureKind {
+    Clouds,
+    Wood,
+    Marble,
+    Canvas,
+    Paper,
+    BrushedMetal,
+    Cells,
+}
+
+impl TextureKind {
+    pub const ALL: [TextureKind; 7] = [
+        TextureKind::Clouds,
+        TextureKind::Wood,
+        TextureKind::Marble,
+        TextureKind::Canvas,
+        TextureKind::Paper,
+        TextureKind::BrushedMetal,
+        TextureKind::Cells,
+    ];
+    pub fn label(self) -> &'static str {
+        match self {
+            TextureKind::Clouds => "Clouds",
+            TextureKind::Wood => "Wood",
+            TextureKind::Marble => "Marble",
+            TextureKind::Canvas => "Canvas weave",
+            TextureKind::Paper => "Paper",
+            TextureKind::BrushedMetal => "Brushed metal",
+            TextureKind::Cells => "Stone cells",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct FillStyle {
+    pub kind: FillKind,
+    pub a: Rgba,
+    pub b: Rgba,
+    /// Gradient angle in degrees (90 = top to bottom).
+    pub angle: f32,
+    pub texture: TextureKind,
+    pub tex_scale: f32,
+}
+
+impl Default for FillStyle {
+    fn default() -> Self {
+        Self {
+            kind: FillKind::Solid,
+            a: [70, 130, 220, 255],
+            b: [20, 40, 120, 255],
+            angle: 90.0,
+            texture: TextureKind::Clouds,
+            tex_scale: 1.0,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct StrokeStyle {
+    pub enabled: bool,
+    pub color: Rgba,
+    pub width: f32,
+}
+
+impl Default for StrokeStyle {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            color: [30, 30, 30, 255],
+            width: 3.0,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum BevelProfile {
+    Round,
+    Chisel,
+    Cove,
+    Ridge,
+    Pillow,
+}
+
+impl BevelProfile {
+    pub const ALL: [BevelProfile; 5] = [
+        BevelProfile::Round,
+        BevelProfile::Chisel,
+        BevelProfile::Cove,
+        BevelProfile::Ridge,
+        BevelProfile::Pillow,
+    ];
+    pub fn label(self) -> &'static str {
+        match self {
+            BevelProfile::Round => "Round",
+            BevelProfile::Chisel => "Chisel",
+            BevelProfile::Cove => "Cove",
+            BevelProfile::Ridge => "Ridge",
+            BevelProfile::Pillow => "Pillow (inflate)",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Bevel {
+    pub enabled: bool,
+    pub profile: BevelProfile,
+    pub width: f32,
+    pub depth: f32,
+    pub softness: f32,
+    /// Light azimuth in degrees, 0 = from the right, 90 = from the top.
+    pub light_angle: f32,
+    pub light_elevation: f32,
+    pub intensity: f32,
+    pub highlight: Rgba,
+    pub shadow: Rgba,
+    pub gloss: f32,
+    pub shininess: f32,
+    /// Amount of (procedural) environment reflection — chrome / metal look.
+    pub reflection: f32,
+}
+
+impl Default for Bevel {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            profile: BevelProfile::Round,
+            width: 8.0,
+            depth: 0.8,
+            softness: 1.0,
+            light_angle: 135.0,
+            light_elevation: 40.0,
+            intensity: 0.8,
+            highlight: [255, 255, 255, 255],
+            shadow: [0, 0, 0, 255],
+            gloss: 0.3,
+            shininess: 20.0,
+            reflection: 0.0,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Shadow {
+    pub enabled: bool,
+    pub color: Rgba,
+    pub dx: f32,
+    pub dy: f32,
+    pub blur: f32,
+    pub opacity: f32,
+}
+
+impl Default for Shadow {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            color: [0, 0, 0, 255],
+            dx: 8.0,
+            dy: 10.0,
+            blur: 10.0,
+            opacity: 0.5,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Glow {
+    pub enabled: bool,
+    pub color: Rgba,
+    pub size: f32,
+    pub opacity: f32,
+}
+
+impl Default for Glow {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            color: [255, 230, 120, 255],
+            size: 16.0,
+            opacity: 0.8,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Effects {
+    pub bevel: Bevel,
+    pub shadow: Shadow,
+    pub glow: Glow,
+}
+
+fn one() -> f32 {
+    1.0
+}
+fn yes() -> bool {
+    true
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub struct Object {
+    pub id: u64,
+    pub name: String,
+    pub kind: ShapeKind,
+    /// Resolution of the object's local raster (w, h) in pixels.
+    pub size: [f32; 2],
+    /// Where the local rectangle lands on the canvas: TL, TR, BR, BL.
+    pub quad: [Pt; 4],
+    #[serde(default)]
+    pub fill: FillStyle,
+    #[serde(default)]
+    pub stroke: StrokeStyle,
+    #[serde(default)]
+    pub effects: Effects,
+    #[serde(default = "one")]
+    pub opacity: f32,
+    #[serde(default = "yes")]
+    pub visible: bool,
+    #[serde(default, with = "pixmap_serde")]
+    pub paint: Option<Arc<Pixmap>>,
+    #[serde(skip)]
+    pub rev: u64,
+}
+
+impl Object {
+    pub fn new(id: u64, kind: ShapeKind, x: f32, y: f32, w: f32, h: f32) -> Self {
+        let w = w.max(1.0);
+        let h = h.max(1.0);
+        Self {
+            id,
+            name: format!("{} {}", kind.label(), id),
+            kind,
+            size: [w.round(), h.round()],
+            quad: Self::rect_quad(x, y, w, h),
+            fill: FillStyle::default(),
+            stroke: StrokeStyle::default(),
+            effects: Effects::default(),
+            opacity: 1.0,
+            visible: true,
+            paint: None,
+            rev: next_rev(),
+        }
+    }
+
+    pub fn rect_quad(x: f32, y: f32, w: f32, h: f32) -> [Pt; 4] {
+        [
+            Pt::new(x, y),
+            Pt::new(x + w, y),
+            Pt::new(x + w, y + h),
+            Pt::new(x, y + h),
+        ]
+    }
+
+    pub fn touch(&mut self) {
+        self.rev = next_rev();
+    }
+
+    pub fn homography(&self) -> Homography {
+        Homography::from_quad(&self.quad, self.size[0], self.size[1])
+    }
+
+    pub fn raster_size(&self) -> (u32, u32) {
+        (
+            self.size[0].round().clamp(1.0, 4096.0) as u32,
+            self.size[1].round().clamp(1.0, 4096.0) as u32,
+        )
+    }
+
+    pub fn center(&self) -> Pt {
+        let q = &self.quad;
+        Pt::new(
+            (q[0].x + q[1].x + q[2].x + q[3].x) * 0.25,
+            (q[0].y + q[1].y + q[2].y + q[3].y) * 0.25,
+        )
+    }
+
+    /// Unit vectors of the local x / y axes on the canvas.
+    pub fn axes(&self) -> (Pt, Pt) {
+        let q = &self.quad;
+        (
+            ((q[1] - q[0]) + (q[2] - q[3])).normalized(),
+            ((q[3] - q[0]) + (q[2] - q[1])).normalized(),
+        )
+    }
+
+    pub fn rotation(&self) -> f32 {
+        (self.quad[1] - self.quad[0]).angle()
+    }
+
+    pub fn bounds(&self) -> (Pt, Pt) {
+        let mut lo = self.quad[0];
+        let mut hi = self.quad[0];
+        for p in &self.quad[1..] {
+            lo = Pt::new(lo.x.min(p.x), lo.y.min(p.y));
+            hi = Pt::new(hi.x.max(p.x), hi.y.max(p.y));
+        }
+        (lo, hi)
+    }
+
+    /// Re-derive raster resolution from the placement (after a scale).
+    pub fn update_size_from_quad(&mut self) {
+        let q = &self.quad;
+        let w = ((q[1] - q[0]).len() + (q[2] - q[3]).len()) * 0.5;
+        let h = ((q[3] - q[0]).len() + (q[2] - q[1]).len()) * 0.5;
+        let new = [w.round().clamp(1.0, 4096.0), h.round().clamp(1.0, 4096.0)];
+        if new != self.size {
+            self.size = new;
+            self.touch();
+        }
+    }
+
+    /// Turn any perspective / shear back into a plain (possibly rotated) rectangle.
+    pub fn reset_perspective(&mut self) {
+        let c = self.center();
+        let rot = self.rotation();
+        let q = &self.quad;
+        let w = ((q[1] - q[0]).len() + (q[2] - q[3]).len()) * 0.5;
+        let h = ((q[3] - q[0]).len() + (q[2] - q[1]).len()) * 0.5;
+        let corners = [
+            Pt::new(-w / 2.0, -h / 2.0),
+            Pt::new(w / 2.0, -h / 2.0),
+            Pt::new(w / 2.0, h / 2.0),
+            Pt::new(-w / 2.0, h / 2.0),
+        ];
+        self.quad = corners.map(|p| c + p.rotate(rot));
+        self.update_size_from_quad();
+    }
+
+    /// Keep the text box proportional to the text (adjusts the width, keeps the height).
+    pub fn fit_text_width(&mut self) {
+        if let ShapeKind::Text { text, font } = &self.kind {
+            if let Some(aspect) = crate::shapes::text_aspect(text, *font) {
+                let new_w = (self.size[1] * aspect).max(4.0);
+                let k = new_w / self.size[0].max(1.0);
+                let q = self.quad;
+                self.quad[1] = q[0] + (q[1] - q[0]) * k;
+                self.quad[2] = q[3] + (q[2] - q[3]) * k;
+                self.update_size_from_quad();
+                self.touch();
+            }
+        }
+    }
+
+    /// Compare everything the user can edit (ignores the cache revision).
+    pub fn same_content(&self, o: &Object) -> bool {
+        let paint_same = match (&self.paint, &o.paint) {
+            (None, None) => true,
+            (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+            _ => false,
+        };
+        self.id == o.id
+            && self.name == o.name
+            && self.kind == o.kind
+            && self.size == o.size
+            && self.quad == o.quad
+            && self.fill == o.fill
+            && self.stroke == o.stroke
+            && self.effects == o.effects
+            && self.opacity == o.opacity
+            && self.visible == o.visible
+            && paint_same
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum NprStyle {
+    None,
+    Watercolor,
+    OilPaint,
+    Impressionist,
+    Pointillism,
+    Pencil,
+    ColorPencil,
+    ComicInk,
+}
+
+impl NprStyle {
+    pub const ALL: [NprStyle; 8] = [
+        NprStyle::None,
+        NprStyle::Watercolor,
+        NprStyle::OilPaint,
+        NprStyle::Impressionist,
+        NprStyle::Pointillism,
+        NprStyle::Pencil,
+        NprStyle::ColorPencil,
+        NprStyle::ComicInk,
+    ];
+    pub fn label(self) -> &'static str {
+        match self {
+            NprStyle::None => "None (clean)",
+            NprStyle::Watercolor => "Watercolor",
+            NprStyle::OilPaint => "Oil paint",
+            NprStyle::Impressionist => "Impressionist strokes",
+            NprStyle::Pointillism => "Pointillism",
+            NprStyle::Pencil => "Pencil sketch",
+            NprStyle::ColorPencil => "Colored pencil",
+            NprStyle::ComicInk => "Comic ink",
+        }
+    }
+    pub fn from_name(s: &str) -> Option<NprStyle> {
+        let s = s.to_ascii_lowercase();
+        Some(match s.as_str() {
+            "none" => NprStyle::None,
+            "watercolor" | "watercolour" => NprStyle::Watercolor,
+            "oil" | "oilpaint" => NprStyle::OilPaint,
+            "impressionist" => NprStyle::Impressionist,
+            "pointillism" => NprStyle::Pointillism,
+            "pencil" => NprStyle::Pencil,
+            "colorpencil" | "colourpencil" => NprStyle::ColorPencil,
+            "comic" | "ink" => NprStyle::ComicInk,
+            _ => return None,
+        })
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct NprSettings {
+    pub style: NprStyle,
+    pub strength: f32,
+    /// 0 = fine detail, 1 = big brushes.
+    pub brush: f32,
+    pub paper: f32,
+    pub seed: u32,
+}
+
+impl Default for NprSettings {
+    fn default() -> Self {
+        Self {
+            style: NprStyle::None,
+            strength: 1.0,
+            brush: 0.4,
+            paper: 0.5,
+            seed: 1,
+        }
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub struct Document {
+    #[serde(default)]
+    pub version: u32,
+    pub width: u32,
+    pub height: u32,
+    pub background: Rgba,
+    #[serde(default)]
+    pub objects: Vec<Object>,
+    #[serde(default)]
+    pub npr: NprSettings,
+    #[serde(default)]
+    pub next_id: u64,
+}
+
+impl Document {
+    pub fn new(width: u32, height: u32) -> Self {
+        Self {
+            version: 1,
+            width,
+            height,
+            background: [255, 255, 255, 255],
+            objects: Vec::new(),
+            npr: NprSettings::default(),
+            next_id: 1,
+        }
+    }
+
+    pub fn alloc_id(&mut self) -> u64 {
+        let id = self.next_id.max(1);
+        self.next_id = id + 1;
+        id
+    }
+
+    pub fn find(&self, id: u64) -> Option<&Object> {
+        self.objects.iter().find(|o| o.id == id)
+    }
+
+    pub fn find_mut(&mut self, id: u64) -> Option<&mut Object> {
+        self.objects.iter_mut().find(|o| o.id == id)
+    }
+
+    pub fn index_of(&self, id: u64) -> Option<usize> {
+        self.objects.iter().position(|o| o.id == id)
+    }
+
+    pub fn same_content(&self, o: &Document) -> bool {
+        self.width == o.width
+            && self.height == o.height
+            && self.background == o.background
+            && self.npr == o.npr
+            && self.objects.len() == o.objects.len()
+            && self
+                .objects
+                .iter()
+                .zip(&o.objects)
+                .all(|(a, b)| a.same_content(b))
+    }
+}
+
+/// Paint layers are stored as base64 PNG inside the JSON document.
+mod pixmap_serde {
+    use base64::Engine;
+    use serde::{Deserialize, Deserializer, Serializer};
+    use std::sync::Arc;
+    use tiny_skia::Pixmap;
+
+    pub fn serialize<S: Serializer>(v: &Option<Arc<Pixmap>>, s: S) -> Result<S::Ok, S::Error> {
+        match v {
+            None => s.serialize_none(),
+            Some(p) => {
+                let png = p.encode_png().map_err(serde::ser::Error::custom)?;
+                s.serialize_some(&base64::engine::general_purpose::STANDARD.encode(png))
+            }
+        }
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Arc<Pixmap>>, D::Error> {
+        let o: Option<String> = Option::deserialize(d)?;
+        match o {
+            None => Ok(None),
+            Some(b) => {
+                let bytes = base64::engine::general_purpose::STANDARD
+                    .decode(b)
+                    .map_err(serde::de::Error::custom)?;
+                let p = Pixmap::decode_png(&bytes).map_err(serde::de::Error::custom)?;
+                Ok(Some(Arc::new(p)))
+            }
+        }
+    }
+}
