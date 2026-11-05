@@ -1,9 +1,10 @@
 //! Object render pipeline with caching:
-//!   local raster  (shape fill + paint layer + outline + bevel/material)   — cached by content revision
+//!   local raster  (fill + paint layer + outline + bevel/material + lights + transparency)
+//!                                                                         — cached by content revision
 //!   -> canvas layer (projective warp + drop shadow + glow)                — cached by placement
 //!   -> composite onto the document.
 
-use crate::doc::{Document, FillKind, FillStyle, Object, ShapeKind};
+use crate::doc::{DashKind, Document, FillKind, FillStyle, LightKind, Object, StrokePos, StrokeStyle};
 use crate::effects;
 use crate::geom::{point_in_poly, Pt};
 use crate::raster;
@@ -12,7 +13,7 @@ use crate::textures;
 use std::collections::{HashMap, HashSet};
 use tiny_skia::{
     BlendMode, Color, FillRule, FilterQuality, GradientStop, LineCap, LineJoin, LinearGradient, Mask,
-    Paint, Pattern, Pixmap, PixmapPaint, Point, RadialGradient, SpreadMode, Stroke, Transform,
+    Paint, Pattern, Pixmap, PixmapPaint, Point, RadialGradient, SpreadMode, Stroke, StrokeDash, Transform,
 };
 
 struct Entry {
@@ -81,16 +82,49 @@ fn fill_shader_paint<'a>(fill: &FillStyle, w: f32, h: f32, pad: f32, tex: Option
     Some(paint)
 }
 
+fn outline_stroke(s: &StrokeStyle, width: f32) -> Stroke {
+    Stroke {
+        width,
+        line_cap: LineCap::Round,
+        line_join: LineJoin::Round,
+        dash: match s.dash {
+            DashKind::Solid => None,
+            DashKind::Dashed => StrokeDash::new(vec![s.width * 3.0, s.width * 2.0], 0.0),
+            DashKind::Dotted => StrokeDash::new(vec![0.01, s.width * 2.2], 0.0),
+        },
+        ..Default::default()
+    }
+}
+
+/// Vector outline: centred on the edge, or only its inner / outer half (masked).
+fn draw_outline(pm: &mut Pixmap, path: &tiny_skia::Path, s: &StrokeStyle) {
+    let mut paint = Paint {
+        anti_alias: true,
+        ..Default::default()
+    };
+    paint.set_color(color(s.color));
+    let (pw, ph) = (pm.width(), pm.height());
+    match s.position {
+        StrokePos::Center => {
+            pm.stroke_path(path, &paint, &outline_stroke(s, s.width), Transform::identity(), None);
+        }
+        StrokePos::Inside | StrokePos::Outside => {
+            let Some(mut mask) = Mask::new(pw, ph) else { return };
+            mask.fill_path(path, FillRule::Winding, true, Transform::identity());
+            if s.position == StrokePos::Outside {
+                mask.invert();
+            }
+            let st = outline_stroke(s, s.width * 2.0);
+            pm.stroke_path(path, &paint, &st, Transform::identity(), Some(&mask));
+        }
+    }
+}
+
 /// Render an object's content in its own local space (plus padding).
-pub fn render_local(obj: &Object, light: [f32; 3]) -> (Pixmap, f32) {
+pub fn render_local(obj: &Object, light: [f32; 3], ex: Pt, ey: Pt) -> (Pixmap, f32) {
     let (w, h) = obj.raster_size();
     let (wf, hf) = (w as f32, h as f32);
-    let stroke_extra = if obj.stroke.enabled && obj.kind != ShapeKind::Bitmap {
-        obj.stroke.width * 0.5
-    } else {
-        0.0
-    };
-    let pad = (stroke_extra + 3.0).ceil();
+    let pad = (obj.stroke.outer_extent() + 3.0).ceil();
     let pw = w + 2 * pad as u32;
     let ph = h + 2 * pad as u32;
     let mut pm = match Pixmap::new(pw, ph) {
@@ -142,30 +176,38 @@ pub fn render_local(obj: &Object, light: [f32; 3]) -> (Pixmap, f32) {
         }
     }
 
-    // 3. outline
-    if let (Some(path), true) = (&path, obj.stroke.enabled && obj.stroke.width > 0.0) {
-        let mut paint = Paint {
-            anti_alias: true,
-            ..Default::default()
-        };
-        paint.set_color(color(obj.stroke.color));
-        let stroke = Stroke {
-            width: obj.stroke.width,
-            line_cap: LineCap::Round,
-            line_join: LineJoin::Round,
-            ..Default::default()
-        };
-        pm.stroke_path(path, &paint, &stroke, Transform::identity(), None);
+    // 3. outline (vector stroke, or traced around the paint of a paint layer)
+    if obj.stroke.enabled && obj.stroke.width > 0.0 {
+        match &path {
+            Some(path) => draw_outline(&mut pm, path, &obj.stroke),
+            None => effects::alpha_outline(&mut pm, &obj.stroke),
+        }
     }
 
     // 4. bevel / material
+    let mut heights = None;
     if obj.effects.bevel.enabled {
         let coverage = match (&path, obj.fill.kind) {
             (Some(path), k) if k != FillKind::None => shape_coverage(path, obj, pw, ph, &pm),
             _ => None,
         };
-        effects::apply_bevel(&mut pm, &obj.effects.bevel, light, coverage.as_deref());
+        heights = effects::apply_bevel(&mut pm, &obj.effects.bevel, light, coverage.as_deref());
     }
+
+    let frame = effects::LightFrame {
+        w: wf,
+        h: hf,
+        pad,
+        ex,
+        ey,
+    };
+    // 5. object lights (they shade the bevel relief too)
+    if obj.effects.lighting.active() {
+        effects::apply_lights(&mut pm, &obj.effects.lighting, heights.as_deref(), &frame);
+    }
+
+    // 6. transparency
+    effects::apply_transparency(&mut pm, &obj.transparency, &frame, (obj.id as u32).wrapping_mul(31));
     (pm, pad)
 }
 
@@ -178,9 +220,10 @@ fn shape_coverage(path: &tiny_skia::Path, obj: &Object, pw: u32, ph: u32, pm: &P
     };
     paint.set_color(Color::WHITE);
     cov.fill_path(path, &paint, FillRule::Winding, Transform::identity(), None);
-    if obj.stroke.enabled && obj.stroke.width > 0.0 {
+    let reach = obj.stroke.outer_extent();
+    if reach > 0.0 {
         let stroke = Stroke {
-            width: obj.stroke.width,
+            width: reach * 2.0,
             line_cap: LineCap::Round,
             line_join: LineJoin::Round,
             ..Default::default()
@@ -238,8 +281,14 @@ impl Renderer {
     fn ensure(&mut self, obj: &Object, dw: u32, dh: u32) {
         let (ex, ey) = obj.axes();
         let light = effects::local_light(&obj.effects.bevel, ex, ey);
-        let light_key = if obj.effects.bevel.enabled {
-            (light[1].atan2(light[0]).to_degrees() * 2.0).round() as i32
+        // Bevel and distant lights are canvas-relative, so rotating the object re-shades it.
+        let canvas_lit = obj.effects.bevel.enabled
+            || (obj.effects.lighting.active()
+                && obj.effects.lighting.lights.iter().any(|l| l.kind == LightKind::Distant));
+        let light_key = if canvas_lit {
+            let a = (ex.angle().to_degrees() * 2.0).round() as i32;
+            let b = (ey.angle().to_degrees() * 2.0).round() as i32;
+            a.wrapping_mul(1000).wrapping_add(b)
         } else {
             0
         };
@@ -248,7 +297,7 @@ impl Renderer {
             None => true,
         };
         if stale {
-            let (local, pad) = render_local(obj, light);
+            let (local, pad) = render_local(obj, light, ex, ey);
             self.cache.insert(
                 obj.id,
                 Entry {

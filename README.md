@@ -45,11 +45,19 @@ Styles: `none watercolor oil impressionist pointillism pencil colorpencil comic`
 | F | Freehand closed shape (becomes a smooth vector curve). |
 | T | Text. Edit the text and font in the properties panel. |
 | B | Brush. Paints into the selected object, or into a new paint layer. Alt+click picks a colour. |
+| X | Transparency. Drag across an object to fade it: opaque where you start, transparent where you let go (linear or radial). Drag the two handles to adjust. |
+| L | Lights. Click an object to add a point light, spotlight or distant light; drag the lamp to move it, the spotlight's diamond to aim it. |
 
 - **Changing an object later**: select it and use the **Shape** section at the top of the properties
   panel (corner radius, star sides/depth, text + **Font**). **Double-click** an object to reshape it:
   rectangles, ellipses and stars become editable paths in the node tool, and text jumps to its text
   field. With the Text tool active, the left panel's Font list also changes the selected text.
+- **Transparency** (properties panel): flat, linear, radial or texture, with start and end opacity,
+  like a fill. It follows the object's perspective and also thins its shadow and glow.
+- **Lights** (properties panel): any number of coloured point, spot and distant lights per object,
+  plus ambient light and shine. They also light the bevel relief.
+- **Outline**: outside, centred or inside the edge, solid, dashed or dotted. On paint layers it
+  traces around everything painted.
 - **Objects list**: drag a row up or down to change the stacking order; dragging a selected row
   moves the whole selection. Shift+click adds to the selection, and the checkbox hides an object.
 - **Path menu**: Union / Subtract / Intersect / Exclude on 2+ selected objects (also in the properties

@@ -195,12 +195,52 @@ impl Default for FillStyle {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum StrokePos {
+    #[default]
+    Center,
+    Inside,
+    Outside,
+}
+
+impl StrokePos {
+    pub const ALL: [StrokePos; 3] = [StrokePos::Outside, StrokePos::Center, StrokePos::Inside];
+    pub fn label(self) -> &'static str {
+        match self {
+            StrokePos::Center => "Centered",
+            StrokePos::Inside => "Inside",
+            StrokePos::Outside => "Outside",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum DashKind {
+    #[default]
+    Solid,
+    Dashed,
+    Dotted,
+}
+
+impl DashKind {
+    pub const ALL: [DashKind; 3] = [DashKind::Solid, DashKind::Dashed, DashKind::Dotted];
+    pub fn label(self) -> &'static str {
+        match self {
+            DashKind::Solid => "Solid",
+            DashKind::Dashed => "Dashed",
+            DashKind::Dotted => "Dotted",
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct StrokeStyle {
     pub enabled: bool,
     pub color: Rgba,
     pub width: f32,
+    pub position: StrokePos,
+    pub dash: DashKind,
 }
 
 impl Default for StrokeStyle {
@@ -209,7 +249,175 @@ impl Default for StrokeStyle {
             enabled: false,
             color: [30, 30, 30, 255],
             width: 3.0,
+            position: StrokePos::Center,
+            dash: DashKind::Solid,
         }
+    }
+}
+
+impl StrokeStyle {
+    /// How far the outline reaches outside the shape.
+    pub fn outer_extent(&self) -> f32 {
+        if !self.enabled {
+            return 0.0;
+        }
+        match self.position {
+            StrokePos::Center => self.width * 0.5,
+            StrokePos::Outside => self.width,
+            StrokePos::Inside => 0.0,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TransparencyKind {
+    None,
+    Flat,
+    Linear,
+    Radial,
+    Texture,
+}
+
+impl TransparencyKind {
+    pub const ALL: [TransparencyKind; 5] = [
+        TransparencyKind::None,
+        TransparencyKind::Flat,
+        TransparencyKind::Linear,
+        TransparencyKind::Radial,
+        TransparencyKind::Texture,
+    ];
+    pub fn label(self) -> &'static str {
+        match self {
+            TransparencyKind::None => "None (opaque)",
+            TransparencyKind::Flat => "Flat",
+            TransparencyKind::Linear => "Linear fade",
+            TransparencyKind::Radial => "Radial fade",
+            TransparencyKind::Texture => "Texture",
+        }
+    }
+}
+
+/// Object transparency, painted like a fill: opacity `start` at `p0` fading to `end` at `p1`.
+/// Points are normalised to the object's local box, so the fade follows moves and perspective.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Transparency {
+    pub kind: TransparencyKind,
+    pub start: f32,
+    pub end: f32,
+    pub p0: [f32; 2],
+    pub p1: [f32; 2],
+    pub texture: TextureKind,
+    pub tex_scale: f32,
+}
+
+impl Default for Transparency {
+    fn default() -> Self {
+        Self {
+            kind: TransparencyKind::None,
+            start: 1.0,
+            end: 0.0,
+            p0: [0.5, 0.0],
+            p1: [0.5, 1.0],
+            texture: TextureKind::Clouds,
+            tex_scale: 1.0,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LightKind {
+    Point,
+    Spot,
+    Distant,
+}
+
+impl LightKind {
+    pub const ALL: [LightKind; 3] = [LightKind::Point, LightKind::Spot, LightKind::Distant];
+    pub fn label(self) -> &'static str {
+        match self {
+            LightKind::Point => "Point light",
+            LightKind::Spot => "Spotlight",
+            LightKind::Distant => "Distant light",
+        }
+    }
+}
+
+/// A coloured light shining on one object. Positions are normalised to the object's local box;
+/// `height` and `range` are in object sizes.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Light {
+    pub kind: LightKind,
+    pub enabled: bool,
+    pub color: Rgba,
+    pub intensity: f32,
+    pub pos: [f32; 2],
+    pub target: [f32; 2],
+    pub height: f32,
+    pub range: f32,
+    /// Spotlight half-angle in degrees and how soft its edge is (0..1).
+    pub cone: f32,
+    pub softness: f32,
+    /// Distant light direction (degrees, like the bevel light) and height above the horizon.
+    pub angle: f32,
+    pub elevation: f32,
+}
+
+impl Light {
+    pub fn new(kind: LightKind, pos: [f32; 2]) -> Self {
+        Self {
+            kind,
+            pos,
+            target: [pos[0], (pos[1] + 0.35).min(1.0)],
+            ..Default::default()
+        }
+    }
+}
+
+impl Default for Light {
+    fn default() -> Self {
+        Self {
+            kind: LightKind::Point,
+            enabled: true,
+            color: [255, 244, 220, 255],
+            intensity: 1.2,
+            pos: [0.3, 0.3],
+            target: [0.5, 0.6],
+            height: 0.35,
+            range: 0.8,
+            cone: 28.0,
+            softness: 0.4,
+            angle: 135.0,
+            elevation: 45.0,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Lighting {
+    pub enabled: bool,
+    /// Light that reaches the object when no lamp shines on it (0 = black).
+    pub ambient: f32,
+    pub specular: f32,
+    pub lights: Vec<Light>,
+}
+
+impl Default for Lighting {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            ambient: 0.3,
+            specular: 0.35,
+            lights: Vec::new(),
+        }
+    }
+}
+
+impl Lighting {
+    pub fn active(&self) -> bool {
+        self.enabled && self.lights.iter().any(|l| l.enabled)
     }
 }
 
@@ -331,6 +539,7 @@ pub struct Effects {
     pub bevel: Bevel,
     pub shadow: Shadow,
     pub glow: Glow,
+    pub lighting: Lighting,
 }
 
 fn one() -> f32 {
@@ -355,6 +564,8 @@ pub struct Object {
     pub stroke: StrokeStyle,
     #[serde(default)]
     pub effects: Effects,
+    #[serde(default)]
+    pub transparency: Transparency,
     #[serde(default = "one")]
     pub opacity: f32,
     #[serde(default = "yes")]
@@ -378,6 +589,7 @@ impl Object {
             fill: FillStyle::default(),
             stroke: StrokeStyle::default(),
             effects: Effects::default(),
+            transparency: Transparency::default(),
             opacity: 1.0,
             visible: true,
             paint: None,
@@ -499,6 +711,7 @@ impl Object {
             && self.fill == o.fill
             && self.stroke == o.stroke
             && self.effects == o.effects
+            && self.transparency == o.transparency
             && self.opacity == o.opacity
             && self.visible == o.visible
             && paint_same

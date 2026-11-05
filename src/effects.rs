@@ -1,7 +1,10 @@
 //! Non-destructive object effects: bevel / material lighting, environment reflection,
-//! drop shadow and outer glow.
+//! point / spot / distant lights, transparency, paint outlines, drop shadow and outer glow.
 
-use crate::doc::{Bevel, BevelProfile, Effects};
+use crate::doc::{
+    Bevel, BevelProfile, Effects, Light, LightKind, Lighting, StrokePos, StrokeStyle, Transparency,
+    TransparencyKind,
+};
 use crate::geom::Pt;
 use crate::raster::{alpha_of, gaussian};
 use tiny_skia::Pixmap;
@@ -112,13 +115,14 @@ fn rgb(c: [u8; 4]) -> [f32; 3] {
 }
 
 /// Bevel + material shading applied in place to a premultiplied local raster.
-pub fn apply_bevel(pm: &mut Pixmap, b: &Bevel, light: [f32; 3], coverage: Option<&[f32]>) {
+/// Returns the height map so object lights can shade the same relief.
+pub fn apply_bevel(pm: &mut Pixmap, b: &Bevel, light: [f32; 3], coverage: Option<&[f32]>) -> Option<Vec<f32>> {
     let w = pm.width() as usize;
     let h = pm.height() as usize;
     let n = w * h;
     let alpha = alpha_of(pm);
     if !alpha.iter().any(|&a| a > 0.0) {
-        return;
+        return None;
     }
     // The bevel follows the shape coverage (so translucent fills still bevel as a whole),
     // or the pixel alpha for pure paint objects.
@@ -210,6 +214,213 @@ pub fn apply_bevel(pm: &mut Pixmap, b: &Bevel, light: [f32; 3], coverage: Option
             }
             for k in 0..3 {
                 data[p + k] = (c[k].clamp(0.0, 1.0) * a * 255.0 + 0.5) as u8;
+            }
+        }
+    }
+    Some(height)
+}
+
+#[inline]
+fn normal_at(height: Option<&[f32]>, w: usize, h: usize, x: usize, y: usize) -> [f32; 3] {
+    let Some(hm) = height else { return [0.0, 0.0, 1.0] };
+    let hx = (hm[y * w + (x + 1).min(w - 1)] - hm[y * w + x.saturating_sub(1)]) * 0.5;
+    let hy = (hm[(y + 1).min(h - 1) * w + x] - hm[y.saturating_sub(1) * w + x]) * 0.5;
+    let l = (hx * hx + hy * hy + 1.0).sqrt();
+    [-hx / l, -hy / l, 1.0 / l]
+}
+
+fn norm3(v: [f32; 3]) -> [f32; 3] {
+    let l = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt().max(1e-6);
+    [v[0] / l, v[1] / l, v[2] / l]
+}
+
+fn dot3(a: [f32; 3], b: [f32; 3]) -> f32 {
+    a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+}
+
+/// Geometry the object lights need: the local raster layout and its axes on the canvas.
+pub struct LightFrame {
+    /// Size of the shape inside the padded raster, and the padding.
+    pub w: f32,
+    pub h: f32,
+    pub pad: f32,
+    /// Unit vectors of the local x / y axes on the canvas (for distant lights).
+    pub ex: Pt,
+    pub ey: Pt,
+}
+
+/// Point, spot and distant lights on the object's own surface (bevel relief included).
+pub fn apply_lights(pm: &mut Pixmap, lighting: &Lighting, height: Option<&[f32]>, f: &LightFrame) {
+    let lights: Vec<&Light> = lighting.lights.iter().filter(|l| l.enabled).collect();
+    if lights.is_empty() {
+        return;
+    }
+    let (pw, ph) = (pm.width() as usize, pm.height() as usize);
+    let scale = (f.w + f.h) * 0.5;
+    struct Prepared {
+        col: [f32; 3],
+        kind: LightKind,
+        pos: [f32; 3],
+        dir: [f32; 3],
+        axis: [f32; 3],
+        range: f32,
+        cos_in: f32,
+        cos_out: f32,
+    }
+    let prepared: Vec<Prepared> = lights
+        .iter()
+        .map(|l| {
+            let c = rgb(l.color);
+            let col = [c[0] * l.intensity, c[1] * l.intensity, c[2] * l.intensity];
+            let pos = [f.pad + l.pos[0] * f.w, f.pad + l.pos[1] * f.h, l.height.max(0.01) * scale];
+            let target = [f.pad + l.target[0] * f.w, f.pad + l.target[1] * f.h, 0.0];
+            let axis = norm3([target[0] - pos[0], target[1] - pos[1], target[2] - pos[2]]);
+            let az = l.angle.to_radians();
+            let el = l.elevation.to_radians().clamp(0.02, 1.56);
+            let l2 = Pt::new(az.cos(), -az.sin());
+            let (lx, ly) = (l2.dot(f.ex), l2.dot(f.ey));
+            let len = (lx * lx + ly * ly).sqrt().max(1e-6);
+            let dir = [lx / len * el.cos(), ly / len * el.cos(), el.sin()];
+            let cone = l.cone.clamp(1.0, 89.0).to_radians();
+            let outer = (cone * (1.0 + l.softness.clamp(0.0, 1.0))).min(1.55);
+            Prepared {
+                col,
+                kind: l.kind,
+                pos,
+                dir,
+                axis,
+                range: (l.range.max(0.01) * scale).max(1.0),
+                cos_in: cone.cos(),
+                cos_out: outer.cos(),
+            }
+        })
+        .collect();
+    let ambient = lighting.ambient.clamp(0.0, 2.0);
+    let spec_amt = lighting.specular.clamp(0.0, 2.0);
+    let data = pm.data_mut();
+    for y in 0..ph {
+        for x in 0..pw {
+            let p = (y * pw + x) * 4;
+            let a = data[p + 3] as f32 / 255.0;
+            if a <= 0.0 {
+                continue;
+            }
+            let n = normal_at(height, pw, ph, x, y);
+            let mut diff = [ambient; 3];
+            let mut spec = [0.0f32; 3];
+            for l in &prepared {
+                let (ldir, atten) = match l.kind {
+                    LightKind::Distant => (l.dir, 1.0),
+                    _ => {
+                        let v = [l.pos[0] - x as f32, l.pos[1] - y as f32, l.pos[2]];
+                        let d = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt().max(1e-3);
+                        let ld = [v[0] / d, v[1] / d, v[2] / d];
+                        let mut att = 1.0 / (1.0 + (d / l.range).powi(2));
+                        if l.kind == LightKind::Spot {
+                            let cos_t = -dot3(ld, l.axis);
+                            att *= crate::textures::smoothstep(l.cos_out, l.cos_in, cos_t);
+                        }
+                        (ld, att * 1.6)
+                    }
+                };
+                if atten <= 0.0 {
+                    continue;
+                }
+                let ndl = dot3(n, ldir).max(0.0);
+                let hv = norm3([ldir[0], ldir[1], ldir[2] + 1.0]);
+                let s = dot3(n, hv).max(0.0).powf(40.0) * spec_amt * atten;
+                for k in 0..3 {
+                    diff[k] += l.col[k] * ndl * atten;
+                    spec[k] += l.col[k] * s;
+                }
+            }
+            for k in 0..3 {
+                let c = (data[p + k] as f32 / 255.0 / a).min(1.0);
+                let v = (c * diff[k] + spec[k]).clamp(0.0, 1.0);
+                data[p + k] = (v * a * 255.0 + 0.5) as u8;
+            }
+        }
+    }
+}
+
+/// Opacity of the object's transparency at a local raster pixel.
+pub fn transparency_at(t: &Transparency, x: f32, y: f32, f: &LightFrame, seed: u32) -> f32 {
+    let lerp = |k: f32| t.start + (t.end - t.start) * k.clamp(0.0, 1.0);
+    let px = Pt::new(x - f.pad, y - f.pad);
+    let p0 = Pt::new(t.p0[0] * f.w, t.p0[1] * f.h);
+    let p1 = Pt::new(t.p1[0] * f.w, t.p1[1] * f.h);
+    match t.kind {
+        TransparencyKind::None => 1.0,
+        TransparencyKind::Flat => t.start,
+        TransparencyKind::Linear => {
+            let d = p1 - p0;
+            lerp((px - p0).dot(d) / d.dot(d).max(1e-6))
+        }
+        TransparencyKind::Radial => lerp(px.dist(p0) / p1.dist(p0).max(1e-3)),
+        TransparencyKind::Texture => {
+            let s = 1.0 / t.tex_scale.max(0.05);
+            lerp(crate::textures::sample(t.texture, x * s, y * s, seed))
+        }
+    }
+    .clamp(0.0, 1.0)
+}
+
+/// Multiply the local raster by the object's transparency (it then also thins shadows and glows).
+pub fn apply_transparency(pm: &mut Pixmap, t: &Transparency, f: &LightFrame, seed: u32) {
+    if t.kind == TransparencyKind::None {
+        return;
+    }
+    let pw = pm.width() as usize;
+    let data = pm.data_mut();
+    for (i, px) in data.chunks_exact_mut(4).enumerate() {
+        if px[3] == 0 {
+            continue;
+        }
+        let k = transparency_at(t, (i % pw) as f32 + 0.5, (i / pw) as f32 + 0.5, f, seed);
+        for v in px.iter_mut() {
+            *v = (*v as f32 * k + 0.5) as u8;
+        }
+    }
+}
+
+/// Outline around whatever is painted (paint layers have no vector path to stroke).
+pub fn alpha_outline(pm: &mut Pixmap, s: &StrokeStyle) {
+    let w = pm.width() as usize;
+    let h = pm.height() as usize;
+    let alpha = alpha_of(pm);
+    if !alpha.iter().any(|&a| a > 0.0) {
+        return;
+    }
+    let inv: Vec<f32> = alpha.iter().map(|a| 1.0 - a).collect();
+    let d_out = edt_inside(&inv, w, h); // outside pixels: distance to the paint
+    let d_in = edt_inside(&alpha, w, h); // inside pixels: distance to the edge
+    let (reach_out, reach_in) = match s.position {
+        StrokePos::Outside => (s.width, 0.0),
+        StrokePos::Inside => (0.0, s.width),
+        StrokePos::Center => (s.width * 0.5, s.width * 0.5),
+    };
+    let col = rgb(s.color);
+    let ca = s.color[3] as f32 / 255.0;
+    let data = pm.data_mut();
+    for i in 0..w * h {
+        let p = i * 4;
+        let a = alpha[i];
+        if d_out[i] > 0.0 {
+            // outside the paint: draw underneath anything semi-transparent
+            let k = (reach_out + 0.5 - d_out[i]).clamp(0.0, 1.0) * ca;
+            if k > 0.0 {
+                let under = k * (1.0 - a);
+                for c in 0..3 {
+                    data[p + c] = (data[p + c] as f32 + col[c] * 255.0 * under).min(255.0) as u8;
+                }
+                data[p + 3] = ((a + under) * 255.0 + 0.5).min(255.0) as u8;
+            }
+        } else if d_in[i] > 0.0 && reach_in > 0.0 {
+            let k = (reach_in + 0.5 - d_in[i]).clamp(0.0, 1.0) * ca;
+            if k > 0.0 {
+                for c in 0..3 {
+                    data[p + c] = (col[c] * 255.0 * k * a + data[p + c] as f32 * (1.0 - k)) as u8;
+                }
             }
         }
     }

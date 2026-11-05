@@ -145,6 +145,7 @@ pub fn wood(o: &mut Object) {
         enabled: true,
         color: [70, 38, 15, 255],
         width: 3.0,
+        ..Default::default()
     };
     o.effects.bevel = Bevel {
         enabled: true,

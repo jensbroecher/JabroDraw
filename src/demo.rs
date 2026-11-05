@@ -183,6 +183,22 @@ pub fn demo_document() -> Document {
         };
         paint_local(&mut sign, &circle, &yellow);
     }
+    sign.effects.lighting = Lighting {
+        enabled: true,
+        ambient: 0.55,
+        specular: 0.4,
+        lights: vec![Light {
+            kind: LightKind::Spot,
+            pos: [0.12, 0.05],
+            target: [0.55, 0.55],
+            height: 0.6,
+            cone: 32.0,
+            softness: 0.7,
+            intensity: 1.3,
+            color: [255, 228, 170, 255],
+            ..Default::default()
+        }],
+    };
     d.objects.push(sign);
 
     // Chrome star
@@ -260,6 +276,13 @@ pub fn demo_document() -> Document {
         };
         paint_local(&mut strokes, &wave(580.0, 1120.0, 720.0, 20.0, 2.2, 1.0, 160), &b2);
     }
+    strokes.stroke = StrokeStyle {
+        enabled: true,
+        color: [255, 255, 255, 255],
+        width: 3.0,
+        position: StrokePos::Outside,
+        ..Default::default()
+    };
     d.objects.push(strokes);
 
     // Title text in gold, slightly tilted

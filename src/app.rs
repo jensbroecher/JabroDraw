@@ -24,10 +24,12 @@ pub enum Tool {
     Freehand,
     Text,
     Brush,
+    Transparency,
+    Light,
 }
 
 impl Tool {
-    const ALL: [Tool; 10] = [
+    const ALL: [Tool; 12] = [
         Tool::Select,
         Tool::Node,
         Tool::Perspective,
@@ -38,6 +40,8 @@ impl Tool {
         Tool::Freehand,
         Tool::Text,
         Tool::Brush,
+        Tool::Transparency,
+        Tool::Light,
     ];
     fn label(self) -> &'static str {
         match self {
@@ -51,6 +55,8 @@ impl Tool {
             Tool::Freehand => "Freehand shape  (F)",
             Tool::Text => "Text  (T)",
             Tool::Brush => "Brush  (B)",
+            Tool::Transparency => "Transparency  (X)",
+            Tool::Light => "Lights  (L)",
         }
     }
     fn key(self) -> egui::Key {
@@ -65,6 +71,8 @@ impl Tool {
             Tool::Freehand => egui::Key::F,
             Tool::Text => egui::Key::T,
             Tool::Brush => egui::Key::B,
+            Tool::Transparency => egui::Key::X,
+            Tool::Light => egui::Key::L,
         }
     }
     fn hint(self) -> &'static str {
@@ -79,6 +87,8 @@ impl Tool {
             Tool::Freehand => "Draw a closed freehand shape — it becomes a smooth vector curve.",
             Tool::Text => "Click or drag a box to place text, then edit it in the properties panel.",
             Tool::Brush => "Paint on the selected object (clipped to its shape) or on a new paint layer. Alt+click picks a colour.",
+            Tool::Transparency => "Drag across an object to fade it out: from opaque where you start to transparent where you let go. Drag the two handles to adjust.",
+            Tool::Light => "Click an object to add a light there (type in the tool panel). Drag a lamp to move it, a spotlight's diamond to aim it.",
         }
     }
 }
@@ -90,6 +100,13 @@ enum Drag {
     Node { id: u64, sp: usize, ni: usize, offset: Pt },
     Handle { id: u64, sp: usize, ni: usize, out: bool },
     PenHandle,
+    /// New transparency fade being dragged out from `q0` (normalised local point).
+    TransNew { id: u64, q0: [f32; 2] },
+    /// Moving the start (0) or end (1) handle of the fade.
+    TransHandle { id: u64, which: usize },
+    LightPos { id: u64, idx: usize },
+    LightTarget { id: u64, idx: usize },
+    LightDir { id: u64, idx: usize },
     Scale { id: u64, handle: usize, anchor: Pt, h0: Pt, orig: [Pt; 4], angle: f32 },
     Rotate { id: u64, center: Pt, a0: f32, orig: [Pt; 4] },
     Corner { id: u64, idx: usize },
@@ -150,6 +167,10 @@ fn doc_to_paint(obj: &Object, p: Pt) -> Option<((f32, f32), f32)> {
     Some((((lx * kx) as f32, (ly * ky) as f32), ((sx + sy) * 0.5) as f32))
 }
 
+fn pct_slider(v: &mut f32) -> egui::Slider<'_> {
+    egui::Slider::new(v, 0.0..=1.0).custom_formatter(|n, _| format!("{:.0}%", n * 100.0))
+}
+
 fn rgba_label(ui: &mut egui::Ui, label: &str, c: &mut Rgba) {
     ui.horizontal(|ui| {
         ui.color_edit_button_srgba_unmultiplied(c);
@@ -177,6 +198,11 @@ pub struct JabroApp {
     focus_text: bool,
     /// Objects being dragged in the object list (ids in list order).
     list_drag: Option<Vec<u64>>,
+    /// Fade type a Transparency-tool drag creates.
+    trans_kind: TransparencyKind,
+    /// Light type a Lights-tool click adds, and the light being edited.
+    new_light_kind: LightKind,
+    light_sel: Option<usize>,
     tool: Tool,
     color_a: Rgba,
     color_b: Rgba,
@@ -208,7 +234,7 @@ pub struct JabroApp {
     prop_edit_open: bool,
     cursor_doc: Option<Pt>,
     pressure: Option<f32>,
-    style_clipboard: Option<(FillStyle, StrokeStyle, Effects)>,
+    style_clipboard: Option<(FillStyle, StrokeStyle, Effects, Transparency)>,
     show_about: bool,
     new_w: u32,
     new_h: u32,
@@ -233,6 +259,9 @@ impl JabroApp {
             stroke_width: 4.0,
             focus_text: false,
             list_drag: None,
+            trans_kind: TransparencyKind::Linear,
+            new_light_kind: LightKind::Point,
+            light_sel: None,
             tool: Tool::Select,
             color_a: [220, 60, 50, 255],
             color_b: [40, 90, 200, 255],
@@ -466,6 +495,7 @@ impl JabroApp {
                 enabled: true,
                 color: self.color_a,
                 width: self.stroke_width,
+                ..Default::default()
             };
         }
         self.doc.objects.push(obj);
@@ -878,6 +908,8 @@ impl JabroApp {
             Tool::Select | Tool::Perspective => self.press_select(p, sp, mods),
             Tool::Node => self.press_node(p, sp),
             Tool::Pen => self.press_pen(p, sp),
+            Tool::Transparency => self.press_transparency(p, sp),
+            Tool::Light => self.press_light(p, sp),
             Tool::Rect | Tool::Ellipse | Tool::Polygon | Tool::Text => {
                 self.drag = Drag::Create { start: p, cur: p }
             }
@@ -971,6 +1003,87 @@ impl JabroApp {
             Some(_) => self.edit_shape(id),
             None => {}
         }
+    }
+
+    fn press_transparency(&mut self, p: Pt, sp: Pos2) {
+        if let Some(o) = self.selected.and_then(|id| self.doc.find(id)) {
+            let t = &o.transparency;
+            if matches!(t.kind, TransparencyKind::Linear | TransparencyKind::Radial) {
+                for (which, q) in [(1, t.p1), (0, t.p0)] {
+                    if self.norm_to_screen(o, q).is_some_and(|s| s.distance(sp) < 10.0) {
+                        self.drag = Drag::TransHandle { id: o.id, which };
+                        return;
+                    }
+                }
+            }
+        }
+        let Some(id) = self.hit_test(p).or(self.selected) else {
+            self.drag = Drag::None;
+            return;
+        };
+        if self.selected != Some(id) {
+            self.select_only(Some(id));
+        }
+        // nothing changes until the mouse actually moves (a plain click only selects)
+        self.drag = match self.doc.find(id).and_then(|o| Self::doc_to_norm(o, p)) {
+            Some(q0) => Drag::TransNew { id, q0 },
+            None => Drag::None,
+        };
+    }
+
+    /// Screen position of a distant light's direction handle (the side the light comes from).
+    fn distant_handle(&self, o: &Object, l: &Light) -> Pos2 {
+        let a = l.angle.to_radians();
+        self.to_screen(o.center()) + Vec2::new(a.cos(), -a.sin()) * 70.0
+    }
+
+    fn press_light(&mut self, p: Pt, sp: Pos2) {
+        if let Some(o) = self.selected.and_then(|id| self.doc.find(id)) {
+            let id = o.id;
+            for (idx, l) in o.effects.lighting.lights.iter().enumerate() {
+                let near = |q: [f32; 2]| self.norm_to_screen(o, q).is_some_and(|s| s.distance(sp) < 11.0);
+                let hit = match l.kind {
+                    LightKind::Spot if near(l.target) => Some(Drag::LightTarget { id, idx }),
+                    LightKind::Point | LightKind::Spot if near(l.pos) => Some(Drag::LightPos { id, idx }),
+                    LightKind::Distant if self.distant_handle(o, l).distance(sp) < 11.0 => {
+                        Some(Drag::LightDir { id, idx })
+                    }
+                    _ => None,
+                };
+                if let Some(d) = hit {
+                    self.light_sel = Some(idx);
+                    self.drag = d;
+                    return;
+                }
+            }
+        }
+        // click on an object: put a new light there
+        let Some(id) = self.hit_test(p) else {
+            self.drag = Drag::None;
+            return;
+        };
+        if self.selected != Some(id) {
+            self.select_only(Some(id));
+        }
+        let Some(q) = self.doc.find(id).and_then(|o| Self::doc_to_norm(o, p)) else { return };
+        self.commit_snapshot();
+        let kind = self.new_light_kind;
+        let mut idx = 0;
+        if let Some(o) = self.doc.find_mut(id) {
+            let lighting = &mut o.effects.lighting;
+            lighting.enabled = true;
+            lighting.lights.push(Light::new(kind, q));
+            idx = lighting.lights.len() - 1;
+            o.touch();
+        }
+        self.light_sel = Some(idx);
+        self.dirty = true;
+        self.status = format!("{} added — drag it to move it; its settings are under Lights.", kind.label());
+        self.drag = match kind {
+            LightKind::Spot => Drag::LightTarget { id, idx },
+            LightKind::Point => Drag::LightPos { id, idx },
+            LightKind::Distant => Drag::LightDir { id, idx },
+        };
     }
 
     fn press_select(&mut self, p: Pt, sp: Pos2, mods: Modifiers) {
@@ -1103,6 +1216,79 @@ impl JabroApp {
                 Drag::Move { start, items }
             }
             Drag::Marquee { start, additive, .. } => Drag::Marquee { start, cur: p, additive },
+            Drag::TransNew { id, q0 } => {
+                let start_screen = self.doc.find(id).and_then(|o| self.norm_to_screen(o, q0));
+                let moved = start_screen.is_some_and(|s| s.distance(self.to_screen(p)) > 4.0);
+                if moved {
+                    self.commit_snapshot();
+                    let kind = self.trans_kind;
+                    if let Some(o) = self.doc.find_mut(id) {
+                        if let Some(q) = Self::doc_to_norm(o, p) {
+                            let t = &mut o.transparency;
+                            if !matches!(t.kind, TransparencyKind::Linear | TransparencyKind::Radial) {
+                                t.kind = kind;
+                                if t.start <= t.end + 0.05 {
+                                    t.start = 1.0;
+                                    t.end = 0.0;
+                                }
+                            }
+                            t.p0 = q0;
+                            t.p1 = q;
+                            o.touch();
+                        }
+                    }
+                    self.dirty = true;
+                }
+                Drag::TransNew { id, q0 }
+            }
+            Drag::TransHandle { id, which } => {
+                self.commit_snapshot();
+                if let Some(o) = self.doc.find_mut(id) {
+                    if let Some(q) = Self::doc_to_norm(o, p) {
+                        if which == 0 {
+                            o.transparency.p0 = q;
+                        } else {
+                            o.transparency.p1 = q;
+                        }
+                        o.touch();
+                    }
+                }
+                self.dirty = true;
+                Drag::TransHandle { id, which }
+            }
+            Drag::LightPos { id, idx } | Drag::LightTarget { id, idx } => {
+                let target = matches!(drag, Drag::LightTarget { .. });
+                self.commit_snapshot();
+                if let Some(o) = self.doc.find_mut(id) {
+                    if let Some(q) = Self::doc_to_norm(o, p) {
+                        if let Some(l) = o.effects.lighting.lights.get_mut(idx) {
+                            if target {
+                                l.target = q;
+                            } else {
+                                // a spotlight keeps pointing at the same spot while it moves
+                                l.pos = q;
+                            }
+                        }
+                        o.touch();
+                    }
+                }
+                self.dirty = true;
+                drag
+            }
+            Drag::LightDir { id, idx } => {
+                self.commit_snapshot();
+                if let Some(o) = self.doc.find_mut(id) {
+                    let v = p - o.center();
+                    if v.len() > 1.0 {
+                        if let Some(l) = o.effects.lighting.lights.get_mut(idx) {
+                            l.angle = (-v.y).atan2(v.x).to_degrees().rem_euclid(360.0);
+                        }
+                        o.touch();
+                    }
+                }
+                self.dirty = true;
+                Drag::LightDir { id, idx }
+            }
             Drag::Node { id, sp, ni, offset } => {
                 self.commit_snapshot();
                 if let Some(o) = self.doc.find_mut(id) {
@@ -1766,6 +1952,42 @@ impl JabroApp {
                     });
                 }
             }
+            Tool::Transparency => {
+                ui.strong("Transparency");
+                ui.label("Dragging creates a:");
+                ui.horizontal(|ui| {
+                    ui.radio_value(&mut self.trans_kind, TransparencyKind::Linear, "Linear fade");
+                    ui.radio_value(&mut self.trans_kind, TransparencyKind::Radial, "Radial fade");
+                });
+                let has_trans = self
+                    .selected
+                    .and_then(|id| self.doc.find(id))
+                    .is_some_and(|o| o.transparency.kind != TransparencyKind::None);
+                if has_trans && ui.button("Remove transparency").clicked() {
+                    self.apply_to_selected(|o| o.transparency.kind = TransparencyKind::None);
+                }
+                ui.small("Opacity values, flat and texture transparency are in the properties panel.");
+            }
+            Tool::Light => {
+                ui.strong("Lights");
+                ui.label("A click on an object adds a:");
+                for k in LightKind::ALL {
+                    ui.radio_value(&mut self.new_light_kind, k, k.label());
+                }
+                let n = self
+                    .selected
+                    .and_then(|id| self.doc.find(id))
+                    .map_or(0, |o| o.effects.lighting.lights.len());
+                if let Some(idx) = self.light_sel.filter(|i| *i < n) {
+                    if ui.button(format!("Remove light {}", idx + 1)).clicked() {
+                        self.apply_to_selected(move |o| {
+                            o.effects.lighting.lights.remove(idx);
+                        });
+                        self.light_sel = None;
+                    }
+                }
+                ui.small("Lights belong to their object and move with it. Ambient light, colour and strength are under Lights in the properties panel.");
+            }
             Tool::Node => {
                 ui.strong("Edit nodes");
                 let sel = self.node_sel;
@@ -2065,17 +2287,19 @@ impl JabroApp {
                 }
                 PropAction::CopyStyle => {
                     if let Some(o) = selected.and_then(|id| self.doc.find(id)) {
-                        self.style_clipboard = Some((o.fill.clone(), o.stroke.clone(), o.effects.clone()));
+                        self.style_clipboard =
+                            Some((o.fill.clone(), o.stroke.clone(), o.effects.clone(), o.transparency.clone()));
                         self.status = "Style copied".into();
                     }
                 }
                 PropAction::PasteStyle => {
-                    if let (Some(o), Some((f, s, e))) =
+                    if let (Some(o), Some((f, s, e, t))) =
                         (selected.and_then(|id| self.doc.find_mut(id)), self.style_clipboard.clone())
                     {
                         o.fill = f;
                         o.stroke = s;
                         o.effects = e;
+                        o.transparency = t;
                     }
                 }
                 PropAction::Front => {
@@ -2262,6 +2486,12 @@ impl JabroApp {
         if self.tool == Tool::Node {
             self.draw_node_overlay(painter);
         }
+        if self.tool == Tool::Transparency {
+            self.draw_transparency_overlay(painter);
+        }
+        if self.tool == Tool::Light {
+            self.draw_light_overlay(painter);
+        }
         let single = self.multi.is_empty();
         if let Some(obj) = self
             .selected
@@ -2396,6 +2626,110 @@ impl JabroApp {
                         vec![r.left_top(), r.right_top(), r.right_bottom(), r.left_bottom()],
                         Stroke::new(1.0_f32, col),
                     ));
+                }
+            }
+        }
+    }
+
+    /// A circle around local point `c` with radius `r` (in local pixels), seen through the object's
+    /// perspective.
+    fn local_circle_screen(&self, o: &Object, c: Pt, r: f32) -> Vec<Pos2> {
+        let hm = o.homography();
+        (0..48)
+            .filter_map(|k| {
+                let a = k as f32 / 48.0 * std::f32::consts::TAU;
+                hm.apply_pt(c + Pt::new(a.cos(), a.sin()) * r).map(|p| self.to_screen(p))
+            })
+            .collect()
+    }
+
+    fn draw_transparency_overlay(&self, painter: &egui::Painter) {
+        let Some(o) = self.selected.and_then(|id| self.doc.find(id)) else { return };
+        let t = &o.transparency;
+        if !matches!(t.kind, TransparencyKind::Linear | TransparencyKind::Radial) {
+            return;
+        }
+        let (Some(a), Some(b)) = (self.norm_to_screen(o, t.p0), self.norm_to_screen(o, t.p1)) else { return };
+        let line = Color32::from_rgb(255, 255, 255);
+        painter.line_segment([a, b], Stroke::new(3.0_f32, Color32::from_black_alpha(140)));
+        painter.line_segment([a, b], Stroke::new(1.5_f32, line));
+        if t.kind == TransparencyKind::Radial {
+            let c = Pt::new(t.p0[0] * o.size[0], t.p0[1] * o.size[1]);
+            let e = Pt::new(t.p1[0] * o.size[0], t.p1[1] * o.size[1]);
+            let ring = self.local_circle_screen(o, c, c.dist(e));
+            painter.add(Shape::closed_line(ring, Stroke::new(1.0_f32, line)));
+        }
+        for (pos, opacity) in [(a, t.start), (b, t.end)] {
+            let g = (opacity.clamp(0.0, 1.0) * 255.0) as u8;
+            painter.circle_filled(pos, 8.0, Color32::from_gray(g));
+            painter.circle_stroke(pos, 8.0, Stroke::new(2.0_f32, Color32::from_rgb(0, 170, 255)));
+            painter.text(
+                pos + Vec2::new(11.0, -11.0),
+                egui::Align2::LEFT_BOTTOM,
+                format!("{:.0}%", opacity * 100.0),
+                egui::FontId::proportional(12.0),
+                Color32::WHITE,
+            );
+        }
+    }
+
+    fn draw_light_overlay(&self, painter: &egui::Painter) {
+        let Some(o) = self.selected.and_then(|id| self.doc.find(id)) else { return };
+        for (idx, l) in o.effects.lighting.lights.iter().enumerate() {
+            let c = Color32::from_rgb(l.color[0], l.color[1], l.color[2]);
+            let ring = if self.light_sel == Some(idx) {
+                Stroke::new(2.5_f32, Color32::WHITE)
+            } else {
+                Stroke::new(1.5_f32, Color32::from_black_alpha(200))
+            };
+            let lamp = |pos: Pos2| {
+                for k in 0..8 {
+                    let a = k as f32 * std::f32::consts::FRAC_PI_4;
+                    let d = Vec2::new(a.cos(), a.sin());
+                    painter.line_segment([pos + d * 11.0, pos + d * 15.0], Stroke::new(1.5_f32, c));
+                }
+                painter.circle_filled(pos, 8.0, c);
+                painter.circle_stroke(pos, 8.0, ring);
+            };
+            match l.kind {
+                LightKind::Point => {
+                    if let Some(pos) = self.norm_to_screen(o, l.pos) {
+                        lamp(pos);
+                    }
+                }
+                LightKind::Spot => {
+                    let (Some(pos), Some(tg)) = (self.norm_to_screen(o, l.pos), self.norm_to_screen(o, l.target))
+                    else {
+                        continue;
+                    };
+                    // footprint of the cone on the surface (approximate)
+                    let scale = (o.size[0] + o.size[1]) * 0.5;
+                    let lp = Pt::new(l.pos[0] * o.size[0], l.pos[1] * o.size[1]);
+                    let tp = Pt::new(l.target[0] * o.size[0], l.target[1] * o.size[1]);
+                    let dist = (lp.dist(tp).powi(2) + (l.height * scale).powi(2)).sqrt();
+                    let r = dist * l.cone.clamp(1.0, 80.0).to_radians().tan();
+                    painter.add(Shape::closed_line(
+                        self.local_circle_screen(o, tp, r),
+                        Stroke::new(1.0_f32, c.gamma_multiply(0.8)),
+                    ));
+                    painter.line_segment([pos, tg], Stroke::new(1.5_f32, c));
+                    let d = Rect::from_center_size(tg, Vec2::splat(9.0));
+                    painter.add(Shape::convex_polygon(
+                        vec![d.center_top(), d.right_center(), d.center_bottom(), d.left_center()],
+                        c,
+                        Stroke::new(1.0_f32, Color32::BLACK),
+                    ));
+                    lamp(pos);
+                }
+                LightKind::Distant => {
+                    let from = self.distant_handle(o, l);
+                    let center = self.to_screen(o.center());
+                    painter.line_segment([from, center], Stroke::new(1.5_f32, c));
+                    let dir = (center - from).normalized();
+                    let side = Vec2::new(-dir.y, dir.x);
+                    painter.line_segment([center, center - dir * 10.0 + side * 5.0], Stroke::new(1.5_f32, c));
+                    painter.line_segment([center, center - dir * 10.0 - side * 5.0], Stroke::new(1.5_f32, c));
+                    lamp(from);
                 }
             }
         }
@@ -2596,12 +2930,75 @@ fn object_props(
                 }
             }
         });
-        egui::CollapsingHeader::new("Outline").default_open(false).show(ui, |ui| {
-            ui.checkbox(&mut obj.stroke.enabled, "Enabled");
-            rgba_label(ui, "Colour", &mut obj.stroke.color);
-            ui.add(egui::Slider::new(&mut obj.stroke.width, 0.5..=40.0).text("Width"));
-        });
     }
+
+    egui::CollapsingHeader::new("Outline").default_open(true).show(ui, |ui| {
+        let s = &mut obj.stroke;
+        ui.checkbox(&mut s.enabled, "Enabled");
+        rgba_label(ui, "Colour", &mut s.color);
+        ui.add(egui::Slider::new(&mut s.width, 0.5..=40.0).text("Width"));
+        ui.horizontal(|ui| {
+            ui.label("Position");
+            egui::ComboBox::from_id_salt("stroke_pos")
+                .selected_text(s.position.label())
+                .show_ui(ui, |ui| {
+                    for p in StrokePos::ALL {
+                        ui.selectable_value(&mut s.position, p, p.label());
+                    }
+                });
+        });
+        if obj.kind != ShapeKind::Bitmap {
+            ui.horizontal(|ui| {
+                ui.label("Style");
+                egui::ComboBox::from_id_salt("stroke_dash")
+                    .selected_text(s.dash.label())
+                    .show_ui(ui, |ui| {
+                        for d in DashKind::ALL {
+                            ui.selectable_value(&mut s.dash, d, d.label());
+                        }
+                    });
+            });
+        } else {
+            ui.small("On a paint layer the outline traces around everything painted.");
+        }
+    });
+
+    egui::CollapsingHeader::new("Transparency").default_open(true).show(ui, |ui| {
+        let t = &mut obj.transparency;
+        egui::ComboBox::from_id_salt("trans_kind")
+            .selected_text(t.kind.label())
+            .show_ui(ui, |ui| {
+                for k in TransparencyKind::ALL {
+                    ui.selectable_value(&mut t.kind, k, k.label());
+                }
+            });
+        match t.kind {
+            TransparencyKind::None => {}
+            TransparencyKind::Flat => {
+                ui.add(pct_slider(&mut t.start).text("Opacity"));
+            }
+            TransparencyKind::Linear | TransparencyKind::Radial => {
+                ui.add(pct_slider(&mut t.start).text("Start opacity"));
+                ui.add(pct_slider(&mut t.end).text("End opacity"));
+                if ui.button("Reverse").clicked() {
+                    std::mem::swap(&mut t.start, &mut t.end);
+                }
+                ui.small("Drag across the object with the Transparency tool (X) to set the direction.");
+            }
+            TransparencyKind::Texture => {
+                egui::ComboBox::from_id_salt("trans_tex")
+                    .selected_text(t.texture.label())
+                    .show_ui(ui, |ui| {
+                        for k in TextureKind::ALL {
+                            ui.selectable_value(&mut t.texture, k, k.label());
+                        }
+                    });
+                ui.add(pct_slider(&mut t.start).text("Opacity (dark)"));
+                ui.add(pct_slider(&mut t.end).text("Opacity (light)"));
+                ui.add(egui::Slider::new(&mut t.tex_scale, 0.2..=5.0).logarithmic(true).text("Scale"));
+            }
+        }
+    });
 
     egui::CollapsingHeader::new("Bevel & material").default_open(true).show(ui, |ui| {
         let b = &mut obj.effects.bevel;
@@ -2626,6 +3023,63 @@ fn object_props(
         ui.add(egui::Slider::new(&mut b.gloss, 0.0..=1.0).text("Gloss"));
         ui.add(egui::Slider::new(&mut b.shininess, 2.0..=120.0).logarithmic(true).text("Shininess"));
         ui.add(egui::Slider::new(&mut b.reflection, 0.0..=1.0).text("Chrome reflection"));
+    });
+
+    let lit = obj.effects.lighting.enabled;
+    egui::CollapsingHeader::new("Lights").default_open(lit).show(ui, |ui| {
+        let lighting = &mut obj.effects.lighting;
+        ui.checkbox(&mut lighting.enabled, "Enabled");
+        ui.add(egui::Slider::new(&mut lighting.ambient, 0.0..=1.5).text("Ambient light"));
+        ui.add(egui::Slider::new(&mut lighting.specular, 0.0..=1.5).text("Shine"));
+        let mut remove = None;
+        for (i, l) in lighting.lights.iter_mut().enumerate() {
+            egui::CollapsingHeader::new(format!("{} {}", l.kind.label(), i + 1))
+                .id_salt(("light", i))
+                .default_open(true)
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.checkbox(&mut l.enabled, "On");
+                        ui.color_edit_button_srgba_unmultiplied(&mut l.color);
+                        egui::ComboBox::from_id_salt(("light_kind", i))
+                            .selected_text(l.kind.label())
+                            .show_ui(ui, |ui| {
+                                for k in LightKind::ALL {
+                                    ui.selectable_value(&mut l.kind, k, k.label());
+                                }
+                            });
+                        if ui.small_button("Remove").clicked() {
+                            remove = Some(i);
+                        }
+                    });
+                    ui.add(egui::Slider::new(&mut l.intensity, 0.0..=4.0).text("Strength"));
+                    match l.kind {
+                        LightKind::Point | LightKind::Spot => {
+                            ui.add(egui::Slider::new(&mut l.height, 0.02..=2.0).text("Height"));
+                            ui.add(egui::Slider::new(&mut l.range, 0.05..=4.0).logarithmic(true).text("Reach"));
+                            if l.kind == LightKind::Spot {
+                                ui.add(egui::Slider::new(&mut l.cone, 3.0..=80.0).text("Cone angle"));
+                                ui.add(egui::Slider::new(&mut l.softness, 0.0..=1.0).text("Soft edge"));
+                            }
+                        }
+                        LightKind::Distant => {
+                            ui.add(egui::Slider::new(&mut l.angle, 0.0..=360.0).text("Direction"));
+                            ui.add(egui::Slider::new(&mut l.elevation, 2.0..=90.0).text("Height"));
+                        }
+                    }
+                });
+        }
+        if let Some(i) = remove {
+            lighting.lights.remove(i);
+        }
+        ui.horizontal_wrapped(|ui| {
+            for k in LightKind::ALL {
+                if ui.button(format!("+ {}", k.label())).clicked() {
+                    lighting.enabled = true;
+                    lighting.lights.push(Light::new(k, [0.3, 0.3]));
+                }
+            }
+        });
+        ui.small("Or use the Lights tool (L): click on the object to place a light, drag it to move or aim it.");
     });
 
     egui::CollapsingHeader::new("Drop shadow").default_open(false).show(ui, |ui| {
@@ -2960,6 +3414,45 @@ mod tests {
         assert_eq!(app.undo.len(), undo_len, "a no-op drop records no undo step");
         app.undo();
         assert_eq!(order(&app), vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn transparency_tool_drag_sets_the_fade_direction() {
+        let mut app = app_with(vec![rect(1, 100.0, 100.0)]);
+        app.tool = Tool::Transparency;
+        click(&mut app, Pt::new(150.0, 150.0), Modifiers::NONE);
+        assert_eq!(app.selected, Some(1));
+        assert_eq!(app.doc.objects[0].transparency.kind, TransparencyKind::None, "a click alone changes nothing");
+        drag(&mut app, Pt::new(110.0, 150.0), Pt::new(190.0, 150.0), Modifiers::NONE);
+        let t = &app.doc.objects[0].transparency;
+        assert_eq!(t.kind, TransparencyKind::Linear);
+        assert!((t.p0[0] - 0.1).abs() < 1e-3 && (t.p1[0] - 0.9).abs() < 1e-3, "{:?} {:?}", t.p0, t.p1);
+        // move the end handle
+        drag(&mut app, Pt::new(190.0, 150.0), Pt::new(150.0, 190.0), Modifiers::NONE);
+        let t = &app.doc.objects[0].transparency;
+        assert!((t.p1[0] - 0.5).abs() < 1e-3 && (t.p1[1] - 0.9).abs() < 1e-3, "{:?}", t.p1);
+        app.undo();
+        app.undo();
+        assert_eq!(app.doc.objects[0].transparency.kind, TransparencyKind::None);
+    }
+
+    #[test]
+    fn light_tool_places_moves_and_aims_lights() {
+        let mut app = app_with(vec![rect(1, 100.0, 100.0)]);
+        app.tool = Tool::Light;
+        click(&mut app, Pt::new(125.0, 125.0), Modifiers::NONE);
+        let l = &app.doc.objects[0].effects.lighting;
+        assert!(l.enabled && l.lights.len() == 1 && l.lights[0].kind == LightKind::Point);
+        assert!((l.lights[0].pos[0] - 0.25).abs() < 1e-3);
+        drag(&mut app, Pt::new(125.0, 125.0), Pt::new(175.0, 150.0), Modifiers::NONE);
+        let p = app.doc.objects[0].effects.lighting.lights[0].pos;
+        assert!((p[0] - 0.75).abs() < 1e-3 && (p[1] - 0.5).abs() < 1e-3, "{p:?}");
+        // a spotlight: press places it, the drag aims it
+        app.new_light_kind = LightKind::Spot;
+        drag(&mut app, Pt::new(110.0, 110.0), Pt::new(160.0, 190.0), Modifiers::NONE);
+        let s = &app.doc.objects[0].effects.lighting.lights[1];
+        assert_eq!(s.kind, LightKind::Spot);
+        assert!((s.pos[0] - 0.1).abs() < 1e-3 && (s.target[1] - 0.9).abs() < 1e-3, "{s:?}");
     }
 
     #[test]

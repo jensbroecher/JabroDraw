@@ -227,3 +227,115 @@ fn split_segment_keeps_curve_shape() {
     assert!(pt(sp.nodes[i].p).dist(expect) < 1e-5);
     assert_eq!(sp.nodes.len(), 5, "4-node circle + 1");
 }
+
+// ------------------------------------------------------------------ transparency, lights, outlines
+
+fn render_one(o: Object, w: u32, h: u32) -> tiny_skia::Pixmap {
+    let mut doc = Document::new(w, h);
+    doc.objects.push(o);
+    Renderer::default().render(&doc)
+}
+
+fn lum(pm: &tiny_skia::Pixmap, x: u32, y: u32) -> f32 {
+    let c = pm.pixel(x, y).unwrap().demultiply();
+    (c.red() as f32 + c.green() as f32 + c.blue() as f32) / (3.0 * 255.0)
+}
+
+#[test]
+fn linear_and_radial_transparency_fade_the_object() {
+    let mut o = Object::new(1, ShapeKind::Rect { corner: 0.0 }, 0.0, 0.0, 100.0, 100.0);
+    o.fill.a = [0, 0, 0, 255];
+    o.transparency.kind = TransparencyKind::Linear; // default: opaque at top, clear at bottom
+    let out = render_one(o.clone(), 100, 100);
+    assert!(lum(&out, 50, 3) < 0.1, "top is opaque black");
+    assert!((lum(&out, 50, 50) - 0.5).abs() < 0.08, "middle is half see-through");
+    assert!(lum(&out, 50, 97) > 0.9, "bottom shows the white page");
+
+    o.transparency.kind = TransparencyKind::Radial;
+    o.transparency.p0 = [0.5, 0.5];
+    o.transparency.p1 = [1.0, 0.5];
+    let out = render_one(o, 100, 100);
+    assert!(lum(&out, 50, 50) < 0.1, "centre opaque");
+    assert!(lum(&out, 98, 50) > 0.9, "rim transparent");
+}
+
+#[test]
+fn transparency_follows_perspective() {
+    let mut o = Object::new(1, ShapeKind::Rect { corner: 0.0 }, 0.0, 0.0, 100.0, 100.0);
+    o.fill.a = [0, 0, 0, 255];
+    o.transparency.kind = TransparencyKind::Linear;
+    o.transparency.p0 = [0.0, 0.5];
+    o.transparency.p1 = [1.0, 0.5]; // fades left -> right
+    o.quad = Object::rect_quad(0.0, 0.0, 100.0, 100.0).map(|p| Pt::new(p.y, p.x)); // mirrored on the diagonal
+    let out = render_one(o, 100, 100);
+    assert!(lum(&out, 50, 3) < 0.15 && lum(&out, 50, 96) > 0.85, "the fade now runs top -> bottom");
+}
+
+#[test]
+fn point_and_spot_lights_brighten_where_they_shine() {
+    let mut o = Object::new(1, ShapeKind::Rect { corner: 0.0 }, 0.0, 0.0, 200.0, 200.0);
+    o.fill.a = [128, 128, 128, 255];
+    o.effects.lighting.enabled = true;
+    o.effects.lighting.ambient = 0.2;
+    o.effects.lighting.lights.push(Light::new(LightKind::Point, [0.5, 0.5]));
+    let out = render_one(o.clone(), 200, 200);
+    assert!(lum(&out, 100, 100) > lum(&out, 5, 5) + 0.15, "pool of light under the lamp");
+
+    let mut spot = Light::new(LightKind::Spot, [0.2, 0.2]);
+    spot.target = [0.7, 0.7];
+    spot.cone = 15.0;
+    spot.softness = 0.1;
+    o.effects.lighting.lights = vec![spot];
+    let out = render_one(o, 200, 200);
+    assert!(lum(&out, 140, 140) > 0.3, "inside the cone is lit");
+    assert!(lum(&out, 180, 20) < 0.15, "outside the cone stays at ambient");
+}
+
+#[test]
+fn outline_positions_inside_outside_and_around_paint() {
+    let mut o = Object::new(1, ShapeKind::Rect { corner: 0.0 }, 40.0, 40.0, 100.0, 100.0);
+    o.fill.a = [0, 0, 255, 255];
+    o.stroke = StrokeStyle {
+        enabled: true,
+        color: [255, 0, 0, 255],
+        width: 10.0,
+        position: StrokePos::Outside,
+        ..Default::default()
+    };
+    let out = render_one(o.clone(), 180, 180);
+    let red = |pm: &tiny_skia::Pixmap, x, y| {
+        let c = pm.pixel(x, y).unwrap().demultiply();
+        c.red() > 200 && c.blue() < 60
+    };
+    assert!(red(&out, 35, 90), "outside outline sits outside the edge");
+    assert!(!red(&out, 45, 90), "inside stays the fill colour");
+
+    o.stroke.position = StrokePos::Inside;
+    let out = render_one(o, 180, 180);
+    assert!(red(&out, 45, 90), "inside outline sits inside");
+    assert!(!red(&out, 35, 90), "nothing outside");
+
+    // paint layer: a dot gets an outline traced around it
+    let mut layer = Object::new(2, ShapeKind::Bitmap, 0.0, 0.0, 100.0, 100.0);
+    layer.fill.kind = FillKind::None;
+    let mut pm = tiny_skia::Pixmap::new(100, 100).unwrap();
+    let b = BrushSettings {
+        size: 30.0,
+        hardness: 1.0,
+        flow: 1.0,
+        color: [0, 0, 255, 255],
+        ..Default::default()
+    };
+    brush::segment(&mut pm, (50.0, 50.0), (50.0, 50.0), 15.0, &b, &mut StrokeState::new());
+    layer.paint = Some(Arc::new(pm));
+    layer.stroke = StrokeStyle {
+        enabled: true,
+        color: [255, 0, 0, 255],
+        width: 6.0,
+        position: StrokePos::Outside,
+        ..Default::default()
+    };
+    let out = render_one(layer, 100, 100);
+    assert!(red(&out, 50, 32), "ring just outside the painted dot");
+    assert!(!red(&out, 50, 50), "dot itself stays blue");
+}
