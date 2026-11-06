@@ -343,7 +343,7 @@ pub fn apply_lights(pm: &mut Pixmap, lighting: &Lighting, height: Option<&[f32]>
     }
 }
 
-fn rgb_to_hsl(r: f32, g: f32, b: f32) -> (f32, f32, f32) {
+pub(crate) fn rgb_to_hsl(r: f32, g: f32, b: f32) -> (f32, f32, f32) {
     let max = r.max(g).max(b);
     let min = r.min(g).min(b);
     let l = (max + min) * 0.5;
@@ -362,7 +362,7 @@ fn rgb_to_hsl(r: f32, g: f32, b: f32) -> (f32, f32, f32) {
     (h * 60.0, s, l)
 }
 
-fn hsl_to_rgb(h: f32, s: f32, l: f32) -> (f32, f32, f32) {
+pub(crate) fn hsl_to_rgb(h: f32, s: f32, l: f32) -> (f32, f32, f32) {
     if s <= 0.0 {
         return (l, l, l);
     }

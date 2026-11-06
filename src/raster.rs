@@ -222,6 +222,103 @@ pub fn warp(
     Some((out, x0 as i32, y0 as i32))
 }
 
+/// Like `warp`, but the object is first bent by a mesh (warp tool / liquify). The local
+/// raster is cut into small triangles that are each mapped through mesh + perspective.
+#[allow(clippy::too_many_arguments)]
+pub fn warp_mesh(
+    local: &Pixmap,
+    pad: f32,
+    fwd: &Homography,
+    mesh: &crate::doc::Mesh,
+    w: f32,
+    h: f32,
+    dw: u32,
+    dh: u32,
+    margin: i32,
+) -> Option<(Pixmap, i32, i32)> {
+    const SUB: usize = 6;
+    let (nu, nv) = (mesh.cols * SUB, mesh.rows * SUB);
+    let (pu, pv) = (pad / w.max(1.0), pad / h.max(1.0));
+    let mut canvas = Vec::with_capacity((nu + 1) * (nv + 1));
+    let mut source = Vec::with_capacity((nu + 1) * (nv + 1));
+    for j in 0..=nv {
+        for i in 0..=nu {
+            let u = -pu + (1.0 + 2.0 * pu) * i as f32 / nu as f32;
+            let v = -pv + (1.0 + 2.0 * pv) * j as f32 / nv as f32;
+            let m = mesh.map(u, v);
+            let c = fwd.apply((m[0] * w) as f64, (m[1] * h) as f64)?;
+            canvas.push((c.0 as f32, c.1 as f32));
+            source.push((u * w + pad, v * h + pad));
+        }
+    }
+    let (mut minx, mut miny, mut maxx, mut maxy) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
+    for &(x, y) in &canvas {
+        minx = minx.min(x);
+        miny = miny.min(y);
+        maxx = maxx.max(x);
+        maxy = maxy.max(y);
+    }
+    if !minx.is_finite() || !maxy.is_finite() {
+        return None;
+    }
+    let m = margin as i64;
+    let x0 = ((minx.floor() as i64) - m).max(-m);
+    let y0 = ((miny.floor() as i64) - m).max(-m);
+    let x1 = ((maxx.ceil() as i64) + m).min(dw as i64 + m);
+    let y1 = ((maxy.ceil() as i64) + m).min(dh as i64 + m);
+    if x1 <= x0 || y1 <= y0 {
+        return None;
+    }
+    let (bw, bh) = ((x1 - x0) as usize, (y1 - y0) as usize);
+    let mut out = Pixmap::new(bw as u32, bh as u32)?;
+    let (src, sw, sh) = (local.data(), local.width() as i32, local.height() as i32);
+    let od = out.data_mut();
+    let edge = |a: (f32, f32), b: (f32, f32), p: (f32, f32)| (b.0 - a.0) * (p.1 - a.1) - (b.1 - a.1) * (p.0 - a.0);
+    let mut tri = |a: usize, b: usize, c: usize| {
+        let (pa, pb, pc) = (canvas[a], canvas[b], canvas[c]);
+        let area = edge(pa, pb, pc);
+        if area.abs() < 1e-6 {
+            return;
+        }
+        let lx = ((pa.0.min(pb.0).min(pc.0)).floor() as i64 - x0).max(0) as usize;
+        let ly = ((pa.1.min(pb.1).min(pc.1)).floor() as i64 - y0).max(0) as usize;
+        let hx = (((pa.0.max(pb.0).max(pc.0)).ceil() as i64 - x0).max(0) as usize).min(bw);
+        let hy = (((pa.1.max(pb.1).max(pc.1)).ceil() as i64 - y0).max(0) as usize).min(bh);
+        let (sa, sb, sc) = (source[a], source[b], source[c]);
+        for py in ly..hy {
+            for px in lx..hx {
+                let p = ((x0 + px as i64) as f32 + 0.5, (y0 + py as i64) as f32 + 0.5);
+                let w0 = edge(pb, pc, p) / area;
+                let w1 = edge(pc, pa, p) / area;
+                let w2 = 1.0 - w0 - w1;
+                if w0 < -1e-4 || w1 < -1e-4 || w2 < -1e-4 {
+                    continue;
+                }
+                let sx = sa.0 * w0 + sb.0 * w1 + sc.0 * w2;
+                let sy = sa.1 * w0 + sb.1 * w1 + sc.1 * w2;
+                let col = sample_bilinear(src, sw, sh, sx, sy);
+                if col[3] > 0.0 {
+                    let i = (py * bw + px) * 4;
+                    let al = col[3].round().min(255.0);
+                    od[i + 3] = al as u8;
+                    for k in 0..3 {
+                        od[i + k] = col[k].round().min(al) as u8;
+                    }
+                }
+            }
+        }
+    };
+    for j in 0..nv {
+        for i in 0..nu {
+            let a = j * (nu + 1) + i;
+            let (b, c, d) = (a + 1, a + nu + 1, a + nu + 2);
+            tri(a, b, d);
+            tri(a, d, c);
+        }
+    }
+    Some((out, x0 as i32, y0 as i32))
+}
+
 /// Extract the alpha channel as 0..1 floats.
 pub fn alpha_of(pm: &Pixmap) -> Vec<f32> {
     pm.data().chunks_exact(4).map(|p| p[3] as f32 / 255.0).collect()

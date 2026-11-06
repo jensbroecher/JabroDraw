@@ -310,6 +310,8 @@ fn plain_vector(o: &Object) -> bool {
         && o.transparency.kind == TransparencyKind::None
         && o.fill.kind != FillKind::Texture
         && (!o.stroke.enabled || o.stroke.position == StrokePos::Center)
+        && o.adjust.is_identity()
+        && o.mesh.as_ref().is_none_or(|m| m.is_identity())
 }
 
 fn path_data(p: &tiny_skia::Path, map: &dyn Fn(f32, f32) -> (f32, f32)) -> String {

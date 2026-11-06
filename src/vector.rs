@@ -282,6 +282,46 @@ pub fn cubic(p0: Pt, c1: Pt, c2: Pt, p3: Pt, t: f32) -> Pt {
     p0 * (u * u * u) + c1 * (3.0 * u * u * t) + c2 * (3.0 * u * t * t) + p3 * (t * t * t)
 }
 
+/// Canvas point -> the object's own (unbent) local pixel coordinates, through its perspective
+/// and, if it has one, its warp mesh.
+pub fn canvas_to_local(o: &Object, p: Pt) -> Option<Pt> {
+    let hm = o.homography();
+    let Some(mesh) = o.mesh.as_ref().filter(|m| !m.is_identity()) else {
+        return hm.inverse()?.apply_pt(p);
+    };
+    const SUB: usize = 3;
+    let (nu, nv) = (mesh.cols * SUB, mesh.rows * SUB);
+    let (w, h) = (o.size[0], o.size[1]);
+    let mut verts = Vec::with_capacity((nu + 1) * (nv + 1));
+    for j in 0..=nv {
+        for i in 0..=nu {
+            let (u, v) = (i as f32 / nu as f32, j as f32 / nv as f32);
+            let m = mesh.map(u, v);
+            verts.push((hm.apply_pt(Pt::new(m[0] * w, m[1] * h))?, Pt::new(u * w, v * h)));
+        }
+    }
+    let edge = |a: Pt, b: Pt, q: Pt| (b.x - a.x) * (q.y - a.y) - (b.y - a.y) * (q.x - a.x);
+    for j in 0..nv {
+        for i in 0..nu {
+            let a = j * (nu + 1) + i;
+            for (x, y, z) in [(a, a + 1, a + nu + 2), (a, a + nu + 2, a + nu + 1)] {
+                let (pa, pb, pc) = (verts[x].0, verts[y].0, verts[z].0);
+                let area = edge(pa, pb, pc);
+                if area.abs() < 1e-9 {
+                    continue;
+                }
+                let w0 = edge(pb, pc, p) / area;
+                let w1 = edge(pc, pa, p) / area;
+                let w2 = 1.0 - w0 - w1;
+                if w0 >= -1e-4 && w1 >= -1e-4 && w2 >= -1e-4 {
+                    return Some(verts[x].1 * w0 + verts[y].1 * w1 + verts[z].1 * w2);
+                }
+            }
+        }
+    }
+    None
+}
+
 /// The object's outline as closed polygons in canvas coordinates (None for paint layers).
 pub fn outline_doc(obj: &Object) -> Option<Contours> {
     if obj.kind == ShapeKind::Bitmap {

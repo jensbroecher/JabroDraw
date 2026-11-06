@@ -49,10 +49,12 @@ Styles: `none watercolor oil impressionist pointillism pencil colorpencil comic`
 | R / E / S | Rectangle / ellipse / star-polygon. Drag to draw, or click for a default size. |
 | F | Freehand closed shape (becomes a smooth vector curve). |
 | T | Text. Edit the text and font in the properties panel. |
-| B | Brush. Paints into the selected object, or into a new paint layer. Alt+click picks a colour. |
+| B | Brush. Paints into the selected object, or into a new paint layer. Alt+click picks a colour. Besides round, airbrush, chalk, smudge and eraser there is **Watercolor** (wet washes that pool at the edges and mix where strokes overlap) and a **Scatter** image hose that sprays leaves, grass, stars, hearts, flowers or confetti, each with its own size, angle and shade. |
 | G | Gradient. Drag across an object to lay its fill gradient (linear or radial), then drag the handles. Add, move and recolour stops on the gradient bar in Fill. |
 | X | Transparency. Drag across an object to fade it: opaque where you start, transparent where you let go (linear or radial). Drag the two handles to adjust. |
 | L | Lights. Click an object to add a point light, spotlight or distant light; drag the lamp to move it, the spotlight's diamond to aim it. |
+| W | Warp. Drag the grid points to bend an object freely, on top of its perspective. Grid density and Reset warp are in the tool panel. |
+| J | Liquify. Paint over an object to push (Move), bloat (Grow), pinch (Shrink) or twirl it. Shapes, text, paint and effects bend together and stay editable. |
 
 - **Changing an object later**: select it and use the **Shape** section at the top of the properties
   panel (corner radius, star sides/depth, text + **Font**). **Double-click** an object to reshape it:

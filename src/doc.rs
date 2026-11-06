@@ -309,6 +309,59 @@ impl FillStyle {
     }
 }
 
+/// Free-form warp: a grid of control points (normalised to the object box) that bends the
+/// object before its perspective placement. Identity = points on a regular grid.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Mesh {
+    pub cols: usize,
+    pub rows: usize,
+    /// (cols + 1) × (rows + 1) points, row by row.
+    pub pts: Vec<[f32; 2]>,
+}
+
+impl Mesh {
+    pub fn identity(cols: usize, rows: usize) -> Self {
+        let mut pts = Vec::with_capacity((cols + 1) * (rows + 1));
+        for j in 0..=rows {
+            for i in 0..=cols {
+                pts.push([i as f32 / cols as f32, j as f32 / rows as f32]);
+            }
+        }
+        Self { cols, rows, pts }
+    }
+
+    pub fn is_identity(&self) -> bool {
+        *self == Mesh::identity(self.cols, self.rows)
+    }
+
+    /// Where the undeformed point (u, v) goes (bilinear between control points; extrapolates
+    /// outside 0..1 so outlines and anti-aliased edges keep up).
+    pub fn map(&self, u: f32, v: f32) -> [f32; 2] {
+        let fx = u * self.cols as f32;
+        let fy = v * self.rows as f32;
+        let i = (fx.floor() as isize).clamp(0, self.cols as isize - 1) as usize;
+        let j = (fy.floor() as isize).clamp(0, self.rows as isize - 1) as usize;
+        let (tx, ty) = (fx - i as f32, fy - j as f32);
+        let p = |i: usize, j: usize| self.pts[j * (self.cols + 1) + i];
+        let (a, b, c, d) = (p(i, j), p(i + 1, j), p(i, j + 1), p(i + 1, j + 1));
+        let lerp = |k: usize| {
+            let top = a[k] + (b[k] - a[k]) * tx;
+            let bottom = c[k] + (d[k] - c[k]) * tx;
+            top + (bottom - top) * ty
+        };
+        [lerp(0), lerp(1)]
+    }
+
+    /// Same deformation on a different grid density (for liquify, which needs a fine grid).
+    pub fn resampled(&self, cols: usize, rows: usize) -> Mesh {
+        let mut m = Mesh::identity(cols, rows);
+        for p in m.pts.iter_mut() {
+            *p = self.map(p[0], p[1]);
+        }
+        m
+    }
+}
+
 /// How an object mixes with what is underneath it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum Blend {
@@ -771,6 +824,9 @@ pub struct Object {
     pub blend: Blend,
     #[serde(default)]
     pub adjust: Adjust,
+    /// Free-form warp (warp tool / liquify); None = straight.
+    #[serde(default)]
+    pub mesh: Option<Mesh>,
     #[serde(default = "one")]
     pub opacity: f32,
     #[serde(default = "yes")]
@@ -818,6 +874,7 @@ impl Object {
             transparency: Transparency::default(),
             blend: Blend::Normal,
             adjust: Adjust::default(),
+            mesh: None,
             opacity: 1.0,
             visible: true,
             paint: None,
@@ -946,6 +1003,7 @@ impl Object {
             && self.transparency == o.transparency
             && self.blend == o.blend
             && self.adjust == o.adjust
+            && self.mesh == o.mesh
             && self.original == o.original
             && self.opacity == o.opacity
             && self.npr_mode == o.npr_mode
@@ -963,6 +1021,7 @@ impl Object {
         self.transparency = src.transparency.clone();
         self.blend = src.blend;
         self.adjust = src.adjust.clone();
+        self.mesh = src.mesh.clone();
         self.original = src.original.clone();
         self.opacity = src.opacity;
         self.npr_mode = src.npr_mode;
@@ -990,6 +1049,7 @@ impl Object {
             && self.transparency == o.transparency
             && self.blend == o.blend
             && self.adjust == o.adjust
+            && self.mesh == o.mesh
             && self.original == o.original
             && self.group == o.group
             && self.instance_of == o.instance_of

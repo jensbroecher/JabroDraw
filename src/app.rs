@@ -26,13 +26,15 @@ pub enum Tool {
     Freehand,
     Text,
     Brush,
+    Warp,
+    Liquify,
     Gradient,
     Transparency,
     Light,
 }
 
 impl Tool {
-    const ALL: [Tool; 13] = [
+    const ALL: [Tool; 15] = [
         Tool::Select,
         Tool::Node,
         Tool::Perspective,
@@ -43,6 +45,8 @@ impl Tool {
         Tool::Freehand,
         Tool::Text,
         Tool::Brush,
+        Tool::Warp,
+        Tool::Liquify,
         Tool::Gradient,
         Tool::Transparency,
         Tool::Light,
@@ -59,6 +63,8 @@ impl Tool {
             Tool::Freehand => "Freehand shape  (F)",
             Tool::Text => "Text  (T)",
             Tool::Brush => "Brush  (B)",
+            Tool::Warp => "Warp  (W)",
+            Tool::Liquify => "Liquify  (J)",
             Tool::Gradient => "Gradient  (G)",
             Tool::Transparency => "Transparency  (X)",
             Tool::Light => "Lights  (L)",
@@ -76,6 +82,8 @@ impl Tool {
             Tool::Freehand => egui::Key::F,
             Tool::Text => egui::Key::T,
             Tool::Brush => egui::Key::B,
+            Tool::Warp => egui::Key::W,
+            Tool::Liquify => egui::Key::J,
             Tool::Gradient => egui::Key::G,
             Tool::Transparency => egui::Key::X,
             Tool::Light => egui::Key::L,
@@ -93,6 +101,8 @@ impl Tool {
             Tool::Freehand => "Draw a closed freehand shape — it becomes a smooth vector curve.",
             Tool::Text => "Click or drag a box to place text, then edit it in the properties panel.",
             Tool::Brush => "Paint on the selected object (clipped to its shape) or on a new paint layer. Alt+click picks a colour.",
+            Tool::Warp => "Drag the grid points to bend the object freely (on top of its perspective). Grid density in the tool panel.",
+            Tool::Liquify => "Paint over an object to push (Move), bloat (Grow), pinch (Shrink) or twirl it — shapes, text and paint bend together.",
             Tool::Gradient => "Drag across an object to lay its gradient: first colour where you start, last where you let go. Drag the handles to adjust; edit colours in Fill.",
             Tool::Transparency => "Drag across an object to fade it out: from opaque where you start to transparent where you let go. Drag the two handles to adjust.",
             Tool::Light => "Click an object to add a light there (type in the tool panel). Drag a lamp to move it, a spotlight's diamond to aim it.",
@@ -114,6 +124,10 @@ enum Drag {
     /// Fill gradient being dragged out, or one of its two handles being moved.
     GradNew { id: u64, q0: [f32; 2] },
     GradHandle { id: u64, which: usize },
+    /// Moving one control point of the warp grid.
+    WarpPoint { id: u64, idx: usize },
+    /// Liquify brush stroke (`last` = previous pointer position on the canvas).
+    Liquify { id: u64, last: Pt },
     LightPos { id: u64, idx: usize },
     LightTarget { id: u64, idx: usize },
     LightDir { id: u64, idx: usize },
@@ -208,6 +222,14 @@ fn ctrl_v_down() -> bool {
 #[cfg(not(windows))]
 fn ctrl_v_down() -> bool {
     false
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum LiquifyMode {
+    Move,
+    Grow,
+    Shrink,
+    Twirl,
 }
 
 #[derive(Clone, Copy)]
@@ -313,10 +335,10 @@ fn doc_to_mask(obj: &Object, p: Pt) -> Option<((f32, f32), f32)> {
 /// Canvas point -> (pixel in a layer of lw x lh stretched over the object, layer pixels per
 /// canvas pixel).
 fn doc_to_layer(obj: &Object, p: Pt, lw: u32, lh: u32) -> Option<((f32, f32), f32)> {
-    let inv = obj.homography().inverse()?;
-    let (lx, ly) = inv.apply(p.x as f64, p.y as f64)?;
-    let (lx2, ly2) = inv.apply(p.x as f64 + 1.0, p.y as f64)?;
-    let (lx3, ly3) = inv.apply(p.x as f64, p.y as f64 + 1.0)?;
+    let l = |q: Pt| vector::canvas_to_local(obj, q).map(|r| (r.x as f64, r.y as f64));
+    let (lx, ly) = l(p)?;
+    let (lx2, ly2) = l(p + Pt::new(1.0, 0.0)).unwrap_or((lx + 1.0, ly));
+    let (lx3, ly3) = l(p + Pt::new(0.0, 1.0)).unwrap_or((lx, ly + 1.0));
     let kx = lw as f64 / obj.size[0].max(1.0) as f64;
     let ky = lh as f64 / obj.size[1].max(1.0) as f64;
     let sx = ((lx2 - lx) * kx).hypot((ly2 - ly) * ky);
@@ -454,6 +476,10 @@ pub struct JabroApp {
     trans_kind: TransparencyKind,
     /// Gradient type a Gradient-tool drag creates.
     grad_kind: FillKind,
+    warp_cells: usize,
+    liquify_mode: LiquifyMode,
+    liquify_size: f32,
+    liquify_strength: f32,
     /// Light type a Lights-tool click adds, and the light being edited.
     new_light_kind: LightKind,
     light_sel: Option<usize>,
@@ -558,6 +584,10 @@ impl JabroApp {
             list_drag: None,
             trans_kind: TransparencyKind::Linear,
             grad_kind: FillKind::Linear,
+            warp_cells: 3,
+            liquify_mode: LiquifyMode::Move,
+            liquify_size: 90.0,
+            liquify_strength: 0.6,
             new_light_kind: LightKind::Point,
             light_sel: None,
             bg_tol: 0.15,
@@ -1716,6 +1746,8 @@ impl JabroApp {
             Tool::Pen => self.press_pen(p, sp),
             Tool::Transparency => self.press_transparency(p, sp),
             Tool::Gradient => self.press_gradient(p, sp),
+            Tool::Warp => self.press_warp(p, sp),
+            Tool::Liquify => self.press_liquify(p),
             Tool::Light => self.press_light(p, sp),
             Tool::Rect | Tool::Ellipse | Tool::Polygon | Tool::Text => {
                 self.drag = Drag::Create { start: p, cur: p }
@@ -1836,6 +1868,76 @@ impl JabroApp {
             Some(q0) => Drag::TransNew { id, q0 },
             None => Drag::None,
         };
+    }
+
+    /// Canvas positions of a mesh's control points (identity grid if the object has none yet).
+    fn warp_points_screen(&self, o: &Object) -> Vec<Pos2> {
+        let mesh = o.mesh.clone().unwrap_or_else(|| Mesh::identity(self.warp_cells, self.warp_cells));
+        mesh.pts.iter().filter_map(|q| self.norm_to_screen(o, *q)).collect()
+    }
+
+    fn press_warp(&mut self, p: Pt, sp: Pos2) {
+        if let Some(o) = self.selected.and_then(|id| self.doc.find(id)) {
+            if let Some(idx) = self.warp_points_screen(o).iter().position(|s| s.distance(sp) < 9.0) {
+                self.drag = Drag::WarpPoint { id: o.id, idx };
+                return;
+            }
+        }
+        let hit = self.hit_test(p);
+        self.select_only(hit);
+        self.drag = Drag::None;
+        if hit.is_some() {
+            self.status = "Drag the grid points to bend the object.".into();
+        }
+    }
+
+    fn press_liquify(&mut self, p: Pt) {
+        let Some(id) = self.hit_test(p).or(self.selected) else {
+            self.drag = Drag::None;
+            return;
+        };
+        if self.selected != Some(id) {
+            self.select_only(Some(id));
+        }
+        self.drag = Drag::Liquify { id, last: p };
+    }
+
+    /// One liquify step on the object's (fine) mesh, from `last` to `p` on the canvas.
+    fn liquify_step(&mut self, id: u64, last: Pt, p: Pt) {
+        let (mode, r, k) = (self.liquify_mode, self.liquify_size * 0.5, self.liquify_strength);
+        let Some(o) = self.doc.find_mut(id) else { return };
+        let mut mesh = match o.mesh.take() {
+            Some(m) if m.cols >= 16 => m,
+            Some(m) => m.resampled(16, 16),
+            None => Mesh::identity(16, 16),
+        };
+        let hm = o.homography();
+        let Some(inv) = hm.inverse() else {
+            o.mesh = Some(mesh);
+            return;
+        };
+        let (w, h) = (o.size[0], o.size[1]);
+        let delta = p - last;
+        for q in mesh.pts.iter_mut() {
+            let Some(c) = hm.apply_pt(Pt::new(q[0] * w, q[1] * h)) else { continue };
+            let d = c.dist(p);
+            if d >= r {
+                continue;
+            }
+            let wgt = (1.0 - d / r).powi(2);
+            let moved = match mode {
+                LiquifyMode::Move => c + delta * (wgt * k.max(0.05) * 1.4).min(1.0),
+                LiquifyMode::Grow => c + (c - p) * (wgt * k * 0.08),
+                LiquifyMode::Shrink => c - (c - p) * (wgt * k * 0.08),
+                LiquifyMode::Twirl => p + (c - p).rotate(wgt * k * 0.12),
+            };
+            if let Some(l) = inv.apply_pt(moved) {
+                *q = [l.x / w.max(1e-3), l.y / h.max(1e-3)];
+            }
+        }
+        o.mesh = Some(mesh);
+        o.touch();
+        self.dirty = true;
     }
 
     fn press_gradient(&mut self, p: Pt, sp: Pos2) {
@@ -2848,6 +2950,27 @@ impl JabroApp {
                 }
                 Drag::GradNew { id, q0 }
             }
+            Drag::WarpPoint { id, idx } => {
+                self.commit_snapshot();
+                let cells = self.warp_cells;
+                if let Some(o) = self.doc.find_mut(id) {
+                    let inv = o.homography().inverse();
+                    let mesh = o.mesh.get_or_insert_with(|| Mesh::identity(cells, cells));
+                    if let (Some(inv), Some(q)) = (inv, mesh.pts.get_mut(idx)) {
+                        if let Some(l) = inv.apply_pt(p) {
+                            *q = [l.x / o.size[0].max(1e-3), l.y / o.size[1].max(1e-3)];
+                        }
+                    }
+                    o.touch();
+                }
+                self.dirty = true;
+                Drag::WarpPoint { id, idx }
+            }
+            Drag::Liquify { id, last } => {
+                self.commit_snapshot();
+                self.liquify_step(id, last, p);
+                Drag::Liquify { id, last: p }
+            }
             Drag::GradHandle { id, which } => {
                 self.commit_snapshot();
                 if let Some(o) = self.doc.find_mut(id) {
@@ -3812,6 +3935,33 @@ impl JabroApp {
                     });
                 }
             }
+            Tool::Warp => {
+                ui.strong("Warp");
+                ui.add(egui::Slider::new(&mut self.warp_cells, 1..=6).text("Grid"));
+                ui.small("Grid size for objects that are not warped yet.");
+                let warped = self.selected.and_then(|id| self.doc.find(id)).is_some_and(|o| o.mesh.is_some());
+                if warped && ui.button("Reset warp").clicked() {
+                    self.apply_to_selected(|o| o.mesh = None);
+                }
+            }
+            Tool::Liquify => {
+                ui.strong("Liquify");
+                for (m, label) in [
+                    (LiquifyMode::Move, "Move (push)"),
+                    (LiquifyMode::Grow, "Grow (bloat)"),
+                    (LiquifyMode::Shrink, "Shrink (pinch)"),
+                    (LiquifyMode::Twirl, "Twirl"),
+                ] {
+                    ui.radio_value(&mut self.liquify_mode, m, label);
+                }
+                ui.add(egui::Slider::new(&mut self.liquify_size, 10.0..=400.0).logarithmic(true).text("Size"));
+                ui.add(egui::Slider::new(&mut self.liquify_strength, 0.05..=1.0).text("Strength"));
+                let warped = self.selected.and_then(|id| self.doc.find(id)).is_some_and(|o| o.mesh.is_some());
+                if warped && ui.button("Reset liquify").clicked() {
+                    self.apply_to_selected(|o| o.mesh = None);
+                }
+                ui.small("Bends the whole object — vector shape, text and paint together — and stays undoable.");
+            }
             Tool::Gradient => {
                 ui.strong("Gradient");
                 ui.label("Dragging creates a:");
@@ -3939,6 +4089,23 @@ impl JabroApp {
                     ui.add(egui::Slider::new(&mut self.brush.flow, 0.02..=1.0).text("Flow"));
                     ui.add(egui::Slider::new(&mut self.brush.spacing, 0.02..=1.0).text("Spacing"));
                     ui.checkbox(&mut self.brush.pressure, "Pen pressure");
+                    match self.brush.kind {
+                        BrushKind::Scatter => {
+                            egui::ComboBox::from_label("Sprays")
+                                .selected_text(self.brush.scatter.label())
+                                .show_ui(ui, |ui| {
+                                    for s in crate::brush::ScatterShape::ALL {
+                                        ui.selectable_value(&mut self.brush.scatter, s, s.label());
+                                    }
+                                });
+                            ui.add(egui::Slider::new(&mut self.brush.jitter, 0.0..=1.0).text("Variation"));
+                            ui.small("Image hose: sprays little leaves, stars, flowers… along the stroke, each with its own size, angle and shade.");
+                        }
+                        BrushKind::Watercolor => {
+                            ui.small("Wet paint: pigment pools at the edges of each stroke and soaks into the paper grain. Lower flow = paler washes; overlap strokes to glaze.");
+                        }
+                        _ => {}
+                    }
                 }
                 let has_work = self
                     .selected
@@ -4467,9 +4634,10 @@ impl JabroApp {
         self.draw_overlays(&painter);
         self.draw_rulers(&painter, latest);
 
-        if self.tool == Tool::Brush {
+        if self.tool == Tool::Brush || self.tool == Tool::Liquify {
             if let Some(p) = latest.filter(|p| rect.contains(*p)) {
-                let r = self.brush.size * 0.5 * self.zoom;
+                let size = if self.tool == Tool::Liquify { self.liquify_size } else { self.brush.size };
+                let r = size * 0.5 * self.zoom;
                 painter.circle_stroke(p, r, Stroke::new(1.0_f32, Color32::from_black_alpha(160)));
                 painter.circle_stroke(p, r + 1.0, Stroke::new(1.0_f32, Color32::from_white_alpha(160)));
             }
@@ -4653,6 +4821,9 @@ impl JabroApp {
         if self.tool == Tool::Transparency {
             self.draw_transparency_overlay(painter);
         }
+        if self.tool == Tool::Warp {
+            self.draw_warp_overlay(painter);
+        }
         if self.tool == Tool::Gradient {
             self.draw_gradient_overlay(painter);
         }
@@ -4808,6 +4979,34 @@ impl JabroApp {
                 hm.apply_pt(c + Pt::new(a.cos(), a.sin()) * r).map(|p| self.to_screen(p))
             })
             .collect()
+    }
+
+    fn draw_warp_overlay(&self, painter: &egui::Painter) {
+        let Some(o) = self.selected.and_then(|id| self.doc.find(id)) else { return };
+        let mesh = o.mesh.clone().unwrap_or_else(|| Mesh::identity(self.warp_cells, self.warp_cells));
+        if mesh.cols > 8 {
+            // a liquify mesh is too dense to edit point by point: just show its outline
+            let line = Stroke::new(1.0_f32, Color32::from_rgba_unmultiplied(0, 170, 255, 120));
+            painter.add(Shape::closed_line(self.quad_screen(&o.quad), line));
+            return;
+        }
+        let line = Stroke::new(1.0_f32, Color32::from_rgba_unmultiplied(0, 170, 255, 200));
+        let to_s = |u: f32, v: f32| self.norm_to_screen(o, mesh.map(u, v));
+        // grid lines follow the bend
+        for j in 0..=mesh.rows {
+            let v = j as f32 / mesh.rows as f32;
+            let pts: Vec<Pos2> = (0..=24).filter_map(|k| to_s(k as f32 / 24.0, v)).collect();
+            painter.add(Shape::line(pts, line));
+        }
+        for i in 0..=mesh.cols {
+            let u = i as f32 / mesh.cols as f32;
+            let pts: Vec<Pos2> = (0..=24).filter_map(|k| to_s(u, k as f32 / 24.0)).collect();
+            painter.add(Shape::line(pts, line));
+        }
+        for s in self.warp_points_screen(o) {
+            painter.circle_filled(s, 5.0, Color32::WHITE);
+            painter.circle_stroke(s, 5.0, Stroke::new(1.5_f32, Color32::from_rgb(0, 170, 255)));
+        }
     }
 
     fn draw_gradient_overlay(&self, painter: &egui::Painter) {
@@ -6223,6 +6422,49 @@ mod tests {
         app.undo();
         app.undo();
         assert_eq!(app.doc.objects[0].fill.kind, FillKind::Solid);
+    }
+
+    #[test]
+    fn warp_tool_drags_a_grid_point_and_undo_restores() {
+        let mut app = app_with(vec![rect(1, 100.0, 100.0)]);
+        app.tool = Tool::Warp;
+        let none = Modifiers::NONE;
+        click(&mut app, Pt::new(150.0, 150.0), none); // selects the object
+        assert_eq!(app.selected, Some(1));
+        drag(&mut app, Pt::new(200.0, 200.0), Pt::new(240.0, 230.0), none); // bottom-right grid point
+        let mesh = app.doc.objects[0].mesh.clone().expect("warped");
+        let corner = *mesh.pts.last().unwrap();
+        assert!((corner[0] - 1.4).abs() < 1e-3 && (corner[1] - 1.3).abs() < 1e-3, "{corner:?}");
+        assert_eq!(mesh.pts[0], [0.0, 0.0], "other points stay put");
+        assert!(app.renderer.hit(&app.doc.objects[0], Pt::new(225.0, 215.0)), "the bent part is clickable");
+        app.undo();
+        assert!(app.doc.objects[0].mesh.is_none());
+    }
+
+    #[test]
+    fn liquify_pushes_and_pinches_then_undoes() {
+        let mut app = app_with(vec![rect(1, 100.0, 100.0)]);
+        app.tool = Tool::Liquify;
+        app.liquify_size = 80.0;
+        app.liquify_strength = 0.8;
+        let none = Modifiers::NONE;
+        drag(&mut app, Pt::new(150.0, 150.0), Pt::new(180.0, 150.0), none);
+        assert_eq!(app.selected, Some(1));
+        let mesh = app.doc.objects[0].mesh.clone().expect("liquified");
+        assert_eq!((mesh.cols, mesh.rows), (16, 16));
+        let id = Mesh::identity(16, 16);
+        let centre = 8 * 17 + 8;
+        assert!(mesh.pts[centre][0] > id.pts[centre][0] + 0.05, "pushed right: {:?}", mesh.pts[centre]);
+        assert_eq!(mesh.pts[0], id.pts[0], "far corner untouched");
+        app.liquify_mode = LiquifyMode::Shrink;
+        let before = app.doc.objects[0].mesh.clone().unwrap();
+        drag(&mut app, Pt::new(150.0, 150.0), Pt::new(151.0, 150.0), none);
+        let after = app.doc.objects[0].mesh.clone().unwrap();
+        let spread = |m: &Mesh| (m.pts[centre - 2][0] - m.pts[centre + 2][0]).abs();
+        assert!(spread(&after) < spread(&before), "pinch pulls points together");
+        app.undo();
+        app.undo();
+        assert!(app.doc.objects[0].mesh.is_none());
     }
 
     #[test]

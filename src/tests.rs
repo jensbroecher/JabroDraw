@@ -552,6 +552,16 @@ fn svg_keeps_plain_shapes_as_vectors() {
     assert!(svg.contains("fill=\"#c81e1e\""));
     assert_eq!(svg.matches("<image").count(), 1, "beveled ball embedded as a picture");
     assert!(svg.contains("data:image/png;base64,"));
+
+    // a warped box can't be a plain SVG path any more: it goes in as a picture too
+    let mut m = Mesh::identity(1, 1);
+    m.pts[3] = [1.3, 1.2];
+    d.objects[0].mesh = Some(m);
+    export::export(&d, None, &Options { format: Format::Svg, ..Default::default() }, &path).unwrap();
+    let svg = std::fs::read_to_string(&path).unwrap();
+    let _ = std::fs::remove_file(&path);
+    assert_eq!(svg.matches("<path").count(), 0);
+    assert_eq!(svg.matches("<image").count(), 2);
 }
 
 // ------------------------------------------------------------------ per-object looks
@@ -661,4 +671,103 @@ fn colour_adjustments_shift_hue_saturation_and_levels() {
     let dark = red(Adjust { black: 0.5, ..Default::default() });
     // black point 0.5: 0.78 -> (0.78 - 0.5) / 0.5 = 0.57 (145); 0.16 -> 0
     assert!(dark.green() == 0 && (dark.red() as i32 - 145).abs() <= 2, "levels crush the shadows {dark:?}");
+}
+
+#[test]
+fn mesh_warp_bends_the_rendered_object_and_its_hit_area() {
+    let mut doc = Document::new(220, 220);
+    let id = doc.alloc_id();
+    let mut obj = Object::new(id, ShapeKind::Rect { corner: 0.0 }, 50.0, 50.0, 100.0, 100.0);
+    obj.fill.a = [255, 0, 0, 255];
+    let mut mesh = Mesh::identity(1, 1);
+    mesh.pts[3] = [1.4, 1.4]; // pull the bottom-right corner out to (190, 190)
+    obj.mesh = Some(mesh);
+    doc.objects.push(obj);
+    let mut r = Renderer::default();
+    let out = r.render(&doc);
+    let px = |x: u32, y: u32| out.pixel(x, y).unwrap().demultiply();
+    assert!(px(165, 165).red() > 240 && px(165, 165).green() < 20, "stretched corner is filled");
+    assert!(px(145, 60).red() > 240 && px(145, 60).green() < 20, "top edge still in place");
+    assert!(px(40, 40).green() > 240, "outside stays background");
+    assert!(px(185, 70).green() > 240, "right of the slanted edge is background");
+    let o = &doc.objects[0];
+    assert!(r.hit(o, Pt::new(170.0, 170.0)), "hit test follows the warp");
+    assert!(!r.hit(o, Pt::new(185.0, 70.0)));
+}
+
+#[test]
+fn scatter_brush_sprays_every_shape_with_colour_variation() {
+    use crate::brush::{BrushKind, ScatterShape};
+    for shape in ScatterShape::ALL {
+        let mut layer = Pixmap::new(240, 80).unwrap();
+        let b = BrushSettings {
+            kind: BrushKind::Scatter,
+            size: 30.0,
+            flow: 1.0,
+            color: [60, 140, 40, 255],
+            scatter: shape,
+            jitter: 0.8,
+            ..Default::default()
+        };
+        let mut st = StrokeState::new();
+        brush::segment(&mut layer, (20.0, 40.0), (220.0, 40.0), 15.0, &b, &mut st);
+        let mut colours = std::collections::HashSet::new();
+        let mut painted = 0;
+        for p in layer.pixels() {
+            if p.alpha() == 255 {
+                painted += 1;
+                colours.insert((p.red() / 8, p.green() / 8, p.blue() / 8));
+            }
+        }
+        assert!(painted > 400, "{shape:?} sprays something ({painted} px)");
+        assert!(colours.len() >= 4, "{shape:?} varies its colour ({} shades)", colours.len());
+    }
+}
+
+fn watercolor_stroke(pieces: usize) -> Pixmap {
+    use crate::brush::BrushKind;
+    let mut layer = Pixmap::new(220, 100).unwrap();
+    let b = BrushSettings {
+        kind: BrushKind::Watercolor,
+        size: 40.0,
+        flow: 0.8,
+        color: [30, 60, 200, 255],
+        ..Default::default()
+    };
+    let mut st = StrokeState::new();
+    let (a, z) = ((20.0f32, 50.0f32), (200.0f32, 50.0f32));
+    for k in 0..pieces {
+        let f0 = k as f32 / pieces as f32;
+        let f1 = (k + 1) as f32 / pieces as f32;
+        let p0 = (a.0 + (z.0 - a.0) * f0, a.1);
+        let p1 = (a.0 + (z.0 - a.0) * f1, a.1);
+        brush::segment(&mut layer, p0, p1, 20.0, &b, &mut st);
+    }
+    layer
+}
+
+#[test]
+fn watercolor_pools_pigment_at_the_edges() {
+    let layer = watercolor_stroke(10);
+    // average alpha per row over the middle of the stroke
+    let row = |y: u32| (70..150).map(|x| layer.pixel(x, y).unwrap().alpha() as f32).sum::<f32>() / 80.0;
+    let centre = row(50);
+    let rim = (31..=48).map(|y| row(y).max(row(100 - y))).fold(0.0, f32::max);
+    assert!(centre > 30.0, "the wash is visible ({centre})");
+    assert!(rim > centre * 1.3, "the rim is darker than the middle (rim {rim}, centre {centre})");
+    assert!(row(5) < 1.0 && row(95) < 1.0, "nothing outside the stroke");
+}
+
+#[test]
+fn watercolor_incremental_rendering_matches_a_single_pass() {
+    let one = watercolor_stroke(1);
+    let many = watercolor_stroke(12);
+    let worst = one
+        .data()
+        .iter()
+        .zip(many.data())
+        .map(|(a, b)| (*a as i32 - *b as i32).abs())
+        .max()
+        .unwrap();
+    assert!(worst <= 3, "mouse-move by mouse-move painting gives the same result (max diff {worst})");
 }

@@ -168,6 +168,7 @@ pub fn demo_document() -> Document {
             spacing: 0.1,
             color: [250, 250, 245, 255],
             pressure: false,
+            ..Default::default()
         };
         paint_local(&mut sign, &wave(w * 0.12, w * 0.88, h * 0.38, h * 0.1, 2.0, 0.0, 80), &chalk);
         paint_local(&mut sign, &wave(w * 0.12, w * 0.88, h * 0.62, h * 0.08, 3.0, 1.2, 80), &chalk);
@@ -224,6 +225,7 @@ pub fn demo_document() -> Document {
             spacing: 0.1,
             color: [255, 80, 120, 255],
             pressure: false,
+            ..Default::default()
         };
         paint_local(&mut bubble, &wave(-20.0, 220.0, 120.0, 30.0, 1.5, 0.3, 90), &b);
         let b2 = BrushSettings {
@@ -267,6 +269,7 @@ pub fn demo_document() -> Document {
             spacing: 0.08,
             color: [235, 70, 50, 255],
             pressure: false,
+            ..Default::default()
         };
         paint_local(&mut strokes, &wave(560.0, 1140.0, 660.0, 28.0, 1.5, 0.0, 160), &b);
         let b2 = BrushSettings {

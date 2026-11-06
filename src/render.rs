@@ -328,7 +328,10 @@ fn build_layer(local: &Pixmap, pad: f32, obj: &Object, dw: u32, dh: u32) -> Opti
     if fx.glow.enabled {
         margin = margin.max((fx.glow.size * 1.6).ceil() as i32 + 2);
     }
-    let (warped, x, y) = raster::warp(local, pad, &obj.homography(), dw, dh, margin)?;
+    let (warped, x, y) = match obj.mesh.as_ref().filter(|m| !m.is_identity()) {
+        Some(mesh) => raster::warp_mesh(local, pad, &obj.homography(), mesh, obj.size[0], obj.size[1], dw, dh, margin)?,
+        None => raster::warp(local, pad, &obj.homography(), dw, dh, margin)?,
+    };
     if margin > 0 {
         Some((effects::shadow_glow(&warped, fx), x, y))
     } else {
@@ -422,8 +425,10 @@ impl Renderer {
         if e.rev != obj.rev {
             return None;
         }
-        let inv = obj.homography().inverse()?;
-        let l = inv.apply_pt(p)?;
+        // bent objects: points outside the warped grid are simply not on the object
+        let Some(l) = crate::vector::canvas_to_local(obj, p) else {
+            return obj.mesh.as_ref().filter(|m| !m.is_identity()).map(|_| 0.0);
+        };
         let s = raster::sample_bilinear(
             e.local.data(),
             e.local.width() as i32,
@@ -478,6 +483,8 @@ impl Renderer {
     pub fn hit(&self, obj: &Object, p: Pt) -> bool {
         match self.alpha_at(obj, p) {
             Some(a) => a > 0.08,
+            None if obj.mesh.as_ref().is_some_and(|m| !m.is_identity()) => crate::vector::canvas_to_local(obj, p)
+                .is_some_and(|l| (0.0..=obj.size[0]).contains(&l.x) && (0.0..=obj.size[1]).contains(&l.y)),
             None => point_in_poly(p, &obj.quad),
         }
     }

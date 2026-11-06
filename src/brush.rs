@@ -11,6 +11,10 @@ pub enum BrushKind {
     Chalk,
     Smudge,
     Eraser,
+    /// Wet-edged washes that settle into the paper.
+    Watercolor,
+    /// Image hose: sprays leaves, grass, stars, hearts, flowers or dots.
+    Scatter,
     /// Paints the object's transparency mask: hides what is under the brush.
     Hide,
     /// Paints the mask back: reveals hidden parts again.
@@ -20,12 +24,14 @@ pub enum BrushKind {
 }
 
 impl BrushKind {
-    pub const ALL: [BrushKind; 8] = [
+    pub const ALL: [BrushKind; 10] = [
         BrushKind::Round,
         BrushKind::Airbrush,
         BrushKind::Chalk,
         BrushKind::Smudge,
         BrushKind::Eraser,
+        BrushKind::Watercolor,
+        BrushKind::Scatter,
         BrushKind::Hide,
         BrushKind::Reveal,
         BrushKind::MagicWand,
@@ -37,6 +43,8 @@ impl BrushKind {
             BrushKind::Chalk => "Chalk",
             BrushKind::Smudge => "Smudge",
             BrushKind::Eraser => "Eraser (deletes paint)",
+            BrushKind::Watercolor => "Wet watercolor",
+            BrushKind::Scatter => "Scatter (leaves, stars…)",
             BrushKind::Hide => "Transparency: hide",
             BrushKind::Reveal => "Transparency: reveal",
             BrushKind::MagicWand => "Magic wand (click to hide an area)",
@@ -59,6 +67,9 @@ pub struct BrushSettings {
     pub spacing: f32,
     pub color: Rgba,
     pub pressure: bool,
+    /// Scatter brush: what it sprays and how much the colour varies (0..1).
+    pub scatter: ScatterShape,
+    pub jitter: f32,
 }
 
 impl Default for BrushSettings {
@@ -71,13 +82,57 @@ impl Default for BrushSettings {
             spacing: 0.12,
             color: [200, 40, 40, 255],
             pressure: true,
+            scatter: ScatterShape::Leaves,
+            jitter: 0.6,
         }
     }
+}
+
+/// What the scatter brush sprays.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScatterShape {
+    Leaves,
+    Grass,
+    Stars,
+    Hearts,
+    Flowers,
+    Dots,
+}
+
+impl ScatterShape {
+    pub const ALL: [ScatterShape; 6] = [
+        ScatterShape::Leaves,
+        ScatterShape::Grass,
+        ScatterShape::Stars,
+        ScatterShape::Hearts,
+        ScatterShape::Flowers,
+        ScatterShape::Dots,
+    ];
+    pub fn label(self) -> &'static str {
+        match self {
+            ScatterShape::Leaves => "Leaves",
+            ScatterShape::Grass => "Grass",
+            ScatterShape::Stars => "Stars",
+            ScatterShape::Hearts => "Hearts",
+            ScatterShape::Flowers => "Flowers",
+            ScatterShape::Dots => "Confetti dots",
+        }
+    }
+}
+
+/// A watercolor stroke in progress: the layer as it was, plus how wet each pixel is.
+struct Wet {
+    base: Vec<u8>,
+    mask: Vec<f32>,
+    lo: (i32, i32),
+    hi: (i32, i32),
 }
 
 pub struct StrokeState {
     carry: f32,
     last_stamp: Option<(f32, f32)>,
+    seed: u32,
+    wet: Option<Wet>,
 }
 
 impl StrokeState {
@@ -85,7 +140,16 @@ impl StrokeState {
         Self {
             carry: 0.0,
             last_stamp: None,
+            seed: 0x9e37_79b9,
+            wet: None,
         }
+    }
+
+    fn rand(&mut self) -> f32 {
+        self.seed ^= self.seed << 13;
+        self.seed ^= self.seed >> 17;
+        self.seed ^= self.seed << 5;
+        (self.seed >> 8) as f32 / 16_777_216.0
     }
 }
 
@@ -98,18 +162,203 @@ pub fn segment(
     s: &BrushSettings,
     st: &mut StrokeState,
 ) {
-    let spacing = (radius * 2.0 * s.spacing).max(0.5);
+    let spacing_k = match s.kind {
+        BrushKind::Scatter => s.spacing.max(0.45),
+        _ => s.spacing,
+    };
+    let spacing = (radius * 2.0 * spacing_k).max(0.5);
     let (dx, dy) = (b.0 - a.0, b.1 - a.1);
     let dist = (dx * dx + dy * dy).sqrt();
+    let dir = dy.atan2(dx);
     let mut t = if st.last_stamp.is_none() { 0.0 } else { st.carry };
     while t <= dist {
         let f = if dist > 0.0 { t / dist } else { 0.0 };
         let p = (a.0 + dx * f, a.1 + dy * f);
-        stamp(pm, p, radius, s, st.last_stamp);
+        match s.kind {
+            BrushKind::Scatter => scatter_stamp(pm, p, radius, s, st, dir),
+            BrushKind::Watercolor => wet_stamp(pm, p, radius, s, st),
+            _ => stamp(pm, p, radius, s, st.last_stamp),
+        }
         st.last_stamp = Some(p);
         t += spacing;
     }
     st.carry = t - dist;
+    if s.kind == BrushKind::Watercolor {
+        render_wet(pm, s, st, radius);
+    }
+}
+
+fn shape_path(shape: ScatterShape) -> Option<tiny_skia::Path> {
+    use tiny_skia::PathBuilder;
+    let mut pb = PathBuilder::new();
+    match shape {
+        ScatterShape::Leaves => {
+            pb.move_to(-1.0, 0.0);
+            pb.quad_to(0.0, -0.62, 1.0, 0.0);
+            pb.quad_to(0.0, 0.62, -1.0, 0.0);
+            pb.close();
+        }
+        ScatterShape::Grass => {
+            // a blade growing from the stamp point (pointing along +x before rotation)
+            pb.move_to(0.0, -0.13);
+            pb.quad_to(1.2, -0.22, 2.3, 0.08);
+            pb.quad_to(1.1, 0.06, 0.0, 0.13);
+            pb.close();
+        }
+        ScatterShape::Stars => {
+            for i in 0..10 {
+                let a = -std::f32::consts::FRAC_PI_2 + i as f32 * std::f32::consts::PI / 5.0;
+                let r = if i % 2 == 0 { 1.0 } else { 0.45 };
+                if i == 0 {
+                    pb.move_to(r * a.cos(), r * a.sin());
+                } else {
+                    pb.line_to(r * a.cos(), r * a.sin());
+                }
+            }
+            pb.close();
+        }
+        ScatterShape::Hearts => {
+            pb.move_to(0.0, 0.9);
+            pb.cubic_to(-1.2, 0.1, -0.9, -0.9, 0.0, -0.35);
+            pb.cubic_to(0.9, -0.9, 1.2, 0.1, 0.0, 0.9);
+            pb.close();
+        }
+        ScatterShape::Flowers => {
+            for i in 0..5 {
+                let a = i as f32 * std::f32::consts::TAU / 5.0;
+                pb.push_circle(0.55 * a.cos(), 0.55 * a.sin(), 0.42);
+            }
+        }
+        ScatterShape::Dots => pb.push_circle(0.0, 0.0, 0.7),
+    }
+    pb.finish()
+}
+
+/// Image hose: sprays little shapes with random size, angle, offset and colour variation.
+fn scatter_stamp(pm: &mut Pixmap, c: (f32, f32), r: f32, s: &BrushSettings, st: &mut StrokeState, dir: f32) {
+    let scale = r * (0.5 + 0.6 * st.rand());
+    let side = (st.rand() - 0.5) * r * 1.1;
+    let (px, py) = (c.0 - dir.sin() * side, c.1 + dir.cos() * side);
+    let rot = match s.scatter {
+        ScatterShape::Grass => -std::f32::consts::FRAC_PI_2 + (st.rand() - 0.5) * 0.8,
+        ScatterShape::Leaves => dir + (st.rand() - 0.5) * 2.2,
+        _ => st.rand() * std::f32::consts::TAU,
+    };
+    // colour variation around the brush colour
+    let j = s.jitter;
+    let col = s.color.map(|v| v as f32 / 255.0);
+    let (h, sat, l) = crate::effects::rgb_to_hsl(col[0], col[1], col[2]);
+    let hue = h + (st.rand() - 0.5) * 70.0 * j;
+    let light = (l + (st.rand() - 0.5) * 0.35 * j).clamp(0.05, 0.95);
+    let (r_, g_, b_) = crate::effects::hsl_to_rgb(hue, sat, light);
+    let Some(path) = shape_path(s.scatter) else { return };
+    let ts = tiny_skia::Transform::from_translate(px, py)
+        .pre_concat(tiny_skia::Transform::from_rotate(rot.to_degrees()))
+        .pre_scale(scale, scale);
+    let mut paint = tiny_skia::Paint::default();
+    let alpha = (s.flow * col[3]).clamp(0.0, 1.0);
+    paint.set_color(tiny_skia::Color::from_rgba(r_, g_, b_, alpha).unwrap_or(tiny_skia::Color::BLACK));
+    pm.fill_path(&path, &paint, tiny_skia::FillRule::Winding, ts, None);
+    if s.scatter == ScatterShape::Leaves {
+        // a darker midrib
+        let mut pb = tiny_skia::PathBuilder::new();
+        pb.move_to(-0.85, 0.0);
+        pb.line_to(0.85, 0.0);
+        if let Some(rib) = pb.finish() {
+            let (r2, g2, b2) = crate::effects::hsl_to_rgb(hue, sat, (light * 0.6).max(0.02));
+            paint.set_color(tiny_skia::Color::from_rgba(r2, g2, b2, alpha).unwrap_or(tiny_skia::Color::BLACK));
+            let stroke = tiny_skia::Stroke { width: 0.07, ..Default::default() };
+            pm.stroke_path(&rib, &paint, &stroke, ts, None);
+        }
+    }
+}
+
+/// Watercolor: only records how wet the paper is; `render_wet` turns that into pigment.
+fn wet_stamp(pm: &Pixmap, c: (f32, f32), r: f32, s: &BrushSettings, st: &mut StrokeState) {
+    let (w, h) = (pm.width() as i32, pm.height() as i32);
+    let wet = st.wet.get_or_insert_with(|| Wet {
+        base: pm.data().to_vec(),
+        mask: vec![0.0; (w * h) as usize],
+        lo: (i32::MAX, i32::MAX),
+        hi: (i32::MIN, i32::MIN),
+    });
+    let r = r.max(1.0);
+    let (x0, x1) = (((c.0 - r).floor() as i32).max(0), ((c.0 + r).ceil() as i32).min(w - 1));
+    let (y0, y1) = (((c.1 - r).floor() as i32).max(0), ((c.1 + r).ceil() as i32).min(h - 1));
+    for y in y0..=y1 {
+        for x in x0..=x1 {
+            let d = ((x as f32 + 0.5 - c.0).powi(2) + (y as f32 + 0.5 - c.1).powi(2)).sqrt() / r;
+            if d >= 1.0 {
+                continue;
+            }
+            // ragged, irregular wet edge: the reach of the water varies along the stroke
+            let wobble = value_noise(x as f32 * 0.09, y as f32 * 0.09, 41) * 0.6
+                + value_noise(x as f32 * 0.3, y as f32 * 0.3, 43) * 0.4;
+            let edge_at = 1.0 - 0.22 * wobble;
+            let v = (1.0 - smoothstep(0.78 * edge_at, edge_at, d)) * s.flow;
+            let i = (y * w + x) as usize;
+            wet.mask[i] = wet.mask[i].max(v);
+        }
+    }
+    wet.lo = (wet.lo.0.min(x0), wet.lo.1.min(y0));
+    wet.hi = (wet.hi.0.max(x1), wet.hi.1.max(y1));
+}
+
+/// Pigment pools at the edges of the wet area and settles into the paper grain.
+/// Only the part touched since the last call is recomputed, so long strokes stay fast.
+fn render_wet(pm: &mut Pixmap, s: &BrushSettings, st: &mut StrokeState, r: f32) {
+    let Some(wet) = st.wet.as_mut() else { return };
+    if wet.hi.0 < wet.lo.0 {
+        return;
+    }
+    let (w, h) = (pm.width() as i32, pm.height() as i32);
+    let sigma = r * 0.22 + 1.0;
+    let reach = (sigma * 3.0).ceil() as i32 + 1;
+    // pixels whose result can change, and the larger area the blur has to read for them
+    let (ox0, oy0) = ((wet.lo.0 - reach).max(0), (wet.lo.1 - reach).max(0));
+    let (ox1, oy1) = ((wet.hi.0 + reach).min(w - 1), (wet.hi.1 + reach).min(h - 1));
+    let (x0, y0) = ((ox0 - reach).max(0), (oy0 - reach).max(0));
+    let (x1, y1) = ((ox1 + reach).min(w - 1), (oy1 + reach).min(h - 1));
+    wet.lo = (i32::MAX, i32::MAX);
+    wet.hi = (i32::MIN, i32::MIN);
+    let (rw, rh) = ((x1 - x0 + 1) as usize, (y1 - y0 + 1) as usize);
+    let mut region = vec![0f32; rw * rh];
+    for y in 0..rh {
+        let row = (y0 as usize + y) * w as usize + x0 as usize;
+        region[y * rw..(y + 1) * rw].copy_from_slice(&wet.mask[row..row + rw]);
+    }
+    let mut soft = region.clone();
+    crate::raster::gaussian(&mut soft, rw, rh, sigma, false);
+    let col = s.color.map(|v| v as f32 / 255.0);
+    let data = pm.data_mut();
+    for gy in oy0..=oy1 {
+        for gx in ox0..=ox1 {
+            let (x, y) = ((gx - x0) as usize, (gy - y0) as usize);
+            let c = region[y * rw + x];
+            let i = (gy as usize * w as usize + gx as usize) * 4;
+            if c <= 0.0 {
+                data[i..i + 4].copy_from_slice(&wet.base[i..i + 4]);
+                continue;
+            }
+            let edge = (c - soft[y * rw + x]).max(0.0);
+            // pigment granulation: soft blotches plus a little fine tooth
+            let grain = value_noise(gx as f32 * 0.11, gy as f32 * 0.11, 97) * 0.65
+                + value_noise(gx as f32 * 0.45, gy as f32 * 0.45, 98) * 0.35
+                - 0.5;
+            let d = ((0.32 * c + 1.8 * edge) * (1.0 + 0.7 * grain)).clamp(0.0, 0.95) * col[3];
+            let base = &wet.base[i..i + 4];
+            let ba = base[3] as f32 / 255.0;
+            let a = (d * 255.0 + base[3] as f32 * (1.0 - d)).round().min(255.0);
+            for k in 0..3 {
+                // glazing: a wash over earlier paint filters it like pigment does (multiply),
+                // over bare paper it is just its own colour
+                let under = if ba > 0.0 { base[k] as f32 / base[3] as f32 } else { 1.0 };
+                let tint = col[k] * (1.0 - ba + ba * under);
+                data[i + k] = (tint * 255.0 * d + base[k] as f32 * (1.0 - d)).round().min(a) as u8;
+            }
+            data[i + 3] = a as u8;
+        }
+    }
 }
 
 fn falloff(d: f32, hardness: f32, r: f32) -> f32 {
