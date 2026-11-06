@@ -5,7 +5,7 @@ edition = "2021"
 description = "Jabro Draw - a hybrid vector + paint editor with bevels, textures, perspective and NPR looks"
 license = "MIT"
 repository = "https://github.com/jensbroecher/JabroDraw"
-publish = false  # no license chosen yet — all rights reserved until you pick one
+publish = false  # an application, not a crate for crates.io
 
 [dependencies]
 eframe = "0.31"

@@ -18,6 +18,7 @@ const APP_EXE: &[u8] = include_bytes!(env!("JABRO_PAYLOAD_EXE"));
 /// Notices and license texts that must ship with the program, plus the manual.
 const FILES: &[(&str, &[u8])] = &[
     ("README.md", include_bytes!("../../../README.md")),
+    ("LICENSE.txt", include_bytes!("../../../LICENSE")),
     ("THIRD_PARTY_NOTICES.md", include_bytes!("../../../THIRD_PARTY_NOTICES.md")),
     ("licenses/Apache-2.0.txt", include_bytes!("../../../licenses/Apache-2.0.txt")),
     ("licenses/rembg-MIT.txt", include_bytes!("../../../licenses/rembg-MIT.txt")),
