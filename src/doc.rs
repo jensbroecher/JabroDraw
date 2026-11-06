@@ -850,6 +850,13 @@ impl Default for NprSettings {
     }
 }
 
+/// A ruler guide: a vertical line at x = pos, or a horizontal one at y = pos.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Guide {
+    pub vertical: bool,
+    pub pos: f32,
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Document {
     #[serde(default)]
@@ -863,6 +870,8 @@ pub struct Document {
     pub npr: NprSettings,
     #[serde(default)]
     pub next_id: u64,
+    #[serde(default)]
+    pub guides: Vec<Guide>,
 }
 
 impl Document {
@@ -875,6 +884,7 @@ impl Document {
             objects: Vec::new(),
             npr: NprSettings::default(),
             next_id: 1,
+            guides: Vec::new(),
         }
     }
 
@@ -901,6 +911,7 @@ impl Document {
             && self.height == o.height
             && self.background == o.background
             && self.npr == o.npr
+            && self.guides == o.guides
             && self.objects.len() == o.objects.len()
             && self
                 .objects

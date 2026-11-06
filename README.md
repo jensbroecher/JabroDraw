@@ -73,6 +73,11 @@ Styles: `none watercolor oil impressionist pointillism pencil colorpencil comic`
   anchor for which side the canvas grows from. **Fit canvas to content** wraps the canvas around
   everything, and **Grow automatically** (a remembered setting) extends the canvas when you drop an
   object past its edge. The status bar shows the size; click it to change it.
+- **Snapping & layout** (View menu): moving, resizing, drawing and node editing snap to the canvas
+  edges and centre, other objects' edges and centres, guides and an optional grid. Pink lines show
+  the match, and Alt bypasses snapping. **Rulers**: drag from a ruler to make a guide, drop it back
+  to remove it. **Arrange** (properties panel): align left, centre, right, top, middle or bottom (a
+  single object aligns to the canvas), and give 3+ objects equal spacing.
 - **Copy / cut / paste** (Ctrl+C / X / V): objects paste back as editable objects, even into
   another document. Other programs receive a transparent picture of the selection. Pasting a
   screenshot or an image copied elsewhere adds it as a picture, and pasting text creates a text

@@ -136,11 +136,53 @@ pub fn grow_to_fit(w: u32, h: u32, lo: Pt, hi: Pt, margin: f32) -> Option<(u32, 
 }
 
 /// Per-user preferences, remembered between sessions.
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
     /// Extend the canvas when an object is dropped past its edge.
     pub auto_grow: bool,
+    /// Snap to the canvas, other objects and guides while moving / drawing.
+    pub snap: bool,
+    /// Show the grid (and snap to it when snapping is on).
+    pub grid: bool,
+    pub grid_size: f32,
+    pub rulers: bool,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            auto_grow: false,
+            snap: true,
+            grid: false,
+            grid_size: 20.0,
+            rulers: true,
+        }
+    }
+}
+
+/// Snap `v` to the nearest of `targets` within `tol`: (snapped value, target).
+pub fn snap_1d(v: f32, targets: &[f32], tol: f32) -> Option<f32> {
+    targets
+        .iter()
+        .map(|&t| (t, (t - v).abs()))
+        .filter(|(_, d)| *d <= tol)
+        .min_by(|a, b| a.1.total_cmp(&b.1))
+        .map(|(t, _)| t)
+}
+
+/// Best shift (within `tol`) that makes one of `edges` land on one of `targets`.
+pub fn snap_shift(edges: &[f32], targets: &[f32], tol: f32) -> Option<(f32, f32)> {
+    let mut best: Option<(f32, f32)> = None;
+    for &e in edges {
+        if let Some(t) = snap_1d(e, targets, tol) {
+            let shift = t - e;
+            if best.is_none_or(|(s, _)| shift.abs() < s.abs()) {
+                best = Some((shift, t));
+            }
+        }
+    }
+    best
 }
 
 fn settings_path() -> Option<std::path::PathBuf> {

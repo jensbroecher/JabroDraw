@@ -109,6 +109,8 @@ enum Drag {
     LightPos { id: u64, idx: usize },
     LightTarget { id: u64, idx: usize },
     LightDir { id: u64, idx: usize },
+    /// Moving (or creating) ruler guide `idx`.
+    Guide { idx: usize },
     Scale { id: u64, handle: usize, anchor: Pt, h0: Pt, orig: [Pt; 4], angle: f32 },
     Rotate { id: u64, center: Pt, a0: f32, orig: [Pt; 4] },
     Corner { id: u64, idx: usize },
@@ -193,6 +195,16 @@ fn ctrl_v_down() -> bool {
 #[cfg(not(windows))]
 fn ctrl_v_down() -> bool {
     false
+}
+
+#[derive(Clone, Copy)]
+enum AlignTo {
+    Left,
+    CenterH,
+    Right,
+    Top,
+    Middle,
+    Bottom,
 }
 
 /// State of the New document / Canvas size dialog.
@@ -390,6 +402,8 @@ pub struct JabroApp {
     /// Use the system clipboard (off in tests so they never touch it).
     system_clipboard: bool,
     ctrl_v_was_down: bool,
+    /// Snap lines to show while dragging: (vertical?, position).
+    snap_lines: Vec<(bool, f32)>,
 }
 
 impl JabroApp {
@@ -471,6 +485,7 @@ impl JabroApp {
             clip_image_sig: None,
             system_clipboard: false,
             ctrl_v_was_down: false,
+            snap_lines: Vec::new(),
         }
     }
 
@@ -1344,6 +1359,16 @@ impl JabroApp {
     fn on_press(&mut self, p: Pt, sp: Pos2, mods: Modifiers) {
         self.last_drag_pos = Some(p);
         self.snapshot = Some(self.doc.clone());
+        // new shapes and pen nodes start on a snap line too
+        let p = if matches!(self.tool, Tool::Rect | Tool::Ellipse | Tool::Polygon | Tool::Text | Tool::Pen)
+            && self.snapping(mods)
+        {
+            let q = self.snap_point(p, &[]);
+            self.snap_lines.clear();
+            q
+        } else {
+            p
+        };
         match self.tool {
             Tool::Select | Tool::Perspective => self.press_select(p, sp, mods),
             Tool::Node => self.press_node(p, sp),
@@ -1559,6 +1584,12 @@ impl JabroApp {
                 }
             }
         }
+        if self.tool == Tool::Select {
+            if let Some(idx) = self.guide_at(sp) {
+                self.drag = Drag::Guide { idx };
+                return;
+            }
+        }
         match self.hit_test(p) {
             Some(id) => {
                 if mods.shift {
@@ -1763,6 +1794,142 @@ impl JabroApp {
         self.status = format!(
             "Background removed ({removed} pixels hidden). Touch up with the Transparency hide / reveal brushes."
         );
+    }
+
+    // ---------------------------------------------------------------- snapping & arranging
+
+    fn snapping(&self, mods: Modifiers) -> bool {
+        (self.settings.snap || self.settings.grid) && !mods.alt
+    }
+
+    /// Lines things can snap to: canvas edges and centre, guides, other objects' edges and
+    /// centres (objects in `exclude` are the ones being moved).
+    fn snap_targets(&self, exclude: &[u64]) -> (Vec<f32>, Vec<f32>) {
+        let (w, h) = (self.doc.width as f32, self.doc.height as f32);
+        let mut xs = Vec::new();
+        let mut ys = Vec::new();
+        if self.settings.snap {
+            xs.extend([0.0, w * 0.5, w]);
+            ys.extend([0.0, h * 0.5, h]);
+            for g in &self.doc.guides {
+                if g.vertical {
+                    xs.push(g.pos)
+                } else {
+                    ys.push(g.pos)
+                }
+            }
+            for o in self.doc.objects.iter().filter(|o| o.visible && !exclude.contains(&o.id)) {
+                if o.kind == ShapeKind::Bitmap && o.size[0] >= w - 1.0 && o.size[1] >= h - 1.0 {
+                    continue; // full-page paint layers would only snap to the page again
+                }
+                let (lo, hi) = o.bounds();
+                xs.extend([lo.x, (lo.x + hi.x) * 0.5, hi.x]);
+                ys.extend([lo.y, (lo.y + hi.y) * 0.5, hi.y]);
+            }
+        }
+        (xs, ys)
+    }
+
+    fn grid_shift(&self, v: f32, tol: f32) -> Option<f32> {
+        if !self.settings.grid {
+            return None;
+        }
+        let g = self.settings.grid_size.max(1.0);
+        let s = (v / g).round() * g - v;
+        (s.abs() <= tol).then_some(s)
+    }
+
+    /// Shift for a box (lo..hi) so one of its edges or its centre lands on a snap line.
+    fn snap_box(&mut self, lo: Pt, hi: Pt, exclude: &[u64]) -> Pt {
+        let (xs, ys) = self.snap_targets(exclude);
+        let tol = 7.0 / self.zoom;
+        self.snap_lines.clear();
+        let mut adj = Pt::default();
+        match canvas::snap_shift(&[lo.x, (lo.x + hi.x) * 0.5, hi.x], &xs, tol) {
+            Some((s, t)) => {
+                adj.x = s;
+                self.snap_lines.push((true, t));
+            }
+            None => adj.x = self.grid_shift(lo.x, tol).unwrap_or(0.0),
+        }
+        match canvas::snap_shift(&[lo.y, (lo.y + hi.y) * 0.5, hi.y], &ys, tol) {
+            Some((s, t)) => {
+                adj.y = s;
+                self.snap_lines.push((false, t));
+            }
+            None => adj.y = self.grid_shift(lo.y, tol).unwrap_or(0.0),
+        }
+        adj
+    }
+
+    fn snap_point(&mut self, p: Pt, exclude: &[u64]) -> Pt {
+        let adj = self.snap_box(p, p, exclude);
+        p + adj
+    }
+
+    /// Align the selection: to each other, or to the canvas when one object is selected.
+    fn align_selected(&mut self, how: AlignTo) {
+        let ids = self.selection();
+        if ids.is_empty() {
+            return;
+        }
+        let bounds: Vec<(u64, Pt, Pt)> = ids
+            .iter()
+            .filter_map(|id| self.doc.find(*id).map(|o| (*id, o.bounds().0, o.bounds().1)))
+            .collect();
+        let (rlo, rhi) = if bounds.len() == 1 {
+            (Pt::default(), Pt::new(self.doc.width as f32, self.doc.height as f32))
+        } else {
+            bounds.iter().fold((Pt::new(f32::MAX, f32::MAX), Pt::new(f32::MIN, f32::MIN)), |(a, b), (_, lo, hi)| {
+                (Pt::new(a.x.min(lo.x), a.y.min(lo.y)), Pt::new(b.x.max(hi.x), b.y.max(hi.y)))
+            })
+        };
+        self.checkpoint();
+        for (id, lo, hi) in bounds {
+            let d = match how {
+                AlignTo::Left => Pt::new(rlo.x - lo.x, 0.0),
+                AlignTo::CenterH => Pt::new((rlo.x + rhi.x - lo.x - hi.x) * 0.5, 0.0),
+                AlignTo::Right => Pt::new(rhi.x - hi.x, 0.0),
+                AlignTo::Top => Pt::new(0.0, rlo.y - lo.y),
+                AlignTo::Middle => Pt::new(0.0, (rlo.y + rhi.y - lo.y - hi.y) * 0.5),
+                AlignTo::Bottom => Pt::new(0.0, rhi.y - hi.y),
+            };
+            if let Some(o) = self.doc.find_mut(id) {
+                o.quad = o.quad.map(|c| c + d);
+            }
+        }
+        self.dirty = true;
+    }
+
+    /// Equal gaps between three or more selected objects.
+    fn distribute_selected(&mut self, horizontal: bool) {
+        let mut items: Vec<(u64, Pt, Pt)> = self
+            .selection()
+            .iter()
+            .filter_map(|id| self.doc.find(*id).map(|o| (*id, o.bounds().0, o.bounds().1)))
+            .collect();
+        if items.len() < 3 {
+            self.status = "Select three or more objects to distribute them.".into();
+            return;
+        }
+        let key = |lo: Pt, hi: Pt| if horizontal { lo.x + hi.x } else { lo.y + hi.y };
+        items.sort_by(|a, b| key(a.1, a.2).total_cmp(&key(b.1, b.2)));
+        let size = |lo: Pt, hi: Pt| if horizontal { hi.x - lo.x } else { hi.y - lo.y };
+        let start = if horizontal { items[0].1.x } else { items[0].1.y };
+        let end = items.iter().map(|(_, lo, hi)| if horizontal { hi.x.max(lo.x) } else { hi.y.max(lo.y) }).fold(f32::MIN, f32::max);
+        let total: f32 = items.iter().map(|(_, lo, hi)| size(*lo, *hi)).sum();
+        let gap = (end - start - total) / (items.len() - 1) as f32;
+        self.checkpoint();
+        let mut cursor = start;
+        for (id, lo, hi) in items {
+            let from = if horizontal { lo.x } else { lo.y };
+            let d = cursor - from;
+            if let Some(o) = self.doc.find_mut(id) {
+                o.quad = o.quad.map(|c| if horizontal { c + Pt::new(d, 0.0) } else { c + Pt::new(0.0, d) });
+            }
+            cursor += size(lo, hi) + gap;
+        }
+        self.dirty = true;
     }
 
     // ---------------------------------------------------------------- clipboard
@@ -1972,8 +2139,26 @@ impl JabroApp {
             return;
         }
         self.last_drag_pos = Some(p);
+        // drawing / reshaping snaps the pointer itself; moving snaps the whole selection below
+        let snap_pointer = match &self.drag {
+            Drag::Scale { id, .. } | Drag::Corner { id, .. } | Drag::Handle { id, .. } => Some(vec![*id]),
+            Drag::Create { .. } => Some(Vec::new()),
+            _ => None,
+        };
+        self.snap_lines.clear();
+        let p = match snap_pointer {
+            Some(excl) if self.snapping(mods) => self.snap_point(p, &excl),
+            _ => p,
+        };
         let drag = std::mem::replace(&mut self.drag, Drag::None);
         self.drag = match drag {
+            Drag::Guide { idx } => {
+                self.commit_snapshot();
+                if let Some(g) = self.doc.guides.get_mut(idx) {
+                    g.pos = if g.vertical { p.x } else { p.y }.round();
+                }
+                Drag::Guide { idx }
+            }
             Drag::Move { start, items } => {
                 self.commit_snapshot();
                 let mut d = p - start;
@@ -1983,6 +2168,18 @@ impl JabroApp {
                     } else {
                         d.x = 0.0
                     }
+                }
+                if self.snapping(mods) {
+                    let ids: Vec<u64> = items.iter().map(|(i, _)| *i).collect();
+                    let (mut lo, mut hi) = (Pt::new(f32::MAX, f32::MAX), Pt::new(f32::MIN, f32::MIN));
+                    for (_, q) in &items {
+                        for c in q {
+                            lo = Pt::new(lo.x.min(c.x + d.x), lo.y.min(c.y + d.y));
+                            hi = Pt::new(hi.x.max(c.x + d.x), hi.y.max(c.y + d.y));
+                        }
+                    }
+                    let adj = self.snap_box(lo, hi, &ids);
+                    d = d + adj;
                 }
                 for (id, orig) in &items {
                     if let Some(o) = self.doc.find_mut(*id) {
@@ -2068,8 +2265,9 @@ impl JabroApp {
             }
             Drag::Node { id, sp, ni, offset } => {
                 self.commit_snapshot();
+                let target = if self.snapping(mods) { self.snap_point(p + offset, &[id]) } else { p + offset };
                 if let Some(o) = self.doc.find_mut(id) {
-                    if let Some(q) = Self::doc_to_norm(o, p + offset) {
+                    if let Some(q) = Self::doc_to_norm(o, target) {
                         if let ShapeKind::Path { subpaths } = &mut o.kind {
                             if let Some(nd) = subpaths.get_mut(sp).and_then(|s| s.nodes.get_mut(ni)) {
                                 let d = [q[0] - nd.p[0], q[1] - nd.p[1]];
@@ -2262,8 +2460,54 @@ impl JabroApp {
                 self.auto_grow();
             }
         }
+        self.snap_lines.clear();
         self.snapshot = None;
         self.last_drag_pos = None;
+    }
+
+    const RULER: f32 = 20.0;
+
+    fn ruler_rects(&self) -> Option<(Rect, Rect)> {
+        if !self.settings.rulers {
+            return None;
+        }
+        let r = self.canvas_rect;
+        Some((
+            Rect::from_min_max(r.left_top(), Pos2::new(r.right(), r.top() + Self::RULER)),
+            Rect::from_min_max(r.left_top(), Pos2::new(r.left() + Self::RULER, r.bottom())),
+        ))
+    }
+
+    /// Pressing on a ruler pulls out a new guide (top ruler: horizontal, left: vertical).
+    fn press_ruler(&mut self, sp: Pos2) -> bool {
+        let Some((top, left)) = self.ruler_rects() else { return false };
+        let vertical = if left.contains(sp) && !top.contains(sp) {
+            true
+        } else if top.contains(sp) {
+            false
+        } else {
+            return false;
+        };
+        let d = self.to_doc(sp);
+        self.checkpoint();
+        self.doc.guides.push(Guide {
+            vertical,
+            pos: if vertical { d.x } else { d.y }.round(),
+        });
+        self.drag = Drag::Guide { idx: self.doc.guides.len() - 1 };
+        self.status = "Drag the guide onto the canvas; drop it back on the ruler to remove it.".into();
+        true
+    }
+
+    fn guide_at(&self, sp: Pos2) -> Option<usize> {
+        let o = self.origin();
+        self.doc.guides.iter().position(|g| {
+            if g.vertical {
+                (o.x + g.pos * self.zoom - sp.x).abs() < 4.0
+            } else {
+                (o.y + g.pos * self.zoom - sp.y).abs() < 4.0
+            }
+        })
     }
 
     fn finish_create(&mut self, start: Pt, cur: Pt, mods: Modifiers) {
@@ -2727,6 +2971,28 @@ impl JabroApp {
                     ui.close_menu();
                 }
                 ui.checkbox(&mut self.npr_preview, "Show NPR look");
+                ui.separator();
+                let before = self.settings.clone();
+                ui.checkbox(&mut self.settings.snap, "Snap to objects, canvas and guides")
+                    .on_hover_text("Hold Alt while dragging to place freely");
+                ui.checkbox(&mut self.settings.grid, "Grid (show and snap)");
+                if self.settings.grid {
+                    ui.add(egui::Slider::new(&mut self.settings.grid_size, 2.0..=200.0).logarithmic(true).text("Grid size"));
+                }
+                ui.checkbox(&mut self.settings.rulers, "Rulers")
+                    .on_hover_text("Drag from a ruler to make a guide; drop it back to remove it");
+                if ui.add_enabled(!self.doc.guides.is_empty(), egui::Button::new("Remove all guides")).clicked() {
+                    self.checkpoint();
+                    self.doc.guides.clear();
+                    ui.close_menu();
+                }
+                if before.snap != self.settings.snap
+                    || before.grid != self.settings.grid
+                    || before.grid_size != self.settings.grid_size
+                    || before.rulers != self.settings.rulers
+                {
+                    self.settings.save();
+                }
             });
             ui.menu_button("Help", |ui| {
                 if ui.button("About Jabro Draw").clicked() {
@@ -3122,6 +3388,40 @@ impl JabroApp {
         self.objects_panel(ui);
         ui.separator();
         let count = self.selection().len();
+        if count >= 1 {
+            ui.strong(if count == 1 { "Arrange (to the canvas)".to_string() } else { format!("Arrange {count} objects") });
+            let mut align = None;
+            let mut dist = None;
+            ui.horizontal_wrapped(|ui| {
+                for (label, a, tip) in [
+                    ("Left", AlignTo::Left, "Align left edges"),
+                    ("Centre", AlignTo::CenterH, "Centre horizontally"),
+                    ("Right", AlignTo::Right, "Align right edges"),
+                    ("Top", AlignTo::Top, "Align top edges"),
+                    ("Middle", AlignTo::Middle, "Centre vertically"),
+                    ("Bottom", AlignTo::Bottom, "Align bottom edges"),
+                ] {
+                    if ui.small_button(label).on_hover_text(tip).clicked() {
+                        align = Some(a);
+                    }
+                }
+                if count >= 3 {
+                    if ui.small_button("Space ↔").on_hover_text("Equal horizontal gaps").clicked() {
+                        dist = Some(true);
+                    }
+                    if ui.small_button("Space ↕").on_hover_text("Equal vertical gaps").clicked() {
+                        dist = Some(false);
+                    }
+                }
+            });
+            if let Some(a) = align {
+                self.align_selected(a);
+            }
+            if let Some(h) = dist {
+                self.distribute_selected(h);
+            }
+            ui.separator();
+        }
         if count >= 2 {
             ui.strong(format!("Combine {count} objects"));
             let mut op_clicked = None;
@@ -3347,8 +3647,10 @@ impl JabroApp {
         if pressed && resp.hovered() && !space {
             if let Some(p) = latest {
                 self.pressing = true;
-                let d = self.to_doc(p);
-                self.on_press(d, p, mods);
+                if !self.press_ruler(p) {
+                    let d = self.to_doc(p);
+                    self.on_press(d, p, mods);
+                }
             }
         }
         if self.pressing && down && !pressed {
@@ -3358,8 +3660,28 @@ impl JabroApp {
             }
         }
         if self.pressing && (released || !down) {
+            // a guide dropped back on a ruler (or off the canvas area) is removed
+            if let Drag::Guide { idx } = self.drag {
+                let on_ruler = |p: Pos2| self.ruler_rects().is_some_and(|(t, l)| t.contains(p) || l.contains(p));
+                if latest.is_none_or(|p| on_ruler(p) || !rect.contains(p)) && idx < self.doc.guides.len() {
+                    self.commit_snapshot();
+                    self.doc.guides.remove(idx);
+                    self.status = "Guide removed".into();
+                }
+            }
             self.on_release(mods);
             self.pressing = false;
+        }
+        if !self.pressing && self.tool == Tool::Select {
+            if let Some(p) = latest.filter(|p| rect.contains(*p)) {
+                if let Some(i) = self.guide_at(p) {
+                    ctx.set_cursor_icon(if self.doc.guides[i].vertical {
+                        egui::CursorIcon::ResizeHorizontal
+                    } else {
+                        egui::CursorIcon::ResizeVertical
+                    });
+                }
+            }
         }
         let right = ctx.input(|i| i.pointer.button_pressed(egui::PointerButton::Secondary));
         if right && resp.hovered() && self.tool == Tool::Pen {
@@ -3402,7 +3724,9 @@ impl JabroApp {
                 Color32::WHITE,
             );
         }
+        self.draw_grid_and_guides(&painter, doc_rect);
         self.draw_overlays(&painter);
+        self.draw_rulers(&painter, latest);
 
         if self.tool == Tool::Brush {
             if let Some(p) = latest.filter(|p| rect.contains(*p)) {
@@ -3411,6 +3735,121 @@ impl JabroApp {
                 painter.circle_stroke(p, r + 1.0, Stroke::new(1.0_f32, Color32::from_white_alpha(160)));
             }
         }
+    }
+
+    fn draw_grid_and_guides(&self, painter: &egui::Painter, doc_rect: Rect) {
+        let view = self.canvas_rect;
+        if self.settings.grid {
+            let g = self.settings.grid_size.max(1.0);
+            // skip lines so they stay at least 8 px apart on screen
+            let mut step = g;
+            while step * self.zoom < 8.0 {
+                step *= 2.0;
+            }
+            let col = Color32::from_rgba_unmultiplied(0, 0, 0, 28);
+            let r = doc_rect.intersect(view);
+            let mut x = 0.0;
+            while x <= self.doc.width as f32 {
+                let sx = doc_rect.left() + x * self.zoom;
+                if sx >= r.left() && sx <= r.right() {
+                    painter.line_segment([Pos2::new(sx, r.top()), Pos2::new(sx, r.bottom())], Stroke::new(1.0_f32, col));
+                }
+                x += step;
+            }
+            let mut y = 0.0;
+            while y <= self.doc.height as f32 {
+                let sy = doc_rect.top() + y * self.zoom;
+                if sy >= r.top() && sy <= r.bottom() {
+                    painter.line_segment([Pos2::new(r.left(), sy), Pos2::new(r.right(), sy)], Stroke::new(1.0_f32, col));
+                }
+                y += step;
+            }
+        }
+        let o = self.origin();
+        let guide = Stroke::new(1.0_f32, Color32::from_rgb(0, 200, 230));
+        for g in &self.doc.guides {
+            if g.vertical {
+                let x = o.x + g.pos * self.zoom;
+                painter.line_segment([Pos2::new(x, view.top()), Pos2::new(x, view.bottom())], guide);
+            } else {
+                let y = o.y + g.pos * self.zoom;
+                painter.line_segment([Pos2::new(view.left(), y), Pos2::new(view.right(), y)], guide);
+            }
+        }
+        let snap = Stroke::new(1.0_f32, Color32::from_rgb(255, 40, 160));
+        for &(vertical, pos) in &self.snap_lines {
+            if vertical {
+                let x = o.x + pos * self.zoom;
+                painter.line_segment([Pos2::new(x, view.top()), Pos2::new(x, view.bottom())], snap);
+            } else {
+                let y = o.y + pos * self.zoom;
+                painter.line_segment([Pos2::new(view.left(), y), Pos2::new(view.right(), y)], snap);
+            }
+        }
+    }
+
+    fn draw_rulers(&self, painter: &egui::Painter, pointer: Option<Pos2>) {
+        let Some((top, left)) = self.ruler_rects() else { return };
+        let bg = Color32::from_gray(36);
+        let fg = Color32::from_gray(170);
+        painter.rect_filled(top, 0.0, bg);
+        painter.rect_filled(left, 0.0, bg);
+        // major tick distance: a "nice" number of canvas pixels at least ~70 px apart on screen
+        let mut step = 1.0f32;
+        for s in [1.0, 2.0, 5.0, 10.0, 20.0, 25.0, 50.0, 100.0, 200.0, 250.0, 500.0, 1000.0, 2000.0, 5000.0] {
+            step = s;
+            if s * self.zoom >= 70.0 {
+                break;
+            }
+        }
+        let o = self.origin();
+        let font = egui::FontId::proportional(10.0);
+        let tick = Stroke::new(1.0_f32, fg);
+        // top ruler
+        let first = ((top.left() - o.x) / self.zoom / step).floor() as i64;
+        let last = ((top.right() - o.x) / self.zoom / step).ceil() as i64;
+        for i in first..=last {
+            for k in 0..5 {
+                let v = (i as f32 + k as f32 * 0.2) * step;
+                let x = o.x + v * self.zoom;
+                if x < top.left() + Self::RULER || x > top.right() {
+                    continue;
+                }
+                let len = if k == 0 { Self::RULER * 0.6 } else { Self::RULER * 0.25 };
+                painter.line_segment([Pos2::new(x, top.bottom() - len), Pos2::new(x, top.bottom())], tick);
+                if k == 0 {
+                    painter.text(Pos2::new(x + 3.0, top.top() + 1.0), egui::Align2::LEFT_TOP, format!("{}", v as i64), font.clone(), fg);
+                }
+            }
+        }
+        // left ruler
+        let first = ((left.top() - o.y) / self.zoom / step).floor() as i64;
+        let last = ((left.bottom() - o.y) / self.zoom / step).ceil() as i64;
+        for i in first..=last {
+            for k in 0..5 {
+                let v = (i as f32 + k as f32 * 0.2) * step;
+                let y = o.y + v * self.zoom;
+                if y < left.top() + Self::RULER || y > left.bottom() {
+                    continue;
+                }
+                let len = if k == 0 { Self::RULER * 0.6 } else { Self::RULER * 0.25 };
+                painter.line_segment([Pos2::new(left.right() - len, y), Pos2::new(left.right(), y)], tick);
+                if k == 0 {
+                    painter.text(Pos2::new(left.left() + 1.0, y + 2.0), egui::Align2::LEFT_TOP, format!("{}", v as i64), font.clone(), fg);
+                }
+            }
+        }
+        // where the pointer is
+        if let Some(p) = pointer.filter(|p| self.canvas_rect.contains(*p)) {
+            let m = Stroke::new(1.0_f32, Color32::from_rgb(255, 140, 0));
+            painter.line_segment([Pos2::new(p.x, top.top()), Pos2::new(p.x, top.bottom())], m);
+            painter.line_segment([Pos2::new(left.left(), p.y), Pos2::new(left.right(), p.y)], m);
+        }
+        painter.rect_filled(
+            Rect::from_min_size(top.left_top(), Vec2::splat(Self::RULER)),
+            0.0,
+            Color32::from_gray(30),
+        );
     }
 
     fn quad_screen(&self, q: &[Pt; 4]) -> Vec<Pos2> {
@@ -4276,6 +4715,7 @@ mod tests {
         app.canvas_rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(800.0, 600.0));
         app.zoom = 1.0;
         app.pan = Vec2::ZERO;
+        app.settings.snap = false; // scripted drags use exact positions; snapping tests turn it on
         app
     }
 
@@ -4746,6 +5186,64 @@ mod tests {
         app.select_only(Some(1));
         let img = app.selection_image().unwrap();
         assert_eq!(img.pixel(1, 1).unwrap().alpha(), 0, "corners outside the ellipse are transparent");
+    }
+
+    #[test]
+    fn moving_snaps_to_canvas_centre_objects_and_guides() {
+        let mut app = app_with(vec![rect(1, 100.0, 100.0), rect(2, 500.0, 300.0)]);
+        app.settings.snap = true;
+        app.tool = Tool::Select;
+        // centre of rect 1 ends 4 px from the canvas centre (400) -> snaps exactly
+        drag(&mut app, Pt::new(150.0, 150.0), Pt::new(396.0, 150.0), Modifiers::NONE);
+        let (lo, hi) = app.doc.objects[0].bounds();
+        assert!(((lo.x + hi.x) / 2.0 - 400.0).abs() < 1e-3, "{lo:?} {hi:?}");
+        // top edge 3 px above rect 2's top -> snaps to it
+        drag(&mut app, Pt::new(400.0, 150.0), Pt::new(400.0, 347.0), Modifiers::NONE);
+        assert!((app.doc.objects[0].bounds().0.y - 300.0).abs() < 1e-3);
+        // Alt: no snapping
+        drag(&mut app, Pt::new(400.0, 350.0), Pt::new(403.0, 350.0), Modifiers::ALT);
+        assert!(((app.doc.objects[0].bounds().0.x + 50.0) - 403.0).abs() < 1e-3);
+
+        // a guide from the left ruler, then snap to it
+        app.canvas_rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(800.0, 600.0));
+        let ruler_point = Pos2::new(5.0, 300.0);
+        assert!(app.press_ruler(ruler_point));
+        app.on_drag(Pt::new(250.0, 300.0), Modifiers::NONE);
+        app.on_release(Modifiers::NONE);
+        assert_eq!(app.doc.guides, vec![Guide { vertical: true, pos: 250.0 }]);
+        app.select_only(None);
+        app.doc.objects[0].quad = Object::rect_quad(650.0, 480.0, 100.0, 100.0); // out of the way
+        drag(&mut app, Pt::new(520.0, 320.0), Pt::new(274.0, 320.0), Modifiers::NONE); // left edge -> 254
+        assert!((app.doc.objects[1].bounds().0.x - 250.0).abs() < 1e-3, "left edge on the guide");
+    }
+
+    #[test]
+    fn grid_snaps_new_shapes() {
+        let mut app = app_with(vec![]);
+        app.settings.grid = true;
+        app.settings.grid_size = 25.0;
+        app.tool = Tool::Rect;
+        drag(&mut app, Pt::new(103.0, 98.0), Pt::new(198.0, 147.0), Modifiers::NONE);
+        let (lo, hi) = app.doc.objects[0].bounds();
+        assert!(lo.dist(Pt::new(100.0, 100.0)) < 1e-3 && hi.dist(Pt::new(200.0, 150.0)) < 1e-3, "{lo:?} {hi:?}");
+    }
+
+    #[test]
+    fn align_and_distribute() {
+        let mut app = app_with(vec![rect(1, 10.0, 10.0), rect(2, 150.0, 80.0), rect(3, 500.0, 40.0)]);
+        app.select_only(Some(1));
+        app.toggle_in_selection(2);
+        app.toggle_in_selection(3);
+        app.align_selected(AlignTo::Top);
+        assert!(app.doc.objects.iter().all(|o| (o.bounds().0.y - 10.0).abs() < 1e-3));
+        app.distribute_selected(true);
+        let xs: Vec<f32> = app.doc.objects.iter().map(|o| o.bounds().0.x).collect();
+        assert!((xs[1] - 255.0).abs() < 1e-3, "middle one centred between: {xs:?}");
+        app.select_only(Some(1));
+        app.align_selected(AlignTo::Right);
+        assert!((app.doc.objects[0].bounds().1.x - 800.0).abs() < 1e-3, "single object aligns to the canvas");
+        app.undo();
+        assert!((app.doc.objects[0].bounds().0.x - 10.0).abs() < 1e-3);
     }
 
     #[test]
