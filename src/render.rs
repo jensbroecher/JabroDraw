@@ -328,14 +328,25 @@ fn build_layer(local: &Pixmap, pad: f32, obj: &Object, dw: u32, dh: u32) -> Opti
     if fx.glow.enabled {
         margin = margin.max((fx.glow.size * 1.6).ceil() as i32 + 2);
     }
+    let extrude = fx.extrude.enabled && fx.extrude.depth >= 0.5;
+    if extrude {
+        // the sides add to whatever the shadow / glow need, since those surround the 3D body
+        margin += fx.extrude.depth.ceil() as i32 + 3;
+    }
     let (warped, x, y) = match obj.mesh.as_ref().filter(|m| !m.is_identity()) {
         Some(mesh) => raster::warp_mesh(local, pad, &obj.homography(), mesh, obj.size[0], obj.size[1], dw, dh, margin)?,
         None => raster::warp(local, pad, &obj.homography(), dw, dh, margin)?,
     };
-    if margin > 0 {
-        Some((effects::shadow_glow(&warped, fx), x, y))
+    let solid = if extrude {
+        let inset = 2.5 + if fx.bevel.enabled { fx.bevel.width * 0.8 } else { 0.0 };
+        effects::extrude(&warped, &fx.extrude, inset)
     } else {
-        Some((warped, x, y))
+        warped
+    };
+    if fx.shadow.enabled || fx.glow.enabled {
+        Some((effects::shadow_glow(&solid, fx), x, y))
+    } else {
+        Some((solid, x, y))
     }
 }
 

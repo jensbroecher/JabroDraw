@@ -37,6 +37,10 @@ impl Pt {
     pub fn angle(self) -> f32 {
         self.y.atan2(self.x)
     }
+    /// 2D cross product (z of the 3D cross): > 0 when `o` turns clockwise on screen.
+    pub fn cross(self, o: Pt) -> f32 {
+        self.x * o.y - self.y * o.x
+    }
     pub fn dist(self, o: Pt) -> f32 {
         (self - o).len()
     }

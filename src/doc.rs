@@ -87,11 +87,63 @@ pub enum ShapeKind {
     Polygon { sides: u32, inner: f32 },
     /// Closed smooth curve through normalised (0..1) points.
     Freehand { points: Vec<[f32; 2]> },
-    Text { text: String, font: FontChoice },
+    Text {
+        text: String,
+        font: FontChoice,
+        #[serde(default)]
+        layout: TextLayout,
+    },
     /// Pure paint object; its shape is the alpha of its paint layer.
     Bitmap,
     /// Editable Bézier path (pen tool, boolean results, converted shapes).
     Path { subpaths: Vec<SubPath> },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum TextAlign {
+    Left,
+    #[default]
+    Center,
+    Right,
+}
+
+/// How the letters of a text object are laid out.
+#[derive(Clone, Debug, PartialEq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TextLayout {
+    /// Extra space between letters, in em (0 = the font's own spacing).
+    pub spacing: f32,
+    /// Extra space between lines, in em.
+    pub leading: f32,
+    pub align: TextAlign,
+    /// Bend the baseline into an arc: degrees of circle the longest line covers
+    /// (positive = arch up like a rainbow, negative = smile). Ignored on a path.
+    pub arc: f32,
+    /// Letters follow this curve instead of a straight line.
+    pub path: Option<TextPath>,
+}
+
+/// A curve for text to follow. Stored in its own units (canvas pixels at the time it was
+/// attached), which are then fitted to the object box like any other text.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TextPath {
+    pub pts: Vec<[f32; 2]>,
+    pub closed: bool,
+    /// Letter size (em) in the curve's units.
+    pub em: f32,
+    /// Where the text sits along the curve, 0..1 of its length (see `TextLayout::align`).
+    pub start: f32,
+    /// Run the other way round, so the letters sit on the other side of the curve.
+    pub flip: bool,
+    /// Lift the letters off the curve (+) or sink them into it (−), in em.
+    pub offset: f32,
+}
+
+impl Default for TextPath {
+    fn default() -> Self {
+        Self { pts: Vec::new(), closed: false, em: 40.0, start: 0.0, flip: false, offset: 0.0 }
+    }
 }
 
 impl ShapeKind {
@@ -787,6 +839,42 @@ impl Default for Glow {
     }
 }
 
+/// 3D extrusion: the object gets solid, lit sides that recede in one direction.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Extrude {
+    pub enabled: bool,
+    /// How far the sides reach back, in canvas pixels.
+    pub depth: f32,
+    /// Direction the sides go, in degrees counter-clockwise like the bevel light
+    /// (0 = right, 90 = up, 270 = down).
+    pub angle: f32,
+    /// Sides take the colour of the object's edge (works for gradients and pictures too).
+    pub auto_color: bool,
+    pub color: Rgba,
+    /// How much the sides darken towards the back (0..1).
+    pub shade: f32,
+    /// 0 = parallel sides; more makes the back smaller, as if receding to a vanishing point.
+    pub taper: f32,
+    /// Direction the light comes from, in degrees (same convention as `angle`).
+    pub light: f32,
+}
+
+impl Default for Extrude {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            depth: 24.0,
+            angle: 315.0,
+            auto_color: true,
+            color: [90, 90, 110, 255],
+            shade: 0.5,
+            taper: 0.0,
+            light: 60.0,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Effects {
@@ -794,6 +882,7 @@ pub struct Effects {
     pub shadow: Shadow,
     pub glow: Glow,
     pub lighting: Lighting,
+    pub extrude: Extrude,
 }
 
 fn one() -> f32 {
@@ -975,8 +1064,8 @@ impl Object {
 
     /// Keep the text box proportional to the text (adjusts the width, keeps the height).
     pub fn fit_text_width(&mut self) {
-        if let ShapeKind::Text { text, font } = &self.kind {
-            if let Some(aspect) = crate::shapes::text_aspect(text, *font) {
+        if let ShapeKind::Text { text, font, layout } = &self.kind {
+            if let Some(aspect) = crate::shapes::text_aspect(text, *font, layout) {
                 let new_w = (self.size[1] * aspect).max(4.0);
                 let k = new_w / self.size[0].max(1.0);
                 let q = self.quad;
@@ -986,6 +1075,51 @@ impl Object {
                 self.touch();
             }
         }
+    }
+
+    /// Layout bounds of this text (None for other shapes or empty text).
+    pub fn text_bounds(&self) -> Option<crate::shapes::TextBounds> {
+        match &self.kind {
+            ShapeKind::Text { text, font, layout } => crate::shapes::text_bounds(text, *font, layout),
+            _ => None,
+        }
+    }
+
+    /// After the text or its layout changed: resize the box so the letters keep their size
+    /// and stay where they were (`old` = `text_bounds()` before the change). Works under
+    /// perspective too, because the new corners go through the old placement.
+    pub fn relayout_text(&mut self, old: Option<crate::shapes::TextBounds>) {
+        let (Some(o), Some(mut n)) = (old, self.text_bounds()) else {
+            self.fit_text_width();
+            return;
+        };
+        if (n.unit - o.unit).abs() > o.unit * 1e-4 {
+            // switched between font units and curve units: convert, keeping the centre
+            let k = n.unit / o.unit;
+            let cn = [(n.min[0] + n.max[0]) * 0.5, (n.min[1] + n.max[1]) * 0.5];
+            let co = [(o.min[0] + o.max[0]) * 0.5, (o.min[1] + o.max[1]) * 0.5];
+            let conv = |p: [f32; 2]| [co[0] + (p[0] - cn[0]) * k, co[1] + (p[1] - cn[1]) * k];
+            n = crate::shapes::TextBounds { min: conv(n.min), max: conv(n.max), unit: o.unit };
+        }
+        let hm = self.homography();
+        let (ow, oh) = ((o.max[0] - o.min[0]).max(1e-3), (o.max[1] - o.min[1]).max(1e-3));
+        let (sw, sh) = (self.size[0], self.size[1]);
+        let at = |x: f32, y: f32| hm.apply_pt(Pt::new((x - o.min[0]) / ow * sw, (y - o.min[1]) / oh * sh));
+        let corners = [
+            at(n.min[0], n.min[1]),
+            at(n.max[0], n.min[1]),
+            at(n.max[0], n.max[1]),
+            at(n.min[0], n.max[1]),
+        ];
+        if let [Some(a), Some(b), Some(c), Some(d)] = corners {
+            let q = [a, b, c, d];
+            let area = (q[1] - q[0]).cross(q[3] - q[0]);
+            if area.is_finite() && area.abs() > 1.0 {
+                self.quad = q;
+                self.update_size_from_quad();
+            }
+        }
+        self.touch();
     }
 
     /// Does this object look the same as `o` (shape, fill, effects, paint…), ignoring where it

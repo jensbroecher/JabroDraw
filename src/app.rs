@@ -771,6 +771,71 @@ impl JabroApp {
         self.status = format!("{}: {} objects combined into one editable path.", op.label(), used.len());
     }
 
+    /// Lay the selected text along the outline of the other selected object.
+    fn text_on_path(&mut self) {
+        let ids = self.selection();
+        let is_text = |id: &u64| self.doc.find(*id).is_some_and(|o| matches!(o.kind, ShapeKind::Text { .. }));
+        let (Some(&tid), Some(&gid)) = (ids.iter().find(|id| is_text(id)), ids.iter().find(|id| !is_text(id))) else {
+            self.status = "Select one text and one shape or path (Shift+click), then choose Text on path.".into();
+            return;
+        };
+        let Some((mut pts, closed)) = self.doc.find(gid).and_then(vector::guide_polyline) else {
+            self.status = "That object has no outline to follow (paint layers can't guide text).".into();
+            return;
+        };
+        // run left to right over the top: clockwise on screen for closed outlines
+        if closed {
+            let area: f32 = (0..pts.len()).map(|i| pts[i].cross(pts[(i + 1) % pts.len()])).sum();
+            if area < 0.0 {
+                pts.reverse();
+            }
+        } else if pts[pts.len() - 1].x < pts[0].x {
+            pts.reverse();
+        }
+        // centre the text on top of a closed outline, in the middle of an open one
+        let start = if closed {
+            let n = pts.len();
+            let top = (0..n).min_by(|&a, &b| pts[a].y.total_cmp(&pts[b].y)).unwrap_or(0);
+            let total: f32 = (0..n).map(|i| pts[i].dist(pts[(i + 1) % n])).sum();
+            let before: f32 = (0..top).map(|i| pts[i].dist(pts[i + 1])).sum();
+            if total > 0.0 { before / total } else { 0.0 }
+        } else {
+            0.5
+        };
+        self.checkpoint();
+        let Some(o) = self.doc.find_mut(tid) else { return };
+        // keep the current letter size: box height / layout height = pixels per layout unit
+        let em = match o.text_bounds() {
+            Some(b) => o.size[1] / ((b.max[1] - b.min[1]).max(1e-3) * b.unit),
+            None => 40.0,
+        };
+        if let ShapeKind::Text { layout, .. } = &mut o.kind {
+            layout.align = TextAlign::Center;
+            layout.path = Some(TextPath {
+                pts: pts.iter().map(|p| [p.x, p.y]).collect(),
+                closed,
+                em,
+                start,
+                ..Default::default()
+            });
+        }
+        if let Some(b) = o.text_bounds() {
+            // curve units are canvas pixels, so the box is simply where the letters landed
+            o.quad = [
+                Pt::new(b.min[0], b.min[1]),
+                Pt::new(b.max[0], b.min[1]),
+                Pt::new(b.max[0], b.max[1]),
+                Pt::new(b.min[0], b.max[1]),
+            ];
+            o.mesh = None;
+            o.update_size_from_quad();
+        }
+        o.touch();
+        self.select_only(Some(tid));
+        self.dirty = true;
+        self.status = "Text follows the path — position, side and lift are in the properties panel. The shape stays a separate object.".into();
+    }
+
     fn convert_selected_to_path(&mut self) {
         let ids = self.selection();
         let convertible = ids
@@ -1695,11 +1760,11 @@ impl JabroApp {
         }
         self.checkpoint();
         if let Some(o) = self.doc.find_mut(id) {
+            let before = o.text_bounds();
             if let ShapeKind::Text { font, .. } = &mut o.kind {
                 *font = f;
             }
-            o.fit_text_width();
-            o.touch();
+            o.relayout_text(before);
         }
         self.dirty = true;
     }
@@ -2679,13 +2744,13 @@ impl JabroApp {
     fn paste_text(&mut self, text: &str) {
         let text: String = text.chars().take(400).collect();
         let font = self.text_font;
-        let aspect = shapes::text_aspect(&text, font).unwrap_or(3.0);
+        let aspect = shapes::text_aspect(&text, font, &TextLayout::default()).unwrap_or(3.0);
         let h = (60.0 * text.lines().count().max(1) as f32).min(400.0);
         let w = (h * aspect).min(self.doc.width as f32 * 0.9);
         let c = self.view_center();
         self.checkpoint();
         let id = self.doc.alloc_id();
-        let mut o = Object::new(id, ShapeKind::Text { text, font }, c.x - w / 2.0, c.y - h / 2.0, w, h);
+        let mut o = Object::new(id, ShapeKind::Text { text, font, layout: TextLayout::default() }, c.x - w / 2.0, c.y - h / 2.0, w, h);
         o.fill = FillStyle {
             kind: FillKind::Solid,
             a: self.color_a,
@@ -3301,13 +3366,14 @@ impl JabroApp {
             Tool::Text => ShapeKind::Text {
                 text: "Jabro".into(),
                 font: self.text_font,
+                layout: TextLayout::default(),
             },
             _ => return,
         };
         if clicked {
             let (dw, dh) = match self.tool {
                 Tool::Text => {
-                    let asp = shapes::text_aspect("Jabro", self.text_font).unwrap_or(3.0);
+                    let asp = shapes::text_aspect("Jabro", self.text_font, &TextLayout::default()).unwrap_or(3.0);
                     (100.0 * asp, 100.0)
                 }
                 Tool::Polygon => (200.0, 200.0),
@@ -3784,6 +3850,15 @@ impl JabroApp {
                 ui.separator();
                 if ui.add_enabled(n >= 1, egui::Button::new("Convert to path  (Ctrl+Shift+C)")).clicked() {
                     self.convert_selected_to_path();
+                    ui.close_menu();
+                }
+                ui.separator();
+                if ui
+                    .add_enabled(n == 2, egui::Button::new("Text on path"))
+                    .on_hover_text("Select a text and a shape or pen path: the letters follow its outline")
+                    .clicked()
+                {
+                    self.text_on_path();
                     ui.close_menu();
                 }
             });
@@ -5203,6 +5278,7 @@ fn object_props(
     }
 
     let mut refit_text = false;
+    let text_before = obj.text_bounds();
     egui::CollapsingHeader::new("Shape").default_open(true).show(ui, |ui| {
         match &mut obj.kind {
             ShapeKind::Rect { corner } => {
@@ -5218,7 +5294,7 @@ fn object_props(
             ShapeKind::Freehand { .. } => {
                 ui.label("Freehand shape.");
             }
-            ShapeKind::Text { text, font } => {
+            ShapeKind::Text { text, font, layout } => {
                 ui.label("Text");
                 let r = ui.add(
                     egui::TextEdit::multiline(text)
@@ -5244,6 +5320,39 @@ fn object_props(
                         });
                 });
                 if *font != before {
+                    refit_text = true;
+                }
+                let before = layout.clone();
+                ui.add(egui::Slider::new(&mut layout.spacing, -0.2..=1.0).text("Letter spacing"));
+                if layout.path.is_none() && text.contains('\n') {
+                    ui.add(egui::Slider::new(&mut layout.leading, -0.6..=2.0).text("Line spacing"));
+                }
+                ui.horizontal(|ui| {
+                    ui.label("Align");
+                    ui.selectable_value(&mut layout.align, TextAlign::Left, "Left");
+                    ui.selectable_value(&mut layout.align, TextAlign::Center, "Centre");
+                    ui.selectable_value(&mut layout.align, TextAlign::Right, "Right");
+                });
+                let mut off_path = false;
+                match &mut layout.path {
+                    None => {
+                        ui.add(egui::Slider::new(&mut layout.arc, -360.0..=360.0).text("Arc").suffix("°"))
+                            .on_hover_text("Bend the text into an arch (+) or a smile (−)");
+                        ui.small("Text along any shape: select the text and the shape (Shift+click), then Path › Text on path.");
+                    }
+                    Some(tp) => {
+                        ui.label("Follows a path");
+                        ui.add(egui::Slider::new(&mut tp.start, 0.0..=1.0).text("Position on path"));
+                        ui.add(egui::Slider::new(&mut tp.offset, -1.0..=1.0).text("Lift"))
+                            .on_hover_text("Raise the letters off the curve (+) or sink them into it (−)");
+                        ui.checkbox(&mut tp.flip, "Other side of the path");
+                        off_path = ui.button("Take off path").clicked();
+                    }
+                }
+                if off_path {
+                    layout.path = None;
+                }
+                if *layout != before {
                     refit_text = true;
                 }
             }
@@ -5284,7 +5393,7 @@ fn object_props(
         });
     });
     if refit_text {
-        obj.fit_text_width();
+        obj.relayout_text(text_before);
     }
 
     ui.add_space(4.0);
@@ -5624,6 +5733,23 @@ fn object_props(
             ui.small("Mix looks in one picture: a clean logo on a watercolor, a pencil-sketched object on a photo…");
         });
 
+    egui::CollapsingHeader::new("3D extrude").default_open(obj.effects.extrude.enabled).show(ui, |ui| {
+        let e = &mut obj.effects.extrude;
+        ui.checkbox(&mut e.enabled, "Enabled");
+        ui.add(egui::Slider::new(&mut e.depth, 1.0..=300.0).logarithmic(true).text("Depth"));
+        ui.add(egui::Slider::new(&mut e.angle, 0.0..=360.0).text("Direction").suffix("°"))
+            .on_hover_text("Where the sides go: 0° right, 90° up, 270° down");
+        ui.add(egui::Slider::new(&mut e.taper, 0.0..=0.9).text("Perspective"))
+            .on_hover_text("0 = parallel sides; more shrinks the back as if it recedes into the distance");
+        ui.add(egui::Slider::new(&mut e.light, 0.0..=360.0).text("Light from").suffix("°"));
+        ui.add(egui::Slider::new(&mut e.shade, 0.0..=1.0).text("Depth shading"));
+        ui.checkbox(&mut e.auto_color, "Sides in the object's own colours");
+        if !e.auto_color {
+            rgba_label(ui, "Side colour", &mut e.color);
+        }
+        ui.small("Works on shapes, text, pictures and paint, and follows perspective and warps. Add a bevel for rounded front edges.");
+    });
+
     egui::CollapsingHeader::new("Drop shadow").default_open(false).show(ui, |ui| {
         let s = &mut obj.effects.shadow;
         ui.checkbox(&mut s.enabled, "Enabled");
@@ -5936,6 +6062,7 @@ mod tests {
         let kind = ShapeKind::Text {
             text: s.into(),
             font: FontChoice::Sans,
+            layout: TextLayout::default(),
         };
         Object::new(id, kind, 300.0, 100.0, 160.0, 60.0)
     }
@@ -5961,7 +6088,7 @@ mod tests {
         app.select_only(Some(2));
         app.set_font(FontChoice::Impact);
         assert!(matches!(&app.doc.objects[0].kind,
-            ShapeKind::Text { font: FontChoice::Impact, text } if text == "Hello"));
+            ShapeKind::Text { font: FontChoice::Impact, text, .. } if text == "Hello"));
         assert_eq!(app.text_font, FontChoice::Impact, "also the default for new text");
         app.undo();
         assert!(matches!(&app.doc.objects[0].kind, ShapeKind::Text { font: FontChoice::Sans, .. }));
@@ -6465,6 +6592,64 @@ mod tests {
         app.undo();
         app.undo();
         assert!(app.doc.objects[0].mesh.is_none());
+    }
+
+    #[test]
+    fn text_on_path_wraps_text_over_a_circle_and_comes_off_again() {
+        let circle = Object::new(1, ShapeKind::Ellipse, 200.0, 100.0, 200.0, 200.0);
+        let mut text = text_obj(2, "AROUND THE TOP");
+        text.quad = Object::new(2, text.kind.clone(), 300.0, 100.0, 60.0, 20.0).quad;
+        text.update_size_from_quad();
+        text.fill.a = [0, 0, 0, 255];
+        text.fit_text_width();
+        let h0 = text.size[1];
+        let mut app = app_with(vec![circle, text]);
+        app.selected = Some(1);
+        app.multi = vec![2];
+        app.text_on_path();
+        let o = app.doc.find(2).unwrap().clone();
+        let ShapeKind::Text { layout, .. } = &o.kind else { panic!() };
+        let tp = layout.path.as_ref().expect("on the path");
+        assert!(tp.closed);
+        // every letter pixel sits just outside the circle, on its upper half
+        let mut doc = Document::new(800, 600);
+        doc.objects.push(o.clone());
+        let out = Renderer::default().render(&doc);
+        let (mut n, mut sx, mut sy) = (0.0, 0.0, 0.0);
+        for y in 0..600 {
+            for x in 0..800 {
+                if out.pixel(x, y).unwrap().demultiply().green() < 100 {
+                    let d = Pt::new(x as f32 + 0.5, y as f32 + 0.5).dist(Pt::new(300.0, 200.0));
+                    assert!(d > 95.0 && d < 100.0 + h0 * 1.2, "letter pixel at ({x},{y}) is {d} from the centre");
+                    n += 1.0;
+                    sx += x as f32;
+                    sy += y as f32;
+                }
+            }
+        }
+        assert!(n > 200.0);
+        assert!((sx / n - 300.0).abs() < 20.0 && sy / n < 140.0, "centred over the top ({}, {})", sx / n, sy / n);
+        app.undo();
+        assert!(matches!(&app.doc.find(2).unwrap().kind, ShapeKind::Text { layout, .. } if layout.path.is_none()));
+        // taking it off a path keeps the letter size
+        app.text_on_path();
+        let o = app.doc.find_mut(2).unwrap();
+        let before = o.text_bounds();
+        if let ShapeKind::Text { layout, .. } = &mut o.kind {
+            layout.path = None;
+        }
+        o.relayout_text(before);
+        assert!((o.size[1] - h0).abs() < h0 * 0.15, "letters keep their size: {} vs {}", o.size[1], h0);
+    }
+
+    #[test]
+    fn text_on_path_needs_a_text_and_a_shape() {
+        let mut app = app_with(vec![rect(1, 50.0, 50.0), rect(2, 300.0, 50.0)]);
+        app.selected = Some(1);
+        app.multi = vec![2];
+        app.text_on_path();
+        assert!(app.status.contains("Select one text"));
+        assert!(app.undo.is_empty());
     }
 
     #[test]

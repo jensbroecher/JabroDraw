@@ -60,6 +60,16 @@ Styles: `none watercolor oil impressionist pointillism pencil colorpencil comic`
   panel (corner radius, star sides/depth, text + **Font**). **Double-click** an object to reshape it:
   rectangles, ellipses and stars become editable paths in the node tool, and text jumps to its text
   field. With the Text tool active, the left panel's Font list also changes the selected text.
+- **Text layout**: letter spacing, line spacing and left / centre / right alignment, plus an
+  **Arc** slider that bends the text into an arch or a smile. **Text on path** (Path menu): select a
+  text and any shape or pen path, and the letters follow its outline. Position, side and lift are
+  in the properties panel, and **Take off path** straightens it again. The letters keep their size
+  through all of this, and the text stays retypable.
+- **3D extrude** (properties panel): solid sides with depth, direction, perspective (a back that
+  recedes towards a vanishing point), light direction and depth shading. The sides take the
+  object's own colours or a colour you pick. It works on shapes, text, pictures and paint, follows
+  perspective and warps, and the drop shadow falls from the whole 3D body. Add a bevel for rounded
+  front edges.
 - **Pictures**: File › Import picture (Ctrl+I), or drag image files onto the window (PNG, JPEG, WebP,
   BMP, GIF, TIFF, TGA, ICO). A picture is a normal object, so you can bevel, outline, light, paint
   on and perspective-bend it. Its **Remove background** button hides everything around the subject

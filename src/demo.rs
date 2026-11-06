@@ -293,6 +293,7 @@ pub fn demo_document() -> Document {
     let title_kind = ShapeKind::Text {
         text: "Jabro Draw".into(),
         font: FontChoice::Black,
+        layout: TextLayout::default(),
     };
     let mut title = Object::new(id, title_kind, 0.0, 0.0, 600.0, 105.0);
     title.name = "Title".into();

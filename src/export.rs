@@ -307,6 +307,7 @@ fn plain_vector(o: &Object) -> bool {
         && !fx.shadow.enabled
         && !fx.glow.enabled
         && !fx.lighting.active()
+        && !fx.extrude.enabled
         && o.transparency.kind == TransparencyKind::None
         && o.fill.kind != FillKind::Texture
         && (!o.stroke.enabled || o.stroke.position == StrokePos::Center)

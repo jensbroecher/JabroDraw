@@ -2,7 +2,7 @@
 //! point / spot / distant lights, transparency, paint outlines, drop shadow and outer glow.
 
 use crate::doc::{
-    Adjust, Bevel, BevelProfile, Effects, Light, LightKind, Lighting, StrokePos, StrokeStyle, Transparency,
+    Adjust, Bevel, BevelProfile, Effects, Extrude, Light, LightKind, Lighting, StrokePos, StrokeStyle, Transparency,
     TransparencyKind,
 };
 use crate::geom::Pt;
@@ -500,6 +500,166 @@ pub fn alpha_outline(pm: &mut Pixmap, s: &StrokeStyle) {
             }
         }
     }
+}
+
+/// 3D extrusion behind an already warped layer: solid sides recede along `ex.angle`, each
+/// lit by the direction its outline faces and darkening towards the back. Works on any
+/// silhouette (shapes, text, pictures, paint) because it only looks at the layer's pixels.
+/// `inset` = how far inside the edge the side colour is taken from (past a bevel rim).
+pub fn extrude(layer: &Pixmap, ex: &Extrude, inset: f32) -> Pixmap {
+    let (w, h) = (layer.width() as usize, layer.height() as usize);
+    let depth = ex.depth.max(0.0);
+    let alpha = alpha_of(layer);
+    let (mut bx0, mut by0, mut bx1, mut by1) = (usize::MAX, usize::MAX, 0usize, 0usize);
+    let (mut sx, mut sy, mut sa) = (0.0f64, 0.0f64, 0.0f64);
+    for y in 0..h {
+        for x in 0..w {
+            let a = alpha[y * w + x];
+            if a > 0.0 {
+                (bx0, by0, bx1, by1) = (bx0.min(x), by0.min(y), bx1.max(x), by1.max(y));
+                sx += x as f64 * a as f64;
+                sy += y as f64 * a as f64;
+                sa += a as f64;
+            }
+        }
+    }
+    if depth < 0.5 || bx0 > bx1 {
+        return layer.clone();
+    }
+    let centre = ((sx / sa) as f32 + 0.5, (sy / sa) as f32 + 0.5);
+    // outward normal of the silhouette at every pixel (from a softened alpha), and the edge colour
+    let mut soft = alpha.clone();
+    gaussian(&mut soft, w, h, 1.2, false);
+    // the face colours, softened, so anti-aliased edges and bevel rims don't streak the sides
+    let face: Vec<Vec<f32>> = if ex.auto_color {
+        (0..4)
+            .map(|c| {
+                let mut ch: Vec<f32> = layer.data().chunks_exact(4).map(|p| p[c] as f32 / 255.0).collect();
+                gaussian(&mut ch, w, h, 1.5, false);
+                ch
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let at = |x: i64, y: i64| soft[(y.clamp(0, h as i64 - 1) as usize) * w + x.clamp(0, w as i64 - 1) as usize];
+    let mut normal = vec![(0.0f32, 0.0f32); w * h];
+    for y in 0..h as i64 {
+        for x in 0..w as i64 {
+            let gx = at(x + 1, y) - at(x - 1, y);
+            let gy = at(x, y + 1) - at(x, y - 1);
+            let l = (gx * gx + gy * gy).sqrt();
+            if l > 1e-5 {
+                normal[y as usize * w + x as usize] = (-gx / l, -gy / l);
+            }
+        }
+    }
+    let (ad, ld) = (ex.angle.to_radians(), ex.light.to_radians());
+    let dir = (ad.cos(), -ad.sin()); // screen y points down
+    let to_light = (ld.cos(), -ld.sin());
+    let fixed = rgb(ex.color);
+    let steps = (depth / 0.7).ceil().max(1.0) as usize;
+    let step = depth / steps as f32;
+    let taper = ex.taper.clamp(0.0, 0.95);
+    // only the face box swept back along the extrusion can change
+    let ox0 = (bx0 as f32 + dir.0.min(0.0) * depth - 2.0).max(0.0) as usize;
+    let oy0 = (by0 as f32 + dir.1.min(0.0) * depth - 2.0).max(0.0) as usize;
+    let ox1 = ((bx1 as f32 + dir.0.max(0.0) * depth + 2.0) as usize).min(w - 1);
+    let oy1 = ((by1 as f32 + dir.1.max(0.0) * depth + 2.0) as usize).min(h - 1);
+    let sample = |qx: f32, qy: f32| -> f32 {
+        let fx = qx - 0.5;
+        let fy = qy - 0.5;
+        let (x0, y0) = (fx.floor() as i64, fy.floor() as i64);
+        let (tx, ty) = (fx - x0 as f32, fy - y0 as f32);
+        let get = |x: i64, y: i64| {
+            if x < 0 || y < 0 || x >= w as i64 || y >= h as i64 {
+                0.0
+            } else {
+                alpha[y as usize * w + x as usize]
+            }
+        };
+        let top = get(x0, y0) * (1.0 - tx) + get(x0 + 1, y0) * tx;
+        let bottom = get(x0, y0 + 1) * (1.0 - tx) + get(x0 + 1, y0 + 1) * tx;
+        top * (1.0 - ty) + bottom * ty
+    };
+    let side_px = |px: usize, py: usize| -> [f32; 4] {
+        let mut acc = [0.0f32; 4];
+        for k in 1..=steps {
+            let t = k as f32 * step;
+            let s = 1.0 - taper * t / depth;
+            // inverse of: p = c + (q - c) * s + dir * t
+            let qx = centre.0 + (px as f32 + 0.5 - dir.0 * t - centre.0) / s;
+            let qy = centre.1 + (py as f32 + 0.5 - dir.1 * t - centre.1) / s;
+            let a = sample(qx, qy);
+            if a <= 0.003 {
+                continue;
+            }
+            let (nx, ny) = (qx.clamp(0.0, w as f32 - 1.0) as usize, qy.clamp(0.0, h as f32 - 1.0) as usize);
+            let i = ny * w + nx;
+            let n = normal[i];
+            let base = if ex.auto_color {
+                let cx = ((qx - n.0 * inset).clamp(0.0, w as f32 - 1.0)) as usize;
+                let cy = ((qy - n.1 * inset).clamp(0.0, h as f32 - 1.0)) as usize;
+                let j = cy * w + cx;
+                let fa = face[3][j];
+                if fa > 0.02 {
+                    [face[0][j] / fa, face[1][j] / fa, face[2][j] / fa]
+                } else {
+                    fixed
+                }
+            } else {
+                fixed
+            };
+            let facing = 0.5 + 0.5 * (n.0 * to_light.0 + n.1 * to_light.1);
+            let shade = (0.3 + 0.62 * facing) * (1.0 - ex.shade.clamp(0.0, 1.0) * 0.75 * t / depth);
+            let ea = a * (1.0 - acc[3]);
+            for c in 0..3 {
+                acc[c] += (base[c] * shade).min(1.0) * ea;
+            }
+            acc[3] += ea;
+            if acc[3] > 0.996 {
+                break;
+            }
+        }
+        acc
+    };
+    // face over sides
+    let mut pm = layer.clone();
+    let rows: Vec<usize> = (oy0..=oy1).collect();
+    let threads = std::thread::available_parallelism().map_or(4, |n| n.get()).clamp(1, 16);
+    let chunk = rows.len().div_ceil(threads).max(1);
+    let row_len = w * 4;
+    let mut bands: Vec<(usize, &mut [u8])> = pm.data_mut().chunks_mut(row_len).enumerate().collect();
+    let bands = &mut bands[oy0..=oy1];
+    std::thread::scope(|sc| {
+        for part in bands.chunks_mut(chunk) {
+            let side_px = &side_px;
+            sc.spawn(move || {
+                for (y, row) in part.iter_mut() {
+                    for x in ox0..=ox1 {
+                        let fa = row[x * 4 + 3] as f32 / 255.0;
+                        if fa >= 0.999 {
+                            continue;
+                        }
+                        let s = side_px(x, *y);
+                        if s[3] <= 0.0 {
+                            continue;
+                        }
+                        let inv = 1.0 - fa;
+                        for c in 0..3 {
+                            row[x * 4 + c] = (row[x * 4 + c] as f32 + s[c] * 255.0 * inv).round().min(255.0) as u8;
+                        }
+                        let na = (fa + s[3] * inv).min(1.0);
+                        row[x * 4 + 3] = (na * 255.0).round() as u8;
+                        for c in 0..3 {
+                            row[x * 4 + c] = row[x * 4 + c].min(row[x * 4 + 3]);
+                        }
+                    }
+                }
+            });
+        }
+    });
+    pm
 }
 
 /// Composite drop shadow and outer glow underneath an already warped layer.

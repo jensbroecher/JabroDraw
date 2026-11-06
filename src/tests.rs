@@ -771,3 +771,95 @@ fn watercolor_incremental_rendering_matches_a_single_pass() {
         .unwrap();
     assert!(worst <= 3, "mouse-move by mouse-move painting gives the same result (max diff {worst})");
 }
+
+// ------------------------------------------------------------------ text layout & 3D extrude
+
+fn text_object(s: &str) -> Object {
+    let kind = ShapeKind::Text { text: s.into(), font: FontChoice::Sans, layout: TextLayout::default() };
+    let mut o = Object::new(1, kind, 100.0, 100.0, 300.0, 80.0);
+    o.fit_text_width();
+    o
+}
+
+fn set_layout(o: &mut Object, f: impl FnOnce(&mut TextLayout)) {
+    let before = o.text_bounds();
+    if let ShapeKind::Text { layout, .. } = &mut o.kind {
+        f(layout);
+    }
+    o.relayout_text(before);
+}
+
+#[test]
+fn letter_spacing_widens_the_text_and_keeps_letter_size() {
+    let mut o = text_object("Hello");
+    let (w0, h0, left) = (o.size[0], o.size[1], o.quad[0]);
+    set_layout(&mut o, |l| l.spacing = 0.3);
+    assert!(o.size[0] > w0 * 1.25, "wider: {} -> {}", w0, o.size[0]);
+    assert!((o.size[1] - h0).abs() < 0.5, "same letter height");
+    assert!(o.quad[0].dist(left) < 0.5, "stays where it was");
+    set_layout(&mut o, |l| l.spacing = 0.0);
+    assert!((o.size[0] - w0).abs() < 0.5, "and back");
+}
+
+#[test]
+fn arc_bends_the_baseline_and_keeps_letter_size() {
+    let mut o = text_object("ABCDEFGHIJ");
+    let (w0, h0) = (o.size[0], o.size[1]);
+    set_layout(&mut o, |l| l.arc = 180.0);
+    assert!(o.size[1] > h0 * 1.8, "an arch is much taller: {} -> {}", h0, o.size[1]);
+    assert!(o.size[0] < w0, "and narrower");
+    // the middle letters sit at the top of the box, the ends lower down
+    let mut doc = Document::new(800, 600);
+    doc.objects.push(o.clone());
+    let out = Renderer::default().render(&doc);
+    let (lo, hi) = o.bounds();
+    let ink = |x: f32| (lo.y as u32..hi.y as u32).find(|&y| out.pixel(x as u32, y).unwrap().demultiply().red() < 128);
+    let mid = ink((lo.x + hi.x) * 0.5).expect("ink in the middle");
+    let end = ink(lo.x + (hi.x - lo.x) * 0.06).expect("ink at the left end");
+    assert!(end > mid + 40, "ends hang lower (mid {mid}, end {end})");
+    set_layout(&mut o, |l| l.arc = 0.0);
+    assert!((o.size[1] - h0).abs() < 1.0 && (o.size[0] - w0).abs() < 1.0, "straight again");
+}
+
+#[test]
+fn line_spacing_and_alignment() {
+    let mut o = text_object("Wide line\nab");
+    let h0 = o.size[1];
+    set_layout(&mut o, |l| l.leading = 0.5);
+    assert!(o.size[1] > h0 * 1.15, "more space between lines");
+    // left aligned: the short line starts at the left edge of the box
+    set_layout(&mut o, |l| l.align = TextAlign::Left);
+    let mut doc = Document::new(800, 600);
+    doc.objects.push(o.clone());
+    let out = Renderer::default().render(&doc);
+    let (lo, hi) = o.bounds();
+    let row = (lo.y + (hi.y - lo.y) * 0.8) as u32;
+    let first = (lo.x as u32..hi.x as u32).find(|&x| out.pixel(x, row).unwrap().demultiply().red() < 128).unwrap();
+    assert!((first as f32) < lo.x + (hi.x - lo.x) * 0.1, "second line starts at the left");
+}
+
+fn extrude_doc(taper: f32) -> Document {
+    let mut doc = Document::new(240, 240);
+    let id = doc.alloc_id();
+    let mut o = Object::new(id, ShapeKind::Rect { corner: 0.0 }, 60.0, 60.0, 80.0, 80.0);
+    o.fill.a = [220, 40, 40, 255];
+    o.effects.extrude = Extrude { enabled: true, depth: 30.0, angle: 315.0, taper, ..Default::default() };
+    doc.objects.push(o);
+    doc
+}
+
+#[test]
+fn extrude_adds_lit_sides_behind_the_face() {
+    let out = Renderer::default().render(&extrude_doc(0.0));
+    let px = |x: u32, y: u32| out.pixel(x, y).unwrap().demultiply();
+    assert_eq!((px(100, 100).red(), px(100, 100).green()), (220, 40), "the face is untouched");
+    let corner = px(152, 152);
+    assert!(corner.green() < 100 && corner.red() < 220, "sides fill in behind, darker: {corner:?}");
+    assert!(px(50, 50).green() > 240 && px(156, 63).green() > 240, "nothing in front or beside");
+    // light from the upper right: the right-hand side is brighter than the bottom
+    let (right, bottom) = (px(146, 110), px(110, 146));
+    assert!(right.red() > bottom.red() + 30, "right {right:?} vs bottom {bottom:?}");
+    // the extruded body is part of the object's own layer, so shadows include it
+    let tapered = Renderer::default().render(&extrude_doc(0.9));
+    assert!(tapered.pixel(155, 155).unwrap().demultiply().green() > 240, "a vanishing back stays small");
+}

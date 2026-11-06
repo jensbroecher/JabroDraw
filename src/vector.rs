@@ -342,6 +342,46 @@ pub fn outline_doc(obj: &Object) -> Option<Contours> {
     }
 }
 
+/// A shape's outline as one polyline in canvas coordinates, for text to follow, plus whether
+/// it is closed. Pen paths keep their open ends; of several pieces the longest wins.
+pub fn guide_polyline(obj: &Object) -> Option<(Vec<Pt>, bool)> {
+    let (w, h) = (obj.size[0], obj.size[1]);
+    let pieces: Vec<(Path, bool)> = match &obj.kind {
+        ShapeKind::Bitmap | ShapeKind::Text { .. } => return None,
+        ShapeKind::Path { subpaths } => subpaths
+            .iter()
+            .filter_map(|sp| Some((build(std::slice::from_ref(sp), w, h)?, sp.closed)))
+            .collect(),
+        k => vec![(shapes::build_path(k, w, h)?, true)],
+    };
+    let hm = obj.homography();
+    let mesh = obj.mesh.as_ref().filter(|m| !m.is_identity());
+    let to_canvas = |p: Pt| {
+        let p = match mesh {
+            Some(m) => {
+                let q = m.map(p.x / w.max(1e-3), p.y / h.max(1e-3));
+                Pt::new(q[0] * w, q[1] * h)
+            }
+            None => p,
+        };
+        hm.apply_pt(p)
+    };
+    let mut best: Option<(Vec<Pt>, bool, f32)> = None;
+    for (path, closed) in pieces {
+        for c in flatten(&path, 0.25) {
+            let pts: Vec<Pt> = c.into_iter().filter_map(to_canvas).collect();
+            if pts.len() < 2 {
+                continue;
+            }
+            let len: f32 = pts.windows(2).map(|s| s[0].dist(s[1])).sum();
+            if best.as_ref().is_none_or(|b| len > b.2) {
+                best = Some((pts, closed, len));
+            }
+        }
+    }
+    best.map(|(p, c, _)| (p, c))
+}
+
 /// Boolean combination of outlines, bottom-most first.
 pub fn boolean(inputs: &[Contours], op: BoolOp) -> Shapes {
     let Some(first) = inputs.first() else {
