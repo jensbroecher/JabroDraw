@@ -930,3 +930,38 @@ fn timelapse_export_holds_the_last_frame() {
     let (n, d) = frames[2].delay().numer_denom_ms();
     assert!(n / d >= 2000, "the finished picture stays a while");
 }
+
+#[test]
+fn npr_preview_is_close_to_the_full_look() {
+    let mut doc = crate::demo::demo_document();
+    doc.npr.style = NprStyle::Watercolor;
+    doc.npr_stack.clear();
+    let mut r = Renderer::default();
+    let runs = r.render_runs(&doc);
+    let full = crate::npr::compose(&runs, doc.width, doc.height, doc.background, 1.0);
+    let quick = crate::npr::compose_preview(&runs, doc.width, doc.height, doc.background, 0.5);
+    assert_eq!((quick.width(), quick.height()), (full.width(), full.height()));
+    // compare coarse 16 x 16 block averages: the same picture, just less fine detail
+    let block = |pm: &Pixmap, bx: u32, by: u32| {
+        let mut s = [0.0f32; 3];
+        for y in by * 16..by * 16 + 16 {
+            for x in bx * 16..bx * 16 + 16 {
+                let p = pm.pixel(x, y).unwrap();
+                s[0] += p.red() as f32;
+                s[1] += p.green() as f32;
+                s[2] += p.blue() as f32;
+            }
+        }
+        s.map(|v| v / 256.0)
+    };
+    let (mut total, mut n) = (0.0, 0.0);
+    for by in 0..doc.height / 16 {
+        for bx in 0..doc.width / 16 {
+            let (a, b) = (block(&full, bx, by), block(&quick, bx, by));
+            total += (0..3).map(|c| (a[c] - b[c]).abs()).sum::<f32>() / 3.0;
+            n += 1.0;
+        }
+    }
+    let mean = total / n;
+    assert!(mean < 12.0, "preview differs by {mean} per channel on average");
+}

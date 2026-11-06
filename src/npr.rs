@@ -6,7 +6,7 @@ use crate::doc::{NprSettings, NprStyle, Rgba};
 use crate::raster::gaussian;
 use crate::textures::{fbm, rand01, smoothstep, value_noise, Rng};
 use std::sync::mpsc::{channel, Receiver, Sender};
-use tiny_skia::{Color, LineCap, LineJoin, Paint, PathBuilder, Pixmap, Stroke, Transform};
+use tiny_skia::{Color, Pixmap, Transform};
 
 #[derive(Clone)]
 pub struct Img {
@@ -333,6 +333,68 @@ fn oil(img: &Img, s: &NprSettings) -> Img {
     out
 }
 
+/// Fast round-brush stroking for the painterly looks: a polyline with round caps and joins,
+/// anti-aliased, blended once per stroke (overlapping segments don't double up), like a
+/// vector stroke but without building an outline for each of the many thousands of strokes.
+struct Brusher {
+    w: usize,
+    h: usize,
+    cov: Vec<f32>,
+    touched: Vec<u32>,
+}
+
+impl Brusher {
+    fn new(w: usize, h: usize) -> Self {
+        Self { w, h, cov: vec![0.0; w * h], touched: Vec::new() }
+    }
+
+    fn stroke(&mut self, canvas: &mut [u8], pts: &[(f32, f32)], width: f32, col: [f32; 3], alpha: f32) {
+        let hw = width * 0.5;
+        let seg = |i: usize| if pts.len() == 1 { (pts[0], pts[0]) } else { (pts[i], pts[i + 1]) };
+        let n = pts.len().saturating_sub(1).max(1);
+        for i in 0..n {
+            let ((ax, ay), (bx, by)) = seg(i);
+            let x0 = ((ax.min(bx) - hw - 1.0).floor().max(0.0)) as usize;
+            let y0 = ((ay.min(by) - hw - 1.0).floor().max(0.0)) as usize;
+            let x1 = ((ax.max(bx) + hw + 1.0).ceil() as usize).min(self.w);
+            let y1 = ((ay.max(by) + hw + 1.0).ceil() as usize).min(self.h);
+            let (dx, dy) = (bx - ax, by - ay);
+            let len2 = (dx * dx + dy * dy).max(1e-9);
+            for y in y0..y1 {
+                let py = y as f32 + 0.5;
+                for x in x0..x1 {
+                    let px = x as f32 + 0.5;
+                    let t = (((px - ax) * dx + (py - ay) * dy) / len2).clamp(0.0, 1.0);
+                    let (qx, qy) = (ax + dx * t - px, ay + dy * t - py);
+                    let c = (hw + 0.5 - (qx * qx + qy * qy).sqrt()).clamp(0.0, 1.0);
+                    if c > 0.0 {
+                        let i = y * self.w + x;
+                        if self.cov[i] == 0.0 {
+                            self.touched.push(i as u32);
+                        }
+                        if c > self.cov[i] {
+                            self.cov[i] = c;
+                        }
+                    }
+                }
+            }
+        }
+        let src = [col[0] * 255.0, col[1] * 255.0, col[2] * 255.0];
+        for &i in &self.touched {
+            let i = i as usize;
+            let a = self.cov[i] * alpha;
+            self.cov[i] = 0.0;
+            let p = &mut canvas[i * 4..i * 4 + 4];
+            let inv = 1.0 - a;
+            for c in 0..3 {
+                p[c] = (src[c] * a + p[c] as f32 * inv + 0.5).min(255.0) as u8;
+            }
+            p[3] = (255.0 * a + p[3] as f32 * inv + 0.5).min(255.0) as u8;
+        }
+        self.touched.clear();
+    }
+}
+
 fn painterly(src: &Img, s: &NprSettings, dots: bool) -> Img {
     let k = s.px_scale.max(0.1);
     let (w, h) = (src.w, src.h);
@@ -345,6 +407,7 @@ fn painterly(src: &Img, s: &NprSettings, dots: bool) -> Img {
         .collect();
     let mut rng = Rng::new(s.seed as u64 * 7 + 3);
     let max_len = 4 + (s.brush * 12.0) as usize;
+    let mut brusher = Brusher::new(w, h);
     for (li, &r) in radii.iter().enumerate() {
         let reference = src.blurred((r * 0.5).max(0.6));
         let rl = reference.lum();
@@ -431,30 +494,9 @@ fn painterly(src: &Img, s: &NprSettings, dots: bool) -> Img {
             strokes.swap(i, j);
         }
         let width = if dots { r * 1.1 } else { r * 1.7 };
-        let stroke = Stroke {
-            width,
-            line_cap: LineCap::Round,
-            line_join: LineJoin::Round,
-            ..Default::default()
-        };
+        let data = canvas.data_mut();
         for (pts, col) in strokes {
-            let mut pb = PathBuilder::new();
-            pb.move_to(pts[0].0, pts[0].1);
-            if pts.len() == 1 {
-                pb.line_to(pts[0].0 + 0.05, pts[0].1);
-            } else {
-                for p in &pts[1..] {
-                    pb.line_to(p.0, p.1);
-                }
-            }
-            if let Some(path) = pb.finish() {
-                let mut paint = Paint {
-                    anti_alias: true,
-                    ..Default::default()
-                };
-                paint.set_color(Color::from_rgba(col[0], col[1], col[2], 0.93).unwrap_or(Color::BLACK));
-                canvas.stroke_path(&path, &paint, &stroke, Transform::identity(), None);
-            }
+            brusher.stroke(data, &pts, width, col, 0.93);
         }
     }
     let mut out = Img::from_pixmap(&canvas);
@@ -653,11 +695,34 @@ pub struct NprJob {
     pub w: u32,
     pub h: u32,
     pub bg: Rgba,
+    /// 1 = full quality; less = a quick preview painted at that fraction of the size.
+    pub scale: f32,
 }
 
 pub struct NprResult {
     pub gen: u64,
     pub img: Pixmap,
+    pub scale: f32,
+    pub took: std::time::Duration,
+}
+
+fn resample(src: &Pixmap, w: u32, h: u32) -> Pixmap {
+    let mut out = Pixmap::new(w.max(1), h.max(1)).expect("size");
+    let (sx, sy) = (w as f32 / src.width() as f32, h as f32 / src.height() as f32);
+    let paint = tiny_skia::PixmapPaint { quality: tiny_skia::FilterQuality::Bilinear, ..Default::default() };
+    out.draw_pixmap(0, 0, src.as_ref(), &paint, Transform::from_scale(sx, sy), None);
+    out
+}
+
+/// The look painted at a fraction of the size (brushes shrink with it), then enlarged:
+/// close enough to judge it, at a fraction of the time.
+pub fn compose_preview(runs: &[LookRun], w: u32, h: u32, bg: Rgba, scale: f32) -> Pixmap {
+    let (pw, ph) = (((w as f32 * scale).round() as u32).max(4), ((h as f32 * scale).round() as u32).max(4));
+    let small: Vec<LookRun> = runs
+        .iter()
+        .map(|r| LookRun { layer: resample(&r.layer, pw, ph), looks: r.looks.clone(), base: r.base })
+        .collect();
+    resample(&compose(&small, pw, ph, bg, scale), w, h)
 }
 
 /// Background thread that always works on the newest submitted picture.
@@ -675,8 +740,14 @@ impl NprWorker {
                 while let Ok(newer) = jrx.try_recv() {
                     job = newer;
                 }
-                let img = compose(&job.runs, job.w, job.h, job.bg, 1.0);
-                if rtx.send(NprResult { gen: job.gen, img }).is_err() {
+                let t0 = std::time::Instant::now();
+                let img = if job.scale < 0.99 {
+                    compose_preview(&job.runs, job.w, job.h, job.bg, job.scale)
+                } else {
+                    compose(&job.runs, job.w, job.h, job.bg, 1.0)
+                };
+                let res = NprResult { gen: job.gen, img, scale: job.scale, took: t0.elapsed() };
+                if rtx.send(res).is_err() {
                     break;
                 }
                 on_done();

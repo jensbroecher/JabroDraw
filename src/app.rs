@@ -521,7 +521,13 @@ pub struct JabroApp {
     dirty: bool,
     gen: u64,
     npr_preview: bool,
-    npr_pending: bool,
+    /// NPR job to send next (its preview scale), one in flight at a time.
+    npr_want: Option<f32>,
+    npr_inflight: bool,
+    /// The quick preview takes under ~0.1 s: show the look live, even while dragging.
+    npr_fast: bool,
+    /// The canvas currently shows an NPR result (not the plain render).
+    npr_shown: bool,
     // animation
     show_timeline: bool,
     /// Playback clock: (time it started, frame it started from).
@@ -640,7 +646,10 @@ impl JabroApp {
             dirty: true,
             gen: 0,
             npr_preview: true,
-            npr_pending: false,
+            npr_want: None,
+            npr_inflight: false,
+            npr_fast: false,
+            npr_shown: false,
             show_timeline: false,
             playing: None,
             anim_job: None,
@@ -1766,6 +1775,12 @@ impl JabroApp {
         }
     }
 
+    /// Size factor for the quick NPR preview: about half a megapixel, never bigger than 1.
+    fn npr_preview_scale(&self) -> f32 {
+        let px = self.doc.width as f32 * self.doc.height as f32;
+        (450_000.0 / px.max(1.0)).sqrt().min(1.0)
+    }
+
     fn refresh(&mut self, ctx: &egui::Context) {
         let pointer_down = ctx.input(|i| i.pointer.any_down());
         let now = ctx.input(|i| i.time);
@@ -1774,7 +1789,13 @@ impl JabroApp {
             self.sync_instances();
             let pm = self.renderer.render(&self.doc);
             self.gen += 1;
-            self.upload(ctx, &pm);
+            let npr_on = self.npr_preview && self.doc.any_look() && self.playing.is_none();
+            // when the quick preview keeps up, keep showing the look (live, also while dragging)
+            // instead of flashing the plain picture in between
+            if !(npr_on && self.npr_fast && self.npr_shown) {
+                self.upload(ctx, &pm);
+                self.npr_shown = false;
+            }
             // time-lapse: one snapshot per finished change, and a few while a stroke goes on
             if self.playing.is_none()
                 && (self.timelapse_due && !pointer_down || pointer_down && now - self.timelapse_at > 0.7)
@@ -1783,29 +1804,45 @@ impl JabroApp {
             }
             self.raw = Some(pm);
             self.dirty = false;
-            self.npr_pending = self.npr_preview && self.doc.any_look() && self.playing.is_none();
-            if !self.npr_pending {
+            self.npr_want = npr_on.then(|| self.npr_preview_scale());
+            if !npr_on {
                 self.npr_busy = false;
             }
         }
-        if self.npr_pending && !pointer_down {
-            let runs = self.renderer.render_runs(&self.doc);
-            self.worker.submit(NprJob {
-                gen: self.gen,
-                runs,
-                w: self.doc.width,
-                h: self.doc.height,
-                bg: self.doc.background,
-            });
-            self.npr_busy = true;
-            self.npr_pending = false;
+        // first a quick preview, then the full-quality look once the mouse is up
+        if let Some(scale) = self.npr_want {
+            let live = self.npr_fast; // only keep painting mid-drag when it keeps up
+            if !self.npr_inflight && (!pointer_down || live) {
+                let runs = self.renderer.render_runs(&self.doc);
+                self.worker.submit(NprJob {
+                    gen: self.gen,
+                    runs,
+                    w: self.doc.width,
+                    h: self.doc.height,
+                    bg: self.doc.background,
+                    scale,
+                });
+                self.npr_inflight = true;
+                self.npr_busy = true;
+                self.npr_want = None;
+            }
         }
     }
 
     fn poll_npr(&mut self, ctx: &egui::Context) {
         while let Ok(res) = self.worker.rx.try_recv() {
-            if res.gen == self.gen && self.npr_preview && self.doc.any_look() {
-                self.upload(ctx, &res.img);
+            self.npr_inflight = false;
+            if res.gen != self.gen || !self.npr_preview || !self.doc.any_look() {
+                continue; // outdated; a newer request is already waiting
+            }
+            self.upload(ctx, &res.img);
+            self.npr_shown = true;
+            if res.scale < 0.99 || self.npr_preview_scale() >= 0.99 {
+                self.npr_fast = res.took.as_secs_f32() < 0.12;
+            }
+            if res.scale < 0.99 {
+                self.npr_want.get_or_insert(1.0);
+            } else {
                 self.npr_busy = false;
             }
         }
@@ -7145,6 +7182,35 @@ mod tests {
         assert!((app.doc.find(1).unwrap().quad[0].x - 100.0).abs() < 0.5, "back to the only key");
         app.delete_keyframes(true);
         assert!(app.doc.find(1).unwrap().keys.is_empty());
+    }
+
+    #[test]
+    fn npr_shows_a_quick_preview_then_the_full_look() {
+        let mut app = app_with(vec![rect(1, 100.0, 100.0)]);
+        app.doc.width = 1200;
+        app.doc.height = 900;
+        app.doc.npr.style = NprStyle::Watercolor;
+        app.dirty = true;
+        let ctx = egui::Context::default();
+        assert!(app.npr_preview_scale() < 0.7);
+        app.refresh(&ctx);
+        assert!(app.npr_inflight && app.npr_busy && app.npr_want.is_none(), "preview sent at once");
+        let wait = |app: &mut JabroApp, done: &dyn Fn(&JabroApp) -> bool| {
+            let start = std::time::Instant::now();
+            while !done(app) {
+                app.poll_npr(&ctx);
+                assert!(start.elapsed().as_secs() < 60, "NPR never answered");
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        };
+        wait(&mut app, &|a| !a.npr_inflight);
+        assert!(app.npr_shown, "the preview is on screen");
+        assert_eq!(app.npr_want, Some(1.0), "and the full look is asked for next");
+        assert!(app.npr_busy);
+        app.refresh(&ctx);
+        assert!(app.npr_inflight && app.npr_want.is_none());
+        wait(&mut app, &|a| !a.npr_inflight);
+        assert!(!app.npr_busy && app.npr_want.is_none(), "done after the full-quality pass");
     }
 
     #[test]

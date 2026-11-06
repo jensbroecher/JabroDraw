@@ -106,7 +106,8 @@ Styles: `none watercolor oil impressionist pointillism pencil colorpencil comic`
 - **NPR per object and stacked looks**: every object can follow the document's look, stay clean, or
   get its own look (properties › NPR look). The look bar can layer up to three looks, such as
   watercolor washes with comic-ink outlines on top. Strokes spill slightly past an object's edges,
-  like real paint.
+  like real paint. The look shows up as a quick preview first and is then painted at full
+  quality. When the preview keeps up, it stays live while you drag.
 - **Animation** (View › Animation timeline): select objects, press **Add keyframe**, go to another
   frame and move, scale, rotate, perspective-bend or fade them. That frame keys itself. Play it
   back with easing, scrub the keyframe strip, and export an animated GIF or numbered PNG frames for
