@@ -2,7 +2,7 @@
 
 use crate::brush::{self, BrushKind, BrushSettings, StrokeState};
 use crate::doc::*;
-use crate::geom::{simplify, Pt};
+use crate::geom::{simplify, Homography, Pt};
 use crate::npr::{self, NprJob, NprWorker};
 use crate::ai::{self, AiJob, AiModel, AiWorker};
 use crate::canvas::{self, Settings};
@@ -111,6 +111,10 @@ enum Drag {
     LightDir { id: u64, idx: usize },
     /// Moving (or creating) ruler guide `idx`.
     Guide { idx: usize },
+    /// Transforming a multi-selection (or group) through its bounding box.
+    ScaleMulti { handle: usize, anchor: Pt, h0: Pt, items: Vec<(u64, [Pt; 4])> },
+    RotateMulti { center: Pt, a0: f32, items: Vec<(u64, [Pt; 4])> },
+    CornerMulti { idx: usize, rect: [Pt; 4], items: Vec<(u64, [Pt; 4])> },
     Scale { id: u64, handle: usize, anchor: Pt, h0: Pt, orig: [Pt; 4], angle: f32 },
     Rotate { id: u64, center: Pt, a0: f32, orig: [Pt; 4] },
     Corner { id: u64, idx: usize },
@@ -132,6 +136,7 @@ enum PropAction {
     FlipV,
     ResetBrushWork,
     AiRemoveBackground,
+    Detach,
     CopyStyle,
     PasteStyle,
     Front,
@@ -1220,6 +1225,7 @@ impl JabroApp {
 
     fn refresh(&mut self, ctx: &egui::Context) {
         if self.dirty {
+            self.sync_instances();
             let pm = self.renderer.render(&self.doc);
             self.gen += 1;
             self.upload(ctx, &pm);
@@ -1551,7 +1557,41 @@ impl JabroApp {
         };
     }
 
+    /// Corners of the selection's bounding box (TL, TR, BR, BL).
+    fn selection_rect(&self) -> Option<[Pt; 4]> {
+        let (lo, hi) = self.selection_bounds()?;
+        Some([lo, Pt::new(hi.x, lo.y), hi, Pt::new(lo.x, hi.y)])
+    }
+
     fn press_select(&mut self, p: Pt, sp: Pos2, mods: Modifiers) {
+        // several objects (or a group): one box with handles transforms them all
+        if let (false, Some(rect)) = (self.multi.is_empty(), self.selection_rect()) {
+            let items: Vec<(u64, [Pt; 4])> =
+                self.selection().iter().filter_map(|i| self.doc.find(*i).map(|o| (*i, o.quad))).collect();
+            if self.tool == Tool::Perspective {
+                for idx in 0..4 {
+                    if self.to_screen(rect[idx]).distance(sp) < 11.0 {
+                        self.drag = Drag::CornerMulti { idx, rect, items };
+                        return;
+                    }
+                }
+            } else {
+                let rh = self.to_screen(rect[0].lerp(rect[1], 0.5)) + Vec2::new(0.0, -28.0);
+                if rh.distance(sp) < 10.0 {
+                    let c = rect[0].lerp(rect[2], 0.5);
+                    self.drag = Drag::RotateMulti { center: c, a0: (p - c).angle(), items };
+                    return;
+                }
+                for h in 0..8 {
+                    let hp = handle_pos(&rect, h);
+                    if self.to_screen(hp).distance(sp) < 9.0 {
+                        let anchor = handle_pos(&rect, (h + 4) % 8);
+                        self.drag = Drag::ScaleMulti { handle: h, anchor, h0: hp, items };
+                        return;
+                    }
+                }
+            }
+        }
         if let (Some(id), true) = (self.selected, self.multi.is_empty()) {
             if let Some(obj) = self.doc.find(id) {
                 if self.tool == Tool::Perspective {
@@ -1592,10 +1632,17 @@ impl JabroApp {
         }
         match self.hit_test(p) {
             Some(id) => {
-                if mods.shift {
+                if mods.command {
+                    // Ctrl+click: just this object, even inside a group
+                    self.select_only(Some(id));
+                } else if mods.shift {
                     self.toggle_in_selection(id);
+                    if self.is_selected(id) {
+                        self.extend_to_group(id);
+                    }
                 } else if !self.is_selected(id) {
                     self.select_only(Some(id));
+                    self.extend_to_group(id);
                 } else {
                     // clicking a member of the selection makes it the primary one
                     if self.selected != Some(id) {
@@ -1794,6 +1841,152 @@ impl JabroApp {
         self.status = format!(
             "Background removed ({removed} pixels hidden). Touch up with the Transparency hide / reveal brushes."
         );
+    }
+
+    // ---------------------------------------------------------------- groups & clones
+
+    /// Axis-aligned box around the whole selection.
+    fn selection_bounds(&self) -> Option<(Pt, Pt)> {
+        self.selection()
+            .iter()
+            .filter_map(|id| self.doc.find(*id).map(|o| o.bounds()))
+            .reduce(|(a, b), (c, d)| (Pt::new(a.x.min(c.x), a.y.min(c.y)), Pt::new(b.x.max(d.x), b.y.max(d.y))))
+    }
+
+    /// Add all other members of `id`'s group to the selection.
+    fn extend_to_group(&mut self, id: u64) {
+        let Some(g) = self.doc.find(id).and_then(|o| o.group) else { return };
+        let members: Vec<u64> = self.doc.objects.iter().filter(|o| o.group == Some(g)).map(|o| o.id).collect();
+        for m in members {
+            if !self.is_selected(m) {
+                self.multi.push(m);
+            }
+        }
+    }
+
+    fn group_selected(&mut self) {
+        let ids = self.selection();
+        if ids.len() < 2 {
+            self.status = "Select two or more objects to group them.".into();
+            return;
+        }
+        self.checkpoint();
+        let gid = self.doc.alloc_id();
+        // members become neighbours in the stack, where the topmost member was
+        let top = ids.iter().filter_map(|id| self.doc.index_of(*id)).max().unwrap_or(0);
+        let mut members = Vec::new();
+        let mut rest = Vec::new();
+        let mut insert_at = 0;
+        for (i, mut o) in std::mem::take(&mut self.doc.objects).into_iter().enumerate() {
+            if ids.contains(&o.id) {
+                o.group = Some(gid);
+                members.push(o);
+            } else {
+                if i < top {
+                    insert_at += 1;
+                }
+                rest.push(o);
+            }
+        }
+        rest.splice(insert_at..insert_at, members);
+        self.doc.objects = rest;
+        self.dirty = true;
+        self.status = format!("Grouped {} objects — Ctrl+click picks a single member.", ids.len());
+    }
+
+    fn ungroup_selected(&mut self) {
+        let ids = self.selection();
+        if !ids.iter().any(|id| self.doc.find(*id).is_some_and(|o| o.group.is_some())) {
+            self.status = "Nothing grouped in the selection.".into();
+            return;
+        }
+        self.checkpoint();
+        for id in ids {
+            if let Some(o) = self.doc.find_mut(id) {
+                o.group = None;
+            }
+        }
+        self.status = "Ungrouped".into();
+    }
+
+    /// Linked copies: they share their look with the original; editing any one updates all.
+    fn clone_selected(&mut self) {
+        let ids = self.selection();
+        if ids.is_empty() {
+            return;
+        }
+        self.checkpoint();
+        let mut group_map = std::collections::HashMap::new();
+        let mut new_ids = Vec::new();
+        for id in ids {
+            let Some(i) = self.doc.index_of(id) else { continue };
+            let root = self.doc.objects[i].instance_of.unwrap_or(id);
+            self.doc.objects[i].instance_of = Some(root);
+            let new_id = self.doc.alloc_id();
+            let mut c = self.doc.objects[i].clone();
+            c.id = new_id;
+            c.name = format!("{} (clone)", c.name.trim_end_matches(" (clone)"));
+            c.quad = c.quad.map(|p| p + Pt::new(20.0, 20.0));
+            c.group = c.group.map(|g| *group_map.entry(g).or_insert_with(|| self.doc.alloc_id()));
+            c.touch();
+            self.doc.objects.push(c);
+            new_ids.push(new_id);
+        }
+        let primary = new_ids.pop();
+        self.select_only(primary);
+        self.multi = new_ids;
+        self.dirty = true;
+        self.status = "Linked clone made — change any copy and all of them follow.".into();
+    }
+
+    fn detach_selected(&mut self) {
+        let ids = self.selection();
+        if !ids.iter().any(|id| self.doc.find(*id).is_some_and(|o| o.instance_of.is_some())) {
+            return;
+        }
+        self.checkpoint();
+        for id in &ids {
+            if let Some(o) = self.doc.find_mut(*id) {
+                o.instance_of = None;
+            }
+        }
+        self.tidy_instances();
+        self.status = "Detached — this copy is independent now.".into();
+    }
+
+    /// A clone set with a single member left is just a normal object again.
+    fn tidy_instances(&mut self) {
+        let mut count = std::collections::HashMap::new();
+        for o in &self.doc.objects {
+            if let Some(r) = o.instance_of {
+                *count.entry(r).or_insert(0) += 1;
+            }
+        }
+        for o in &mut self.doc.objects {
+            if o.instance_of.is_some_and(|r| count[&r] < 2) {
+                o.instance_of = None;
+            }
+        }
+    }
+
+    /// Whichever linked clone was edited last passes its look on to the others.
+    fn sync_instances(&mut self) {
+        let mut sets: std::collections::HashMap<u64, Vec<usize>> = std::collections::HashMap::new();
+        for (i, o) in self.doc.objects.iter().enumerate() {
+            if let Some(r) = o.instance_of {
+                sets.entry(r).or_default().push(i);
+            }
+        }
+        for idxs in sets.values().filter(|v| v.len() > 1) {
+            let newest = *idxs.iter().max_by_key(|&&i| self.doc.objects[i].rev).expect("set");
+            let src = self.doc.objects[newest].clone();
+            for &i in idxs {
+                if i != newest && !self.doc.objects[i].same_look(&src) {
+                    self.doc.objects[i].copy_look(&src);
+                    self.doc.objects[i].touch();
+                }
+            }
+        }
     }
 
     // ---------------------------------------------------------------- snapping & arranging
@@ -2002,11 +2195,14 @@ impl JabroApp {
         self.paste_count += 1;
         let off = Pt::new(20.0, 20.0) * self.paste_count as f32;
         let mut new_ids = Vec::new();
+        let mut group_map = std::collections::HashMap::new();
         for src in self.clipboard.clone() {
             let id = self.doc.alloc_id();
             let mut o = src;
             o.id = id;
             o.quad = o.quad.map(|c| c + off);
+            o.instance_of = None;
+            o.group = o.group.map(|g| *group_map.entry(g).or_insert_with(|| self.doc.alloc_id()));
             o.touch();
             self.doc.objects.push(o);
             new_ids.push(id);
@@ -2143,6 +2339,7 @@ impl JabroApp {
         let snap_pointer = match &self.drag {
             Drag::Scale { id, .. } | Drag::Corner { id, .. } | Drag::Handle { id, .. } => Some(vec![*id]),
             Drag::Create { .. } => Some(Vec::new()),
+            Drag::ScaleMulti { items, .. } | Drag::CornerMulti { items, .. } => Some(items.iter().map(|(i, _)| *i).collect()),
             _ => None,
         };
         self.snap_lines.clear();
@@ -2158,6 +2355,59 @@ impl JabroApp {
                     g.pos = if g.vertical { p.x } else { p.y }.round();
                 }
                 Drag::Guide { idx }
+            }
+            Drag::ScaleMulti { handle, anchor, h0, items } => {
+                self.commit_snapshot();
+                let affects_x = handle != 1 && handle != 5;
+                let affects_y = handle != 3 && handle != 7;
+                let (hl, ml) = (h0 - anchor, p - anchor);
+                let mut sx = if affects_x && hl.x.abs() > 1e-3 { ml.x / hl.x } else { 1.0 };
+                let mut sy = if affects_y && hl.y.abs() > 1e-3 { ml.y / hl.y } else { 1.0 };
+                if mods.shift && affects_x && affects_y {
+                    let s = if sx.abs() > sy.abs() { sx } else { sy };
+                    sx = s;
+                    sy = s;
+                }
+                let fix = |s: f32| if s.abs() < 0.01 { 0.01f32.copysign(s) } else { s };
+                let (sx, sy) = (fix(sx), fix(sy));
+                for (id, q) in &items {
+                    if let Some(o) = self.doc.find_mut(*id) {
+                        o.quad = q.map(|c| anchor + Pt::new((c - anchor).x * sx, (c - anchor).y * sy));
+                        o.update_size_from_quad();
+                    }
+                }
+                self.dirty = true;
+                Drag::ScaleMulti { handle, anchor, h0, items }
+            }
+            Drag::RotateMulti { center, a0, items } => {
+                self.commit_snapshot();
+                let mut da = (p - center).angle() - a0;
+                if mods.shift {
+                    let step = 15f32.to_radians();
+                    da = (da / step).round() * step;
+                }
+                for (id, q) in &items {
+                    if let Some(o) = self.doc.find_mut(*id) {
+                        o.quad = q.map(|c| center + (c - center).rotate(da));
+                    }
+                }
+                self.dirty = true;
+                Drag::RotateMulti { center, a0, items }
+            }
+            Drag::CornerMulti { idx, rect, items } => {
+                self.commit_snapshot();
+                // one perspective for all: map the old box onto the new quad (exact for every member)
+                let mut target = rect;
+                target[idx] = p;
+                let (lo, hi) = (rect[0], rect[2]);
+                let hm = Homography::from_quad(&target, (hi.x - lo.x).max(1e-3), (hi.y - lo.y).max(1e-3));
+                for (id, q) in &items {
+                    if let Some(o) = self.doc.find_mut(*id) {
+                        o.quad = q.map(|c| hm.apply_pt(c - lo).unwrap_or(c));
+                    }
+                }
+                self.dirty = true;
+                Drag::CornerMulti { idx, rect, items }
             }
             Drag::Move { start, items } => {
                 self.commit_snapshot();
@@ -2444,6 +2694,7 @@ impl JabroApp {
                         if !self.is_selected(id) {
                             self.toggle_in_selection(id);
                         }
+                        self.extend_to_group(id);
                     }
                     let n = self.selection().len();
                     self.status = format!("{n} object(s) selected");
@@ -2621,6 +2872,7 @@ impl JabroApp {
         self.checkpoint();
         let primary = self.selected;
         let mut new_primary = None;
+        let mut group_map = std::collections::HashMap::new();
         let mut new_ids = Vec::new();
         for old in ids {
             let Some(i) = self.doc.index_of(old) else { continue };
@@ -2628,6 +2880,8 @@ impl JabroApp {
             let mut o = self.doc.objects[i].clone();
             o.id = id;
             o.name = format!("{} copy", o.name);
+            o.instance_of = None;
+            o.group = o.group.map(|g| *group_map.entry(g).or_insert_with(|| self.doc.alloc_id()));
             o.quad = o.quad.map(|p| p + Pt::new(20.0, 20.0));
             o.touch();
             self.doc.objects.insert(i + 1, o);
@@ -2743,8 +2997,17 @@ impl JabroApp {
         if cmd(Key::Z) {
             self.undo();
         }
+        if ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND | Modifiers::SHIFT, Key::D)) {
+            self.clone_selected();
+        }
         if cmd(Key::D) {
             self.duplicate_selected();
+        }
+        if ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND | Modifiers::SHIFT, Key::G)) {
+            self.ungroup_selected();
+        }
+        if cmd(Key::G) {
+            self.group_selected();
         }
         if ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND | Modifiers::SHIFT, Key::C)) {
             self.convert_selected_to_path();
@@ -2896,6 +3159,28 @@ impl JabroApp {
                 }
             });
             ui.menu_button("Object", |ui| {
+                let n = self.selection().len();
+                if ui.add_enabled(n >= 2, egui::Button::new("Group  (Ctrl+G)")).clicked() {
+                    self.group_selected();
+                    ui.close_menu();
+                }
+                if ui.add_enabled(n >= 1, egui::Button::new("Ungroup  (Ctrl+Shift+G)")).clicked() {
+                    self.ungroup_selected();
+                    ui.close_menu();
+                }
+                if ui
+                    .add_enabled(n >= 1, egui::Button::new("Linked clone  (Ctrl+Shift+D)"))
+                    .on_hover_text("A copy that stays linked: change one and all copies follow")
+                    .clicked()
+                {
+                    self.clone_selected();
+                    ui.close_menu();
+                }
+                if ui.add_enabled(n >= 1, egui::Button::new("Detach clone")).clicked() {
+                    self.detach_selected();
+                    ui.close_menu();
+                }
+                ui.separator();
                 if ui.button("Bring to front").clicked() {
                     self.move_selected(isize::MAX / 2);
                     ui.close_menu();
@@ -3281,6 +3566,12 @@ impl JabroApp {
                         if r.drag_started() {
                             action = Some(A::DragStart(obj.id));
                         }
+                        if obj.group.is_some() {
+                            ui.weak("group").on_hover_text("Part of a group (Ctrl+Shift+G ungroups)");
+                        }
+                        if obj.instance_of.is_some() {
+                            ui.weak("clone").on_hover_text("Linked clone: edits apply to all its copies");
+                        }
                         if r.hovered() || r.dragged() {
                             ui.ctx().set_cursor_icon(if r.dragged() {
                                 egui::CursorIcon::Grabbing
@@ -3525,6 +3816,12 @@ impl JabroApp {
                         reset_brush_work(o);
                         self.status = "Brush work reset — back to the original.".into();
                     }
+                }
+                PropAction::Detach => {
+                    if let Some(o) = selected.and_then(|id| self.doc.find_mut(id)) {
+                        o.instance_of = None;
+                    }
+                    self.tidy_instances();
                 }
                 PropAction::AiRemoveBackground => {
                     if let Some(id) = selected {
@@ -3877,6 +4174,37 @@ impl JabroApp {
                 painter.add(Shape::closed_line(self.quad_screen(&o.quad), Stroke::new(1.5_f32, sel_col)));
             }
         }
+        // the shared box of a multi-selection / group
+        if let (false, Some(rect)) = (self.multi.is_empty(), self.selection_rect()) {
+            let pts = self.quad_screen(&rect);
+            let faint = Stroke::new(1.0_f32, Color32::from_rgba_unmultiplied(0, 170, 255, 160));
+            painter.add(Shape::closed_line(pts.clone(), faint));
+            match self.tool {
+                Tool::Perspective => {
+                    for p in &pts {
+                        painter.circle_filled(*p, 6.5, Color32::from_rgb(255, 150, 30));
+                        painter.circle_stroke(*p, 6.5, Stroke::new(1.0_f32, Color32::BLACK));
+                    }
+                }
+                Tool::Select => {
+                    let top = self.to_screen(rect[0].lerp(rect[1], 0.5));
+                    let rh = top + Vec2::new(0.0, -28.0);
+                    painter.line_segment([top, rh], faint);
+                    painter.circle_filled(rh, 5.5, Color32::WHITE);
+                    painter.circle_stroke(rh, 5.5, Stroke::new(1.0_f32, sel_col));
+                    for h in 0..8 {
+                        let c = self.to_screen(handle_pos(&rect, h));
+                        let r = Rect::from_center_size(c, Vec2::splat(8.0));
+                        painter.rect_filled(r, 0.0, Color32::WHITE);
+                        painter.add(Shape::closed_line(
+                            vec![r.left_top(), r.right_top(), r.right_bottom(), r.left_bottom()],
+                            Stroke::new(1.0_f32, sel_col),
+                        ));
+                    }
+                }
+                _ => {}
+            }
+        }
         if self.tool == Tool::Node {
             self.draw_node_overlay(painter);
         }
@@ -4188,6 +4516,14 @@ fn object_props(
         ui.text_edit_singleline(&mut obj.name);
     });
     ui.add(egui::Slider::new(&mut obj.opacity, 0.0..=1.0).text("Opacity"));
+    if obj.instance_of.is_some() {
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Linked clone — changes here update every copy.");
+            if ui.small_button("Detach").clicked() {
+                actions.push(PropAction::Detach);
+            }
+        });
+    }
 
     let mut refit_text = false;
     egui::CollapsingHeader::new("Shape").default_open(true).show(ui, |ui| {
@@ -5244,6 +5580,82 @@ mod tests {
         assert!((app.doc.objects[0].bounds().1.x - 800.0).abs() < 1e-3, "single object aligns to the canvas");
         app.undo();
         assert!((app.doc.objects[0].bounds().0.x - 10.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn groups_select_move_and_transform_together() {
+        let mut app = app_with(vec![rect(1, 100.0, 100.0), rect(2, 300.0, 100.0), rect(3, 600.0, 400.0)]);
+        app.tool = Tool::Select;
+        app.select_only(Some(1));
+        app.toggle_in_selection(2);
+        app.group_selected();
+        let g = app.doc.objects[0].group;
+        assert!(g.is_some() && app.doc.objects[1].group == g && app.doc.objects[2].group.is_none());
+
+        click(&mut app, Pt::new(650.0, 450.0), Modifiers::NONE); // select something else first
+        click(&mut app, Pt::new(150.0, 150.0), Modifiers::NONE); // one member -> whole group
+        assert_eq!(app.selection().len(), 2);
+        click(&mut app, Pt::new(350.0, 150.0), Modifiers::COMMAND); // Ctrl: just that member
+        assert_eq!(app.selection(), vec![2]);
+
+        click(&mut app, Pt::new(150.0, 150.0), Modifiers::NONE);
+        drag(&mut app, Pt::new(150.0, 150.0), Pt::new(170.0, 190.0), Modifiers::NONE);
+        assert!(app.doc.objects[1].quad[0].dist(Pt::new(320.0, 140.0)) < 1e-3, "moved together");
+
+        // group box: drag its bottom-right handle to double the size (anchor = top-left)
+        let (lo, hi) = app.selection_bounds().unwrap();
+        drag(&mut app, hi, lo + (hi - lo) * 2.0, Modifiers::NONE);
+        let o2 = &app.doc.objects[1];
+        assert!(o2.quad[0].dist(Pt::new(120.0 + 200.0 * 2.0, 140.0)) < 0.5, "{:?}", o2.quad[0]);
+        assert!((o2.size[0] - 200.0).abs() < 0.5, "re-rasterised at the new size");
+
+        app.ungroup_selected();
+        assert!(app.doc.objects.iter().all(|o| o.group.is_none()));
+    }
+
+    #[test]
+    fn group_perspective_maps_every_member() {
+        let mut app = app_with(vec![rect(1, 100.0, 100.0), rect(2, 200.0, 100.0)]);
+        app.tool = Tool::Perspective;
+        app.select_only(Some(1));
+        app.toggle_in_selection(2);
+        // pull the box's top-right corner (300, 100) up to (300, 50)
+        drag(&mut app, Pt::new(300.0, 100.0), Pt::new(300.0, 50.0), Modifiers::NONE);
+        let o2 = &app.doc.objects[1];
+        assert!(o2.quad[1].dist(Pt::new(300.0, 50.0)) < 1e-3, "corner follows exactly");
+        let bl = o2.quad[3];
+        assert!((bl.y - 200.0).abs() < 1e-3 && bl.x > 100.0 && bl.x < 300.0, "stays on the bottom edge: {bl:?}");
+        let o1 = &app.doc.objects[0];
+        assert!(o1.quad[0].dist(Pt::new(100.0, 100.0)) < 1e-3, "pinned corner stays");
+    }
+
+    #[test]
+    fn linked_clones_share_their_look() {
+        let mut app = app_with(vec![rect(1, 100.0, 100.0)]);
+        app.select_only(Some(1));
+        app.clone_selected();
+        let clone_id = app.selected.unwrap();
+        assert_eq!(app.doc.objects.len(), 2);
+        assert!(app.doc.objects.iter().all(|o| o.instance_of == Some(1)));
+        // edit the clone: the original follows
+        if let Some(c) = app.doc.find_mut(clone_id) {
+            c.fill.a = [10, 200, 30, 255];
+            c.effects.bevel.enabled = true;
+            c.touch();
+        }
+        app.sync_instances();
+        let orig = app.doc.find(1).unwrap();
+        assert_eq!(orig.fill.a, [10, 200, 30, 255]);
+        assert!(orig.effects.bevel.enabled);
+        assert!(orig.quad[0].dist(Pt::new(100.0, 100.0)) < 1e-3, "placement stays its own");
+        // detach: independent again (and the last one left stops being a clone too)
+        app.select_only(Some(clone_id));
+        app.detach_selected();
+        assert!(app.doc.objects.iter().all(|o| o.instance_of.is_none()));
+        // duplicates are never linked
+        app.select_only(Some(1));
+        app.duplicate_selected();
+        assert!(app.doc.objects.iter().all(|o| o.instance_of.is_none()));
     }
 
     #[test]

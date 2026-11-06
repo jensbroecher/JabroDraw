@@ -78,6 +78,12 @@ Styles: `none watercolor oil impressionist pointillism pencil colorpencil comic`
   the match, and Alt bypasses snapping. **Rulers**: drag from a ruler to make a guide, drop it back
   to remove it. **Arrange** (properties panel): align left, centre, right, top, middle or bottom (a
   single object aligns to the canvas), and give 3+ objects equal spacing.
+- **Groups** (Ctrl+G / Ctrl+Shift+G): click any member to select the whole group, Ctrl+click
+  for a single member. A group or multi-selection gets one box to scale and rotate. With the
+  Perspective tool you can bend them all at once.
+- **Linked clones** (Ctrl+Shift+D): copies that share their look. Edit any one (fill, bevel,
+  paint, nodes…) and all copies follow, each keeping its own position and size. Detach makes one
+  independent again.
 - **Copy / cut / paste** (Ctrl+C / X / V): objects paste back as editable objects, even into
   another document. Other programs receive a transparent picture of the selection. Pasting a
   screenshot or an image copied elsewhere adds it as a picture, and pasting text creates a text

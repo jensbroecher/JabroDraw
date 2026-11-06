@@ -625,6 +625,12 @@ pub struct Object {
     /// Save-file shortcut: the paint layer is still the untouched original (stored once).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub paint_is_original: bool,
+    /// Objects with the same group id are selected and transformed together.
+    #[serde(default)]
+    pub group: Option<u64>,
+    /// Linked clones share an instance id: editing one updates all of them.
+    #[serde(default)]
+    pub instance_of: Option<u64>,
     #[serde(skip)]
     pub rev: u64,
 }
@@ -649,6 +655,8 @@ impl Object {
             mask: None,
             original: None,
             paint_is_original: false,
+            group: None,
+            instance_of: None,
             rev: next_rev(),
         }
     }
@@ -752,6 +760,38 @@ impl Object {
         }
     }
 
+    /// Does this object look the same as `o` (shape, fill, effects, paint…), ignoring where it
+    /// is placed? Linked clones keep exactly this part in sync.
+    pub fn same_look(&self, o: &Object) -> bool {
+        let same = |a: &Option<Arc<Pixmap>>, b: &Option<Arc<Pixmap>>| match (a, b) {
+            (None, None) => true,
+            (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+            _ => false,
+        };
+        self.kind == o.kind
+            && self.fill == o.fill
+            && self.stroke == o.stroke
+            && self.effects == o.effects
+            && self.transparency == o.transparency
+            && self.original == o.original
+            && self.opacity == o.opacity
+            && same(&self.paint, &o.paint)
+            && same(&self.mask, &o.mask)
+    }
+
+    /// Take over the look of `src` (keeps placement, name, group and identity).
+    pub fn copy_look(&mut self, src: &Object) {
+        self.kind = src.kind.clone();
+        self.fill = src.fill.clone();
+        self.stroke = src.stroke.clone();
+        self.effects = src.effects.clone();
+        self.transparency = src.transparency.clone();
+        self.original = src.original.clone();
+        self.opacity = src.opacity;
+        self.paint = src.paint.clone();
+        self.mask = src.mask.clone();
+    }
+
     /// Compare everything the user can edit (ignores the cache revision).
     pub fn same_content(&self, o: &Object) -> bool {
         let same = |a: &Option<Arc<Pixmap>>, b: &Option<Arc<Pixmap>>| match (a, b) {
@@ -770,6 +810,8 @@ impl Object {
             && self.effects == o.effects
             && self.transparency == o.transparency
             && self.original == o.original
+            && self.group == o.group
+            && self.instance_of == o.instance_of
             && self.opacity == o.opacity
             && self.visible == o.visible
             && paint_same
