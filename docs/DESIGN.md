@@ -8,7 +8,7 @@ vector/bitmap editors of the 2000s. Archived pages could not be fetched, so item
 
 | Area | Classic hybrid editors |
 |---|---|
-| Object model | **"VectorBit"**: every object is vector-editable (shape, order, resize, envelope) but carries bitmap-based properties. You could paint with brushes directly on vector objects; strokes were masked by the shape, and strokes could themselves become objects with effects. Groups were called **Packages** (nestable, effects on the whole package, clones). There was no classic layer panel. |
+| Object model | Every object is vector-editable (shape, order, resize, envelope) but carries bitmap-based properties. You could paint with brushes directly on vector objects; strokes were masked by the shape, and strokes could themselves become objects with effects. Groups were called **Packages** (nestable, effects on the whole package, clones). There was no classic layer panel. |
 | Effects | Non-destructive per-object properties: colour, texture, outline, lights, material, transparency (incl. texture transparency), 3D bevel & extrude, drop shadow, glow, motion blur, sparkle, lens flare, bump mapping, per-object colour correction. Multiple point / spot / distant lights per object + material (metallic). Texture library + GenetX procedural textures, "area gradients". |
 | Transform | Perspective transformation, envelope editing, "Liquid shape" brushes (move/grow/shrink/rotate), anti-aliased rotation, texture rotation/perspective. Mesh warp *(unconfirmed)*. |
 | NPR | "Non-Photo-Realistic" styles that change the *drawing tool* the picture is rendered with: chalk, paintbrush, pencil, watercolor, engraving, oils, ink, crayon, sketch. A global style by default, overridable **per object / per package**, adjustable strength + fine-tune dialog, non-destructive, quick style library. It worked on the VectorBit data rather than being a flat post-filter. |
@@ -89,7 +89,7 @@ pen pressure (if the tablet driver reports it through Windows touch/pen events);
     the outline turns gently, with corners where it turns sharply.
   - Still to do: true curve fitting for boolean results; booleans that keep paint layers; a
     continue-path pen mode; join/break nodes; stroke-to-path.
-- **Packages** (groups) that take effects and NPR as a unit, plus clones/instances.
+- **Groups** that take effects and NPR as a unit, plus clones/instances.
 - **Per-object NPR override** (the classics' best trick): each object chooses "inherit / none / style X".
 - Envelope + mesh warp in addition to the 4-corner perspective.
 - Multi-stop gradient editor, transparency gradients, blend modes, inner shadow / inner glow,
