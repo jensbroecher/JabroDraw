@@ -77,7 +77,8 @@ computer, and there is no account, telemetry or update check.
 
 Jabro Draw runs on 64-bit Windows (it is developed and tested on Windows 11).
 
-1. Download `Jabro-Draw-<version>-Setup.exe` from the [Releases](../../releases) page.
+1. Download `Jabro-Draw-<version>-Setup.exe` from the
+   [Releases](https://github.com/jensbroecher/JabroDraw/releases) page.
 2. Run it. Windows may say "Windows protected your PC" because the installer is not signed with a
    paid certificate: click **More info → Run anyway**.
 3. It installs for your user only, without admin rights, and adds Start menu and desktop
