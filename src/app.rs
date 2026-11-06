@@ -3,12 +3,12 @@
 use crate::brush::{self, BrushKind, BrushSettings, StrokeState};
 use crate::doc::*;
 use crate::geom::{simplify, Homography, Pt};
-use crate::npr::{self, NprJob, NprWorker};
+use crate::npr::{NprJob, NprWorker};
 use crate::ai::{self, AiJob, AiModel, AiWorker};
 use crate::canvas::{self, Settings};
 use crate::render::Renderer;
 use crate::vector::{self, BoolOp};
-use crate::{demo, imageops, io, shapes, styles};
+use crate::{demo, export, imageops, io, shapes, styles};
 use eframe::egui::{self, Color32, Modifiers, Pos2, Rect, Sense, Shape, Stroke, Vec2};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -409,6 +409,9 @@ pub struct JabroApp {
     ctrl_v_was_down: bool,
     /// Snap lines to show while dragging: (vertical?, position).
     snap_lines: Vec<(bool, f32)>,
+    export_dialog: Option<export::Options>,
+    /// Last used export settings.
+    export_opts: export::Options,
 }
 
 impl JabroApp {
@@ -491,6 +494,8 @@ impl JabroApp {
             system_clipboard: false,
             ctrl_v_was_down: false,
             snap_lines: Vec::new(),
+            export_dialog: None,
+            export_opts: export::Options::default(),
         }
     }
 
@@ -1160,19 +1165,85 @@ impl JabroApp {
         }
     }
 
-    fn export_png(&mut self) {
-        let Some(path) = rfd::FileDialog::new()
-            .add_filter("PNG image", &["png"])
-            .set_file_name("jabro.png")
-            .save_file()
-        else {
-            return;
-        };
-        let raw = self.renderer.render(&self.doc);
-        let out = npr::apply(&raw, &self.doc.npr);
-        match io::export_png(&out, &path) {
-            Ok(()) => self.status = format!("Exported {}", path.display()),
-            Err(e) => self.status = format!("Export failed: {e}"),
+    fn open_export_dialog(&mut self) {
+        let mut o = self.export_opts.clone();
+        o.selection_only = o.selection_only && self.selected.is_some();
+        self.export_dialog = Some(o);
+    }
+
+    fn export_dialog_ui(&mut self, ctx: &egui::Context) {
+        let Some(mut o) = self.export_dialog.take() else { return };
+        let mut open = true;
+        let mut go = false;
+        let mut cancel = false;
+        let has_sel = self.selected.is_some();
+        let has_look = self.doc.npr.style != NprStyle::None;
+        egui::Window::new("Export")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label("Format");
+                    egui::ComboBox::from_id_salt("export_format")
+                        .selected_text(o.format.label())
+                        .width(260.0)
+                        .show_ui(ui, |ui| {
+                            for f in export::Format::ALL {
+                                ui.selectable_value(&mut o.format, f, f.label());
+                            }
+                        });
+                });
+                ui.horizontal(|ui| {
+                    ui.label(if o.format == export::Format::Svg { "Display size" } else { "Resolution" });
+                    for s in [1.0f32, 2.0, 3.0, 4.0, 8.0] {
+                        ui.radio_value(&mut o.scale, s, format!("{}×", s as u32));
+                    }
+                });
+                let (bw, bh) = match (o.selection_only && has_sel).then(|| self.selection_bounds()).flatten() {
+                    Some((lo, hi)) => (hi.x - lo.x, hi.y - lo.y),
+                    None => (self.doc.width as f32, self.doc.height as f32),
+                };
+                ui.weak(format!("{} × {} px", (bw * o.scale).round(), (bh * o.scale).round()));
+                ui.add_enabled(
+                    o.format != export::Format::Jpeg,
+                    egui::Checkbox::new(&mut o.transparent, "Transparent background"),
+                );
+                ui.add_enabled(has_sel, egui::Checkbox::new(&mut o.selection_only, "Only the selected objects"));
+                if o.format.raster() && has_look {
+                    ui.checkbox(&mut o.npr, format!("Apply the NPR look ({})", self.doc.npr.style.label()));
+                }
+                if o.format == export::Format::Jpeg {
+                    ui.add(egui::Slider::new(&mut o.quality, 40..=100).text("Quality"));
+                }
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    if ui.button("  Export…  ").clicked() {
+                        go = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        cancel = true;
+                    }
+                });
+            });
+        if go {
+            self.export_opts = o.clone();
+            let ext = o.format.ext();
+            let name = format!("{}.{ext}", self.doc_name());
+            if let Some(path) = rfd::FileDialog::new()
+                .add_filter(o.format.label(), &[ext])
+                .set_file_name(&name)
+                .save_file()
+            {
+                let ids = (o.selection_only && has_sel).then(|| self.selection());
+                match export::export(&self.doc, ids.as_deref(), &o, &path) {
+                    Ok(()) => self.status = format!("Exported {}", path.display()),
+                    Err(e) => self.status = format!("Export failed: {e}"),
+                }
+            }
+        } else if open && !cancel {
+            self.export_dialog = Some(o);
         }
     }
 
@@ -2952,7 +3023,7 @@ impl JabroApp {
             self.open();
         }
         if cmd(Key::E) {
-            self.export_png();
+            self.open_export_dialog();
         }
         if cmd(Key::I) {
             self.import_image_dialog();
@@ -3104,9 +3175,9 @@ impl JabroApp {
                     ui.close_menu();
                     self.import_image_dialog();
                 }
-                if ui.button("Export PNG…  (Ctrl+E)").clicked() {
+                if ui.button("Export…  (Ctrl+E)").clicked() {
                     ui.close_menu();
-                    self.export_png();
+                    self.open_export_dialog();
                 }
                 ui.separator();
                 if ui.button("Load demo scene").clicked() {
@@ -4996,6 +5067,7 @@ impl eframe::App for JabroApp {
         self.handle_dropped_files(ctx);
         self.poll_ai();
         self.canvas_dialog_ui(ctx);
+        self.export_dialog_ui(ctx);
         self.update_title(ctx);
         self.shortcuts(ctx);
         self.read_pressure(ctx);

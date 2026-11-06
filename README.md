@@ -78,6 +78,14 @@ Styles: `none watercolor oil impressionist pointillism pencil colorpencil comic`
   the match, and Alt bypasses snapping. **Rulers**: drag from a ruler to make a guide, drop it back
   to remove it. **Arrange** (properties panel): align left, centre, right, top, middle or bottom (a
   single object aligns to the canvas), and give 3+ objects equal spacing.
+- **Export** (File › Export…, Ctrl+E):
+  - **Formats:** PNG, JPEG (with quality), WebP, SVG, or a layered PSD with one named layer per
+    object.
+  - **Resolution:** 1–8×, staying crisp because objects, text and effects are re-rendered (NPR
+    brushes scale too).
+  - **Options:** transparent background, selection only, and whether to include the NPR look.
+  - **SVG:** plain shapes and text stay real vectors; objects with effects SVG can't express are
+    embedded as pictures.
 - **Groups** (Ctrl+G / Ctrl+Shift+G): click any member to select the whole group, Ctrl+click
   for a single member. A group or multi-selection gets one box to scale and rotate. With the
   Perspective tool you can bend them all at once.

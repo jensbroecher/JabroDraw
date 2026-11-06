@@ -419,6 +419,12 @@ impl Renderer {
         Some(s[3] / 255.0)
     }
 
+    /// One object's finished layer (with shadow and glow) and its top-left position.
+    pub fn object_layer(&mut self, obj: &Object, dw: u32, dh: u32) -> Option<(Pixmap, i32, i32)> {
+        self.ensure(obj, dw, dh);
+        self.cache.get(&obj.id).and_then(|e| e.layer.clone())
+    }
+
     pub fn hit(&self, obj: &Object, p: Pt) -> bool {
         match self.alpha_at(obj, p) {
             Some(a) => a > 0.08,

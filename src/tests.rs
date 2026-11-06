@@ -469,3 +469,87 @@ fn pictures_and_masks_survive_save_and_load() {
     assert_eq!(mask_at(b.mask.as_ref().unwrap(), 2, 2), 0);
     assert_eq!(b.fill.image.as_ref().unwrap().0.width(), 120);
 }
+
+// ------------------------------------------------------------------ export
+
+use crate::export::{self, Format, Options};
+
+fn export_doc() -> Document {
+    let mut d = Document::new(200, 100);
+    let mut a = Object::new(1, ShapeKind::Rect { corner: 0.2 }, 10.0, 10.0, 80.0, 60.0);
+    a.name = "Plain box".into();
+    a.fill.a = [200, 30, 30, 255];
+    let mut b = Object::new(2, ShapeKind::Ellipse, 110.0, 10.0, 80.0, 80.0);
+    b.name = "Shiny ball".into();
+    b.effects.bevel.enabled = true;
+    d.objects = vec![a, b];
+    d
+}
+
+#[test]
+fn hi_res_export_scales_everything() {
+    let mut d = export_doc();
+    d.objects[1].effects.shadow.enabled = true;
+    let p = export::prepare(&d, None, 2.0).unwrap();
+    assert_eq!((p.width, p.height), (400, 200));
+    let b = &p.objects[1];
+    assert!(b.quad[0].dist(Pt::new(220.0, 20.0)) < 1e-3 && b.size == [160.0, 160.0]);
+    assert_eq!(b.effects.bevel.width, d.objects[1].effects.bevel.width * 2.0);
+    assert_eq!(b.effects.shadow.blur, d.objects[1].effects.shadow.blur * 2.0);
+    // selection only: cropped to the object
+    let s = export::prepare(&d, Some(&[1]), 1.0).unwrap();
+    assert_eq!((s.width, s.height, s.objects.len()), (80, 60, 1));
+}
+
+#[test]
+fn jpeg_and_webp_files_decode() {
+    let d = export_doc();
+    for (fmt, transparent) in [(Format::Jpeg, false), (Format::Webp, true)] {
+        let opts = Options { format: fmt, scale: 2.0, transparent, ..Default::default() };
+        let path = std::env::temp_dir().join(format!("jabro_export_test.{}", fmt.ext()));
+        export::export(&d, None, &opts, &path).unwrap();
+        let img = image::open(&path).unwrap().to_rgba8();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(img.dimensions(), (400, 200), "{fmt:?}");
+        let corner = img.get_pixel(1, 1);
+        if transparent {
+            assert_eq!(corner[3], 0, "transparent background kept");
+        } else {
+            assert!(corner[0] > 240, "white page");
+        }
+        let red = img.get_pixel(100, 80);
+        assert!(red[0] > 150 && red[1] < 90, "{fmt:?}: {red:?}");
+    }
+}
+
+#[test]
+fn psd_has_one_named_layer_per_object() {
+    let d = export_doc();
+    let path = std::env::temp_dir().join("jabro_export_test.psd");
+    export::export(&d, None, &Options { format: Format::Psd, ..Default::default() }, &path).unwrap();
+    let bytes = std::fs::read(&path).unwrap();
+    let _ = std::fs::remove_file(&path);
+    let psd = psd::Psd::from_bytes(&bytes).expect("valid PSD");
+    assert_eq!((psd.width(), psd.height()), (200, 100));
+    let names: Vec<&str> = psd.layers().iter().map(|l| l.name()).collect();
+    // the reader lists top first; the file stores bottom first, like Photoshop
+    assert_eq!(names, vec!["Shiny ball", "Plain box", "Background"]);
+    let flat = psd.rgba();
+    let i = ((40 * 200 + 50) * 4) as usize;
+    assert!(flat[i] > 150 && flat[i + 1] < 90, "merged image shows the red box");
+}
+
+#[test]
+fn svg_keeps_plain_shapes_as_vectors() {
+    let mut d = export_doc();
+    d.objects[0].quad[1] = Pt::new(95.0, 0.0); // a bit of perspective on the box
+    let path = std::env::temp_dir().join("jabro_export_test.svg");
+    export::export(&d, None, &Options { format: Format::Svg, ..Default::default() }, &path).unwrap();
+    let svg = std::fs::read_to_string(&path).unwrap();
+    let _ = std::fs::remove_file(&path);
+    assert!(svg.starts_with("<svg") && svg.trim_end().ends_with("</svg>"));
+    assert_eq!(svg.matches("<path").count(), 1, "plain box as a vector path");
+    assert!(svg.contains("fill=\"#c81e1e\""));
+    assert_eq!(svg.matches("<image").count(), 1, "beveled ball embedded as a picture");
+    assert!(svg.contains("data:image/png;base64,"));
+}

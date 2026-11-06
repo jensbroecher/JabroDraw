@@ -94,12 +94,12 @@ fn saturate(img: &mut Img, k: f32) {
     }
 }
 
-fn paper_grain(w: usize, h: usize, seed: u32) -> Vec<f32> {
+fn paper_grain(w: usize, h: usize, seed: u32, k: f32) -> Vec<f32> {
     let mut g = Vec::with_capacity(w * h);
     for y in 0..h {
         for x in 0..w {
             let (xf, yf) = (x as f32, y as f32);
-            g.push(0.6 * fbm(xf / 2.2, yf / 2.2, seed, 2) + 0.4 * fbm(xf / 12.0, yf / 12.0, seed + 1, 3));
+            g.push(0.6 * fbm(xf / (2.2 * k), yf / (2.2 * k), seed, 2) + 0.4 * fbm(xf / (12.0 * k), yf / (12.0 * k), seed + 1, 3));
         }
     }
     g
@@ -254,16 +254,17 @@ fn lic(noise: &[f32], tx: &[f32], ty: &[f32], w: usize, h: usize, len: usize) ->
 }
 
 fn watercolor(img: &Img, s: &NprSettings) -> Img {
+    let k = s.px_scale.max(0.1);
     let (w, h) = (img.w, img.h);
     let seed = s.seed;
     // 1. wobbly, hand-made boundaries
-    let amp = 2.0 + 4.0 * s.brush;
+    let amp = (2.0 + 4.0 * s.brush) * k;
     let mut wob = img.clone();
     for y in 0..h {
         for x in 0..w {
             let (xf, yf) = (x as f32, y as f32);
-            let dx = (fbm(xf / 38.0, yf / 38.0, seed, 3) - 0.5) * 2.0 * amp;
-            let dy = (fbm(xf / 38.0, yf / 38.0, seed + 7, 3) - 0.5) * 2.0 * amp;
+            let dx = (fbm(xf / (38.0 * k), yf / (38.0 * k), seed, 3) - 0.5) * 2.0 * amp;
+            let dy = (fbm(xf / (38.0 * k), yf / (38.0 * k), seed + 7, 3) - 0.5) * 2.0 * amp;
             let c = img.sample(xf + dx, yf + dy);
             for k in 0..3 {
                 wob.p[k][y * w + x] = c[k];
@@ -271,18 +272,18 @@ fn watercolor(img: &Img, s: &NprSettings) -> Img {
         }
     }
     // 2. flatten into washes
-    let r = 2 + (s.brush * 6.0) as usize;
-    let abs = kuwahara(&wob, r).blurred(1.0);
+    let r = ((2.0 + s.brush * 6.0) * k).max(1.0) as usize;
+    let abs = kuwahara(&wob, r).blurred(k);
     // 3. pigment pooling at wash edges
     let mut l = abs.lum();
-    gaussian(&mut l, w, h, 1.2, true);
+    gaussian(&mut l, w, h, 1.2 * k, true);
     let (gx, gy) = sobel(&l, w, h);
-    let grain = paper_grain(w, h, seed + 11);
+    let grain = paper_grain(w, h, seed + 11, k);
     let mut out = abs.clone();
     for i in 0..w * h {
         let (x, y) = ((i % w) as f32, (i / w) as f32);
         let edge = ((gx[i] * gx[i] + gy[i] * gy[i]).sqrt() * 1.6).min(1.0);
-        let turb = fbm(x / 70.0, y / 70.0, seed + 3, 4) - 0.5;
+        let turb = fbm(x / (70.0 * k), y / (70.0 * k), seed + 3, 4) - 0.5;
         let gr = grain[i] - 0.5;
         let density = (1.0 + 0.9 * edge + 0.45 * turb + 0.6 * gr * s.paper).max(0.3);
         for c in 0..3 {
@@ -295,17 +296,18 @@ fn watercolor(img: &Img, s: &NprSettings) -> Img {
 }
 
 fn oil(img: &Img, s: &NprSettings) -> Img {
+    let k = s.px_scale.max(0.1);
     let (w, h) = (img.w, img.h);
-    let r = 2 + (s.brush * 7.0) as usize;
-    let mut k = kuwahara(img, r);
-    k = kuwahara(&k, (r / 2).max(1));
-    saturate(&mut k, 1.15);
-    let lum = k.lum();
-    let (tx, ty) = tangent_field(&lum, w, h, 3.0 + s.brush * 3.0, s.seed);
+    let r = ((2.0 + s.brush * 7.0) * k).max(1.0) as usize;
+    let mut kw = kuwahara(img, r);
+    kw = kuwahara(&kw, (r / 2).max(1));
+    saturate(&mut kw, 1.15);
+    let lum = kw.lum();
+    let (tx, ty) = tangent_field(&lum, w, h, (3.0 + s.brush * 3.0) * k, s.seed);
     let noise: Vec<f32> = (0..w * h)
         .map(|i| rand01((i % w) as i32, (i / w) as i32, s.seed))
         .collect();
-    let len = 4 + (s.brush * 10.0) as usize;
+    let len = ((4.0 + s.brush * 10.0) * k) as usize;
     let streak = lic(&noise, &tx, &ty, w, h, len);
     let gain = ((2 * len + 1) as f32).sqrt() * 0.6;
     let height: Vec<f32> = streak
@@ -313,7 +315,7 @@ fn oil(img: &Img, s: &NprSettings) -> Img {
         .zip(&lum)
         .map(|(s, l)| 0.5 + (s - 0.5) * gain + l * 0.3)
         .collect();
-    let mut out = k.clone();
+    let mut out = kw.clone();
     for y in 0..h {
         for x in 0..w {
             let i = y * w + x;
@@ -321,9 +323,9 @@ fn oil(img: &Img, s: &NprSettings) -> Img {
             let hy = height[(y + 1).min(h - 1) * w + x] - height[y.saturating_sub(1) * w + x];
             let shade = (hx + hy) * 0.707 * 0.9;
             let spec = (shade - 0.14).max(0.0) * 0.5;
-            let weave = 0.5 + 0.25 * ((x as f32 * 1.3).sin() + (y as f32 * 1.3).sin());
+            let weave = 0.5 + 0.25 * ((x as f32 * 1.3 / k).sin() + (y as f32 * 1.3 / k).sin());
             for c in 0..3 {
-                let v = k.p[c][i] * (1.0 + shade) + spec;
+                let v = kw.p[c][i] * (1.0 + shade) + spec;
                 out.p[c][i] = (v * (1.0 - s.paper * 0.12 * weave)).clamp(0.0, 1.0);
             }
         }
@@ -332,10 +334,11 @@ fn oil(img: &Img, s: &NprSettings) -> Img {
 }
 
 fn painterly(src: &Img, s: &NprSettings, dots: bool) -> Img {
+    let k = s.px_scale.max(0.1);
     let (w, h) = (src.w, src.h);
     let mut canvas = Pixmap::new(w as u32, h as u32).expect("size");
     canvas.fill(Color::from_rgba8(250, 246, 236, 255));
-    let big = if dots { 3.0 + s.brush * 9.0 } else { 4.0 + s.brush * 18.0 };
+    let big = if dots { 3.0 + s.brush * 9.0 } else { 4.0 + s.brush * 18.0 } * k;
     let radii: Vec<f32> = [big, big * 0.5, big * 0.25]
         .into_iter()
         .filter(|r| *r >= 1.5)
@@ -377,7 +380,7 @@ fn painterly(src: &Img, s: &NprSettings, dots: bool) -> Img {
                         let (g1, g2) = (gx[idx], gy[idx]);
                         let mag = (g1 * g1 + g2 * g2).sqrt();
                         let (mut dx, mut dy) = if mag < 0.02 {
-                            let a = fbm(x / 140.0, y / 140.0, s.seed + 5, 2) * std::f32::consts::TAU * 1.5;
+                            let a = fbm(x / (140.0 * k), y / (140.0 * k), s.seed + 5, 2) * std::f32::consts::TAU * 1.5;
                             (a.cos(), a.sin())
                         } else {
                             (-g2 / mag, g1 / mag)
@@ -458,7 +461,7 @@ fn painterly(src: &Img, s: &NprSettings, dots: bool) -> Img {
     if s.paper > 0.0 {
         for y in 0..h {
             for x in 0..w {
-                let weave = 0.5 + 0.25 * ((x as f32 * 1.3).sin() + (y as f32 * 1.3).sin());
+                let weave = 0.5 + 0.25 * ((x as f32 * 1.3 / k).sin() + (y as f32 * 1.3 / k).sin());
                 let i = y * w + x;
                 for c in 0..3 {
                     out.p[c][i] *= 1.0 - s.paper * 0.1 * weave;
@@ -470,16 +473,17 @@ fn painterly(src: &Img, s: &NprSettings, dots: bool) -> Img {
 }
 
 fn pencil(img: &Img, s: &NprSettings, colored: bool) -> Img {
+    let k = s.px_scale.max(0.1);
     let (w, h) = (img.w, img.h);
     let lum = img.lum();
     let mut inv: Vec<f32> = lum.iter().map(|l| 1.0 - l).collect();
-    gaussian(&mut inv, w, h, 1.0 + s.brush * 4.0, true);
+    gaussian(&mut inv, w, h, (1.0 + s.brush * 4.0) * k, true);
     let mut tone = lum.clone();
-    gaussian(&mut tone, w, h, 2.0, true);
+    gaussian(&mut tone, w, h, 2.0 * k, true);
     let mut soft = lum.clone();
-    gaussian(&mut soft, w, h, 0.8 + s.brush, true);
+    gaussian(&mut soft, w, h, (0.8 + s.brush) * k, true);
     let (ex, ey) = sobel(&soft, w, h);
-    let grain = paper_grain(w, h, s.seed + 21);
+    let grain = paper_grain(w, h, s.seed + 21, k);
     let mut sat = img.clone();
     saturate(&mut sat, 1.3);
     let mut out = img.clone();
@@ -493,8 +497,8 @@ fn pencil(img: &Img, s: &NprSettings, colored: bool) -> Img {
             let (xf, yf) = (x as f32, y as f32);
             let u = (xf + yf) * 0.7071;
             let v = (xf - yf) * 0.7071;
-            let h1 = value_noise(v * 0.7, u * 0.035, s.seed + 5);
-            let h2 = value_noise(u * 0.7, v * 0.035, s.seed + 9);
+            let h1 = value_noise(v * 0.7 / k, u * 0.035 / k, s.seed + 5);
+            let h2 = value_noise(u * 0.7 / k, v * 0.035 / k, s.seed + 9);
             let c1 = smoothstep(-0.08, 0.08, dark * 1.25 - h1);
             let c2 = smoothstep(-0.08, 0.08, dark * 1.25 - 0.45 - h2);
             let g = 0.55 + 0.45 * grain[i];
@@ -520,18 +524,19 @@ fn pencil(img: &Img, s: &NprSettings, colored: bool) -> Img {
 }
 
 fn comic(img: &Img, s: &NprSettings) -> Img {
+    let k = s.px_scale.max(0.1);
     let (w, h) = (img.w, img.h);
-    let mut k = kuwahara(img, 2 + (s.brush * 4.0) as usize);
-    saturate(&mut k, 1.25);
-    let lum = k.lum();
+    let mut kw = kuwahara(img, ((2.0 + s.brush * 4.0) * k) as usize);
+    saturate(&mut kw, 1.25);
+    let lum = kw.lum();
     let levels = 3.0 + (1.0 - s.brush) * 3.0;
-    let sigma = 0.8 + s.brush * 1.5;
+    let sigma = (0.8 + s.brush * 1.5) * k;
     let base = img.lum();
     let mut g1 = base.clone();
     gaussian(&mut g1, w, h, sigma, true);
     let mut g2 = base;
     gaussian(&mut g2, w, h, sigma * 1.6, true);
-    let mut out = k.clone();
+    let mut out = kw.clone();
     for y in 0..h {
         for x in 0..w {
             let i = y * w + x;
@@ -544,8 +549,8 @@ fn comic(img: &Img, s: &NprSettings) -> Img {
             let mut tone = 1.0;
             if s.paper > 0.0 && l < 0.55 {
                 let (xf, yf) = (x as f32, y as f32);
-                let u = (xf + yf) * 0.7071 / 6.0;
-                let v = (xf - yf) * 0.7071 / 6.0;
+                let u = (xf + yf) * 0.7071 / (6.0 * k);
+                let v = (xf - yf) * 0.7071 / (6.0 * k);
                 let du = u - u.floor() - 0.5;
                 let dv = v - v.floor() - 0.5;
                 let rr = (du * du + dv * dv).sqrt();
@@ -554,7 +559,7 @@ fn comic(img: &Img, s: &NprSettings) -> Img {
                 }
             }
             for c in 0..3 {
-                out.p[c][i] = (k.p[c][i] * f * ink * tone).clamp(0.0, 1.0);
+                out.p[c][i] = (kw.p[c][i] * f * ink * tone).clamp(0.0, 1.0);
             }
         }
     }

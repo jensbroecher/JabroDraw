@@ -878,6 +878,9 @@ pub struct NprSettings {
     pub brush: f32,
     pub paper: f32,
     pub seed: u32,
+    /// Brush sizes are multiplied by this (high-resolution export). Not saved.
+    #[serde(skip, default = "one")]
+    pub px_scale: f32,
 }
 
 impl Default for NprSettings {
@@ -888,6 +891,7 @@ impl Default for NprSettings {
             brush: 0.4,
             paper: 0.5,
             seed: 1,
+            px_scale: 1.0,
         }
     }
 }

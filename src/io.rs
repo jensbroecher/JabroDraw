@@ -3,7 +3,7 @@
 use crate::doc::Document;
 use std::path::Path;
 use std::sync::Arc;
-use tiny_skia::Pixmap;
+
 
 pub fn save(doc: &Document, path: &Path) -> Result<(), String> {
     // A picture that was never painted on is stored once, not as paint + original.
@@ -35,6 +35,3 @@ pub fn load(path: &Path) -> Result<Document, String> {
     Ok(doc)
 }
 
-pub fn export_png(pm: &Pixmap, path: &Path) -> Result<(), String> {
-    pm.save_png(path).map_err(|e| e.to_string())
-}

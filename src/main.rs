@@ -12,6 +12,7 @@ mod canvas;
 mod demo;
 mod doc;
 mod effects;
+mod export;
 mod fonts;
 mod geom;
 mod imageops;
