@@ -5,6 +5,7 @@ use crate::doc::*;
 use crate::geom::{simplify, Pt};
 use crate::npr::{self, NprJob, NprWorker};
 use crate::ai::{self, AiJob, AiModel, AiWorker};
+use crate::canvas::{self, Settings};
 use crate::render::Renderer;
 use crate::vector::{self, BoolOp};
 use crate::{demo, imageops, io, shapes, styles};
@@ -133,6 +134,23 @@ enum PropAction {
     PasteStyle,
     Front,
     Back,
+}
+
+/// State of the New document / Canvas size dialog.
+struct CanvasDialog {
+    new_doc: bool,
+    w: u32,
+    h: u32,
+    lock: bool,
+    /// Which part of the picture stays put when resizing: (column, row) 0..2;
+    /// (9, 9) means "fit to content".
+    anchor: (u8, u8),
+}
+
+enum DocAction {
+    CanvasDialog,
+    FitContent,
+    AutoGrow(bool),
 }
 
 /// Settings of the properties panel's Picture section.
@@ -303,8 +321,8 @@ pub struct JabroApp {
     pressure: Option<f32>,
     style_clipboard: Option<(FillStyle, StrokeStyle, Effects, Transparency)>,
     show_about: bool,
-    new_w: u32,
-    new_h: u32,
+    settings: Settings,
+    canvas_dialog: Option<CanvasDialog>,
 }
 
 impl JabroApp {
@@ -312,15 +330,17 @@ impl JabroApp {
         cc.egui_ctx.set_visuals(egui::Visuals::dark());
         let ctx = cc.egui_ctx.clone();
         let ctx2 = ctx.clone();
-        Self::with_worker(
+        let mut app = Self::with_worker(
             NprWorker::new(move || ctx.request_repaint()),
             AiWorker::new(move || ctx2.request_repaint()),
-        )
+        );
+        app.settings = Settings::load();
+        app
     }
 
     fn with_worker(worker: NprWorker, ai: AiWorker) -> Self {
         let doc = demo::demo_document();
-        let (new_w, new_h) = (doc.width, doc.height);
+
         let saved_doc = doc.clone();
         Self {
             doc,
@@ -376,8 +396,8 @@ impl JabroApp {
             pressure: None,
             style_clipboard: None,
             show_about: false,
-            new_w,
-            new_h,
+            settings: Settings::default(),
+            canvas_dialog: None,
         }
     }
 
@@ -727,19 +747,200 @@ impl JabroApp {
         self.doc = doc;
         self.renderer.clear();
         self.selected = None;
-        self.new_w = self.doc.width;
-        self.new_h = self.doc.height;
         self.fit_pending = true;
         self.dirty = true;
     }
 
-    fn new_doc(&mut self) {
-        let mut d = Document::new(self.new_w.max(16), self.new_h.max(16));
+    fn new_doc(&mut self, w: u32, h: u32) {
+        let mut d = Document::new(w, h);
         d.npr = self.doc.npr.clone();
         d.npr.style = NprStyle::None;
         self.replace_doc(d);
         self.path = None;
-        self.status = "New document".into();
+        self.status = format!("New {w} × {h} document");
+    }
+
+    /// Change the canvas size, moving every object by `offset` (used when the canvas grows to
+    /// the left / top). The view is adjusted so nothing appears to jump. No undo step here.
+    fn resize_canvas(&mut self, w: u32, h: u32, offset: Pt) {
+        let w = w.clamp(canvas::MIN_SIZE, canvas::MAX_SIZE);
+        let h = h.clamp(canvas::MIN_SIZE, canvas::MAX_SIZE);
+        if offset != Pt::default() {
+            for o in &mut self.doc.objects {
+                o.quad = o.quad.map(|c| c + offset);
+            }
+        }
+        // keep content at the same spot on screen: origin_new = origin_old - offset * zoom
+        let o_new = self.origin() - Vec2::new(offset.x, offset.y) * self.zoom;
+        self.doc.width = w;
+        self.doc.height = h;
+        let size = Vec2::new(w as f32, h as f32) * self.zoom;
+        self.pan = (o_new - self.canvas_rect.center()) + size * 0.5;
+        self.dirty = true;
+    }
+
+    /// Canvas just big enough for all objects (with a small margin).
+    fn fit_canvas_to_content(&mut self) -> bool {
+        let Some((lo, hi)) = canvas::content_bounds(&self.doc) else {
+            self.status = "Nothing to fit — the document is empty.".into();
+            return false;
+        };
+        let m = 16.0;
+        let w = (hi.x - lo.x + 2.0 * m).ceil() as u32;
+        let h = (hi.y - lo.y + 2.0 * m).ceil() as u32;
+        self.resize_canvas(w, h, Pt::new(m - lo.x, m - lo.y));
+        self.status = format!("Canvas fitted to the content: {} × {} px", self.doc.width, self.doc.height);
+        true
+    }
+
+    /// Grow the canvas after a drop if something now sticks out (when the setting is on).
+    fn auto_grow(&mut self) {
+        if !self.settings.auto_grow {
+            return;
+        }
+        let Some((lo, hi)) = canvas::content_bounds(&self.doc) else { return };
+        if let Some((w, h, off)) = canvas::grow_to_fit(self.doc.width, self.doc.height, lo, hi, 8.0) {
+            self.resize_canvas(w, h, off);
+            self.status = format!("Canvas grew to {w} × {h} px to fit everything.");
+        }
+    }
+
+    fn open_canvas_dialog(&mut self, new_doc: bool) {
+        self.canvas_dialog = Some(CanvasDialog {
+            new_doc,
+            w: self.doc.width,
+            h: self.doc.height,
+            lock: false,
+            anchor: (1, 1),
+        });
+    }
+
+    fn canvas_dialog_ui(&mut self, ctx: &egui::Context) {
+        let Some(mut d) = self.canvas_dialog.take() else { return };
+        let mut open = true;
+        let mut apply = false;
+        let mut cancel = false;
+        let title = if d.new_doc { "New document" } else { "Canvas size" };
+        egui::Window::new(title)
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label("Template");
+                    let current = canvas::PRESETS
+                        .iter()
+                        .find(|p| p.w == d.w && p.h == d.h)
+                        .map_or("Custom".to_string(), |p| p.name.to_string());
+                    egui::ComboBox::from_id_salt("canvas_preset")
+                        .selected_text(current)
+                        .width(220.0)
+                        .height(420.0)
+                        .show_ui(ui, |ui| {
+                            let mut group = "";
+                            for p in canvas::PRESETS {
+                                if p.group != group {
+                                    group = p.group;
+                                    ui.add_space(4.0);
+                                    ui.strong(group);
+                                }
+                                let label = format!("{}   {} × {}", p.name, p.w, p.h);
+                                if ui.selectable_label(d.w == p.w && d.h == p.h, label).clicked() {
+                                    d.w = p.w;
+                                    d.h = p.h;
+                                }
+                            }
+                        });
+                });
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    let ratio = d.w as f32 / d.h.max(1) as f32;
+                    let rw = ui.add(egui::DragValue::new(&mut d.w).range(canvas::MIN_SIZE..=canvas::MAX_SIZE).suffix(" px"));
+                    ui.label("×");
+                    let rh = ui.add(egui::DragValue::new(&mut d.h).range(canvas::MIN_SIZE..=canvas::MAX_SIZE).suffix(" px"));
+                    if d.lock && rw.changed() {
+                        d.h = ((d.w as f32 / ratio).round() as u32).clamp(canvas::MIN_SIZE, canvas::MAX_SIZE);
+                    } else if d.lock && rh.changed() {
+                        d.w = ((d.h as f32 * ratio).round() as u32).clamp(canvas::MIN_SIZE, canvas::MAX_SIZE);
+                    }
+                    if ui.button("⇄").on_hover_text("Swap portrait / landscape").clicked() {
+                        std::mem::swap(&mut d.w, &mut d.h);
+                    }
+                });
+                ui.horizontal(|ui| {
+                    ui.checkbox(&mut d.lock, "Keep aspect ratio");
+                    ui.label(format!("Aspect {}", canvas::aspect_label(d.w, d.h)));
+                });
+                if !d.new_doc {
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                        ui.label("Keep the picture at");
+                        egui::Grid::new("canvas_anchor").spacing([2.0, 2.0]).show(ui, |ui| {
+                            for row in 0..3u8 {
+                                for col in 0..3u8 {
+                                    let sel = d.anchor == (col, row);
+                                    if ui
+                                        .add_sized([22.0, 22.0], egui::SelectableLabel::new(sel, if sel { "●" } else { "" }))
+                                        .clicked()
+                                    {
+                                        d.anchor = (col, row);
+                                    }
+                                }
+                                ui.end_row();
+                            }
+                        });
+                    });
+                    ui.small("The canvas grows or shrinks away from the chosen spot.");
+                    ui.add_space(4.0);
+                    if ui
+                        .button("Fit canvas to content")
+                        .on_hover_text("Make the canvas just big enough for all objects, shadows and glows included")
+                        .clicked()
+                    {
+                        if let Some((lo, hi)) = canvas::content_bounds(&self.doc) {
+                            d.w = ((hi.x - lo.x + 32.0).ceil() as u32).clamp(canvas::MIN_SIZE, canvas::MAX_SIZE);
+                            d.h = ((hi.y - lo.y + 32.0).ceil() as u32).clamp(canvas::MIN_SIZE, canvas::MAX_SIZE);
+                            d.anchor = (9, 9); // "fit" marker
+                        }
+                    }
+                    let mut g = self.settings.auto_grow;
+                    if ui
+                        .checkbox(&mut g, "Grow the canvas automatically when objects go past the edge")
+                        .changed()
+                    {
+                        self.settings.auto_grow = g;
+                        self.settings.save();
+                    }
+                }
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui.button(if d.new_doc { "  Create  " } else { "  Apply  " }).clicked() {
+                        apply = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        cancel = true;
+                    }
+                });
+            });
+        if apply {
+            if d.new_doc {
+                self.new_doc(d.w, d.h);
+            } else if d.w != self.doc.width || d.h != self.doc.height || d.anchor == (9, 9) {
+                self.checkpoint();
+                if d.anchor == (9, 9) {
+                    self.fit_canvas_to_content();
+                } else {
+                    let dx = (d.w as f32 - self.doc.width as f32) * d.anchor.0 as f32 * 0.5;
+                    let dy = (d.h as f32 - self.doc.height as f32) * d.anchor.1 as f32 * 0.5;
+                    self.resize_canvas(d.w, d.h, Pt::new(dx.round(), dy.round()));
+                    self.status = format!("Canvas is now {} × {} px", self.doc.width, self.doc.height);
+                }
+                self.fit_pending = true;
+            }
+        } else if open && !cancel {
+            self.canvas_dialog = Some(d);
+        }
     }
 
     fn open(&mut self) {
@@ -1858,6 +2059,15 @@ impl JabroApp {
             }
             _ => {}
         }
+        if self.settings.auto_grow {
+            let sticks_out = canvas::content_bounds(&self.doc).is_some_and(|(lo, hi)| {
+                canvas::grow_to_fit(self.doc.width, self.doc.height, lo, hi, 8.0).is_some()
+            });
+            if sticks_out {
+                self.commit_snapshot(); // part of the same undo step as the drop
+                self.auto_grow();
+            }
+        }
         self.snapshot = None;
         self.last_drag_pos = None;
     }
@@ -2055,6 +2265,9 @@ impl JabroApp {
         if cmd(Key::I) {
             self.import_image_dialog();
         }
+        if cmd(Key::N) {
+            self.open_canvas_dialog(true);
+        }
         if ctx.wants_keyboard_input() {
             return;
         }
@@ -2141,8 +2354,8 @@ impl JabroApp {
     fn menu_bar(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         egui::menu::bar(ui, |ui| {
             ui.menu_button("File", |ui| {
-                if ui.button("New").clicked() {
-                    self.new_doc();
+                if ui.button("New…  (Ctrl+N)").clicked() {
+                    self.open_canvas_dialog(true);
                     ui.close_menu();
                 }
                 if ui.button("Open…  (Ctrl+O)").clicked() {
@@ -2223,6 +2436,24 @@ impl JabroApp {
                     ui.close_menu();
                 }
             });
+            ui.menu_button("Canvas", |ui| {
+                if ui.button("Canvas size…").clicked() {
+                    self.open_canvas_dialog(false);
+                    ui.close_menu();
+                }
+                if ui.button("Fit canvas to content").clicked() {
+                    self.checkpoint();
+                    if self.fit_canvas_to_content() {
+                        self.fit_pending = true;
+                    }
+                    ui.close_menu();
+                }
+                let mut g = self.settings.auto_grow;
+                if ui.checkbox(&mut g, "Grow automatically past the edge").changed() {
+                    self.settings.auto_grow = g;
+                    self.settings.save();
+                }
+            });
             ui.menu_button("Path", |ui| {
                 let n = self.selection().len();
                 for op in BoolOp::ALL {
@@ -2295,6 +2526,18 @@ impl JabroApp {
         ui.horizontal(|ui| {
             ui.label(self.tool.hint());
             ui.separator();
+            if ui
+                .link(format!(
+                    "Canvas {} × {} ({})",
+                    self.doc.width,
+                    self.doc.height,
+                    canvas::aspect_label(self.doc.width, self.doc.height)
+                ))
+                .on_hover_text("Change the canvas size")
+                .clicked()
+            {
+                self.open_canvas_dialog(false);
+            }
             ui.label(format!("Zoom {:.0}%", self.zoom * 100.0));
             if let Some(p) = self.cursor_doc {
                 ui.label(format!("x {:.0}  y {:.0}", p.x, p.y));
@@ -2653,7 +2896,8 @@ impl JabroApp {
         }
         let before = self.doc.clone();
         let mut actions: Vec<PropAction> = Vec::new();
-        let mut resize: Option<(u32, u32)> = None;
+        let mut doc_act: Option<DocAction> = None;
+        let auto_grow = self.settings.auto_grow;
         let has_clip = self.style_clipboard.is_some();
         let selected = self.selected;
         let focus_text = std::mem::take(&mut self.focus_text);
@@ -2668,7 +2912,7 @@ impl JabroApp {
             match selected.and_then(|id| self.doc.find_mut(id)) {
                 Some(obj) => object_props(ui, obj, &mut actions, has_clip, focus_text, &mut pic),
                 None => {
-                    doc_props(ui, &mut self.doc, &mut self.new_w, &mut self.new_h, &mut resize);
+                    doc_props(ui, &mut self.doc, auto_grow, &mut doc_act);
                 }
             }
         });
@@ -2774,10 +3018,19 @@ impl JabroApp {
                 }
             }
         }
-        if let Some((w, h)) = resize {
-            self.doc.width = w.clamp(16, 8192);
-            self.doc.height = h.clamp(16, 8192);
-            self.fit_pending = true;
+        match doc_act {
+            Some(DocAction::CanvasDialog) => self.open_canvas_dialog(false),
+            Some(DocAction::FitContent) => {
+                // recorded by the change detection below as one undo step
+                if self.fit_canvas_to_content() {
+                    self.fit_pending = true;
+                }
+            }
+            Some(DocAction::AutoGrow(g)) => {
+                self.settings.auto_grow = g;
+                self.settings.save();
+            }
+            None => {}
         }
 
         if !self.doc.same_content(&before) {
@@ -3683,23 +3936,31 @@ fn object_props(
     });
 }
 
-fn doc_props(
-    ui: &mut egui::Ui,
-    doc: &mut Document,
-    new_w: &mut u32,
-    new_h: &mut u32,
-    resize: &mut Option<(u32, u32)>,
-) {
+fn doc_props(ui: &mut egui::Ui, doc: &mut Document, auto_grow: bool, act: &mut Option<DocAction>) {
     ui.strong("Document");
     rgba_label(ui, "Background", &mut doc.background);
-    ui.horizontal(|ui| {
-        ui.add(egui::DragValue::new(new_w).range(16..=8192).suffix(" px"));
-        ui.label("×");
-        ui.add(egui::DragValue::new(new_h).range(16..=8192).suffix(" px"));
-        if ui.button("Resize canvas").clicked() {
-            *resize = Some((*new_w, *new_h));
+    ui.add_space(4.0);
+    ui.label(format!(
+        "Canvas {} × {} px  ({})",
+        doc.width,
+        doc.height,
+        canvas::aspect_label(doc.width, doc.height)
+    ));
+    ui.horizontal_wrapped(|ui| {
+        if ui.button("Canvas size…").on_hover_text("Size, templates (1:1, 16:9, A4…) and anchor").clicked() {
+            *act = Some(DocAction::CanvasDialog);
+        }
+        if ui.button("Fit to content").on_hover_text("Make the canvas just big enough for all objects").clicked() {
+            *act = Some(DocAction::FitContent);
         }
     });
+    let mut g = auto_grow;
+    if ui
+        .checkbox(&mut g, "Grow the canvas when objects go past the edge")
+        .changed()
+    {
+        *act = Some(DocAction::AutoGrow(g));
+    }
     ui.add_space(8.0);
     ui.label(format!("{} objects. Select one to edit its fill, bevel, shadow and paint.", doc.objects.len()));
     ui.add_space(8.0);
@@ -3715,6 +3976,7 @@ impl eframe::App for JabroApp {
         self.handle_close(ctx);
         self.handle_dropped_files(ctx);
         self.poll_ai();
+        self.canvas_dialog_ui(ctx);
         self.update_title(ctx);
         self.shortcuts(ctx);
         self.read_pressure(ctx);
@@ -4139,6 +4401,65 @@ mod tests {
         assert!(text.contains("\"paint\":null") && text.contains("paint_is_original"), "stored once");
         let o = &back.objects[0];
         assert!(Arc::ptr_eq(o.paint.as_ref().unwrap(), &o.original.as_ref().unwrap().0));
+    }
+
+    #[test]
+    fn aspect_labels_and_templates() {
+        assert_eq!(canvas::aspect_label(1920, 1080), "16:9");
+        assert_eq!(canvas::aspect_label(1080, 1080), "1:1");
+        assert_eq!(canvas::aspect_label(1080, 1350), "4:5");
+        assert_eq!(canvas::aspect_label(1080, 1920), "9:16");
+        assert_eq!(canvas::aspect_label(1200, 630), "1.90:1");
+        assert_eq!(canvas::aspect_label(2560, 1080), "21:9");
+        for p in canvas::PRESETS {
+            assert!(p.w >= canvas::MIN_SIZE && p.w <= canvas::MAX_SIZE && p.h <= canvas::MAX_SIZE, "{}", p.name);
+        }
+        let mut app = app_with(vec![rect(1, 10.0, 10.0)]);
+        app.new_doc(1080, 1920);
+        assert_eq!((app.doc.width, app.doc.height), (1080, 1920));
+        assert!(app.doc.objects.is_empty());
+        app.undo();
+        assert_eq!(app.doc.objects.len(), 1, "New is undoable");
+    }
+
+    #[test]
+    fn canvas_grows_when_objects_are_dropped_past_the_edge() {
+        let mut app = app_with(vec![rect(1, 100.0, 100.0), rect(2, 400.0, 300.0)]);
+        app.tool = Tool::Select;
+        // setting off: nothing happens
+        drag(&mut app, Pt::new(450.0, 350.0), Pt::new(850.0, 350.0), Modifiers::NONE);
+        assert_eq!((app.doc.width, app.doc.height), (800, 600));
+        app.undo();
+
+        app.settings.auto_grow = true;
+        drag(&mut app, Pt::new(450.0, 350.0), Pt::new(850.0, 650.0), Modifiers::NONE);
+        assert!(app.doc.width >= 908 && app.doc.height >= 708, "{}x{}", app.doc.width, app.doc.height);
+        app.undo();
+        assert_eq!((app.doc.width, app.doc.height), (800, 600), "drop and growth undo together");
+        assert!(app.doc.objects[1].quad[0].dist(Pt::new(400.0, 300.0)) < 1e-3);
+
+        // past the top-left: everything shifts so the content stays where it is on screen
+        let before = app.to_screen(app.doc.objects[0].quad[0]);
+        drag(&mut app, Pt::new(150.0, 150.0), Pt::new(-50.0, -30.0), Modifiers::NONE);
+        let o = &app.doc.objects[0];
+        let (lo, _) = canvas::visual_bounds(o);
+        assert!(lo.x >= 7.9 && lo.y >= 7.9, "object is inside the canvas now: {lo:?}");
+        let moved_by = Pt::new(-200.0, -180.0);
+        let expect = before + Vec2::new(moved_by.x, moved_by.y) * app.zoom;
+        assert!(app.to_screen(o.quad[0]).distance(expect) < 0.5, "no visual jump");
+    }
+
+    #[test]
+    fn canvas_resize_with_anchor_and_fit_to_content() {
+        let mut app = app_with(vec![rect(1, 100.0, 100.0)]);
+        app.resize_canvas(1000, 800, Pt::new(100.0, 100.0)); // centred anchor on +200 / +200
+        assert!(app.doc.objects[0].quad[0].dist(Pt::new(200.0, 200.0)) < 1e-3);
+        app.doc.objects[0].effects.shadow.enabled = true; // shadow reaches beyond the shape
+        assert!(app.fit_canvas_to_content());
+        let (lo, hi) = canvas::visual_bounds(&app.doc.objects[0]);
+        assert!((lo.x - 16.0).abs() < 1.0 && (lo.y - 16.0).abs() < 1.0, "{lo:?}");
+        assert!(hi.x <= app.doc.width as f32 - 15.0 && hi.y <= app.doc.height as f32 - 15.0);
+        assert!(app.doc.width < 200 && app.doc.height < 200, "{}x{}", app.doc.width, app.doc.height);
     }
 
     #[test]

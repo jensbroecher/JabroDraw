@@ -8,6 +8,7 @@
 mod ai;
 mod app;
 mod brush;
+mod canvas;
 mod demo;
 mod doc;
 mod effects;

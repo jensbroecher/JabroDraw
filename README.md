@@ -68,6 +68,11 @@ Styles: `none watercolor oil impressionist pointillism pencil colorpencil comic`
   plus ambient light and shine. They also light the bevel relief.
 - **Outline**: outside, centred or inside the edge, solid, dashed or dotted. On paint layers it
   traces around everything painted.
+- **Canvas**: File › New… (Ctrl+N) and Canvas › Canvas size… offer templates for screen, social,
+  photo and print sizes (16:9, 1:1, 4:5, 9:16, A4/Letter at 300 dpi…), an aspect lock and an
+  anchor for which side the canvas grows from. **Fit canvas to content** wraps the canvas around
+  everything, and **Grow automatically** (a remembered setting) extends the canvas when you drop an
+  object past its edge. The status bar shows the size; click it to change it.
 - **Objects list**: drag a row up or down to change the stacking order; dragging a selected row
   moves the whole selection. Shift+click adds to the selection, and the checkbox hides an object.
 - **Path menu**: Union / Subtract / Intersect / Exclude on 2+ selected objects (also in the properties
