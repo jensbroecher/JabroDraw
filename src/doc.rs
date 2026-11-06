@@ -218,6 +218,11 @@ pub struct FillStyle {
     pub image: Option<ImageData>,
     /// Stretch the picture over the object instead of tiling it.
     pub image_stretch: bool,
+    /// Colour stops (position 0..1, colour). Empty = just `a` to `b`.
+    pub stops: Vec<(f32, Rgba)>,
+    /// Gradient start / end, normalised to the object box (set with the gradient tool).
+    /// None = use `angle` across the whole object.
+    pub points: Option<([f32; 2], [f32; 2])>,
 }
 
 impl Default for FillStyle {
@@ -231,6 +236,8 @@ impl Default for FillStyle {
             tex_scale: 1.0,
             image: None,
             image_stretch: true,
+            stops: Vec::new(),
+            points: None,
         }
     }
 }
@@ -270,6 +277,157 @@ impl DashKind {
             DashKind::Dashed => "Dashed",
             DashKind::Dotted => "Dotted",
         }
+    }
+}
+
+impl FillStyle {
+    /// Colour stops sorted by position (falls back to `a` → `b`).
+    pub fn gradient_stops(&self) -> Vec<(f32, Rgba)> {
+        if self.stops.len() < 2 {
+            return vec![(0.0, self.a), (1.0, self.b)];
+        }
+        let mut s = self.stops.clone();
+        s.sort_by(|x, y| x.0.total_cmp(&y.0));
+        s
+    }
+
+    /// Colour of the gradient at position t (0..1).
+    pub fn color_at(&self, t: f32) -> Rgba {
+        let s = self.gradient_stops();
+        let t = t.clamp(0.0, 1.0);
+        if t <= s[0].0 {
+            return s[0].1;
+        }
+        for w in s.windows(2) {
+            let (a, b) = (w[0], w[1]);
+            if t <= b.0 {
+                let k = if b.0 > a.0 { (t - a.0) / (b.0 - a.0) } else { 0.0 };
+                return std::array::from_fn(|i| (a.1[i] as f32 + (b.1[i] as f32 - a.1[i] as f32) * k).round() as u8);
+            }
+        }
+        s[s.len() - 1].1
+    }
+}
+
+/// How an object mixes with what is underneath it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum Blend {
+    #[default]
+    Normal,
+    Multiply,
+    Screen,
+    Overlay,
+    Darken,
+    Lighten,
+    ColorDodge,
+    ColorBurn,
+    HardLight,
+    SoftLight,
+    Difference,
+    Exclusion,
+    Hue,
+    Saturation,
+    Color,
+    Luminosity,
+}
+
+impl Blend {
+    pub const ALL: [Blend; 16] = [
+        Blend::Normal,
+        Blend::Multiply,
+        Blend::Screen,
+        Blend::Overlay,
+        Blend::Darken,
+        Blend::Lighten,
+        Blend::ColorDodge,
+        Blend::ColorBurn,
+        Blend::HardLight,
+        Blend::SoftLight,
+        Blend::Difference,
+        Blend::Exclusion,
+        Blend::Hue,
+        Blend::Saturation,
+        Blend::Color,
+        Blend::Luminosity,
+    ];
+    pub fn label(self) -> &'static str {
+        match self {
+            Blend::Normal => "Normal",
+            Blend::Multiply => "Multiply",
+            Blend::Screen => "Screen",
+            Blend::Overlay => "Overlay",
+            Blend::Darken => "Darken",
+            Blend::Lighten => "Lighten",
+            Blend::ColorDodge => "Colour dodge",
+            Blend::ColorBurn => "Colour burn",
+            Blend::HardLight => "Hard light",
+            Blend::SoftLight => "Soft light",
+            Blend::Difference => "Difference",
+            Blend::Exclusion => "Exclusion",
+            Blend::Hue => "Hue",
+            Blend::Saturation => "Saturation",
+            Blend::Color => "Colour",
+            Blend::Luminosity => "Luminosity",
+        }
+    }
+    pub fn to_skia(self) -> tiny_skia::BlendMode {
+        use tiny_skia::BlendMode as B;
+        match self {
+            Blend::Normal => B::SourceOver,
+            Blend::Multiply => B::Multiply,
+            Blend::Screen => B::Screen,
+            Blend::Overlay => B::Overlay,
+            Blend::Darken => B::Darken,
+            Blend::Lighten => B::Lighten,
+            Blend::ColorDodge => B::ColorDodge,
+            Blend::ColorBurn => B::ColorBurn,
+            Blend::HardLight => B::HardLight,
+            Blend::SoftLight => B::SoftLight,
+            Blend::Difference => B::Difference,
+            Blend::Exclusion => B::Exclusion,
+            Blend::Hue => B::Hue,
+            Blend::Saturation => B::Saturation,
+            Blend::Color => B::Color,
+            Blend::Luminosity => B::Luminosity,
+        }
+    }
+}
+
+/// Non-destructive colour adjustments of one object.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Adjust {
+    /// Degrees around the colour wheel.
+    pub hue: f32,
+    /// -1 (grey) .. +1 (twice as colourful).
+    pub saturation: f32,
+    /// -1 (black) .. +1 (white).
+    pub lightness: f32,
+    /// -1 .. +1.
+    pub contrast: f32,
+    /// Levels: input black point, white point (0..1) and gamma (midtones).
+    pub black: f32,
+    pub white: f32,
+    pub gamma: f32,
+}
+
+impl Default for Adjust {
+    fn default() -> Self {
+        Self {
+            hue: 0.0,
+            saturation: 0.0,
+            lightness: 0.0,
+            contrast: 0.0,
+            black: 0.0,
+            white: 1.0,
+            gamma: 1.0,
+        }
+    }
+}
+
+impl Adjust {
+    pub fn is_identity(&self) -> bool {
+        *self == Adjust::default()
     }
 }
 
@@ -609,6 +767,10 @@ pub struct Object {
     pub effects: Effects,
     #[serde(default)]
     pub transparency: Transparency,
+    #[serde(default)]
+    pub blend: Blend,
+    #[serde(default)]
+    pub adjust: Adjust,
     #[serde(default = "one")]
     pub opacity: f32,
     #[serde(default = "yes")]
@@ -654,6 +816,8 @@ impl Object {
             stroke: StrokeStyle::default(),
             effects: Effects::default(),
             transparency: Transparency::default(),
+            blend: Blend::Normal,
+            adjust: Adjust::default(),
             opacity: 1.0,
             visible: true,
             paint: None,
@@ -780,6 +944,8 @@ impl Object {
             && self.stroke == o.stroke
             && self.effects == o.effects
             && self.transparency == o.transparency
+            && self.blend == o.blend
+            && self.adjust == o.adjust
             && self.original == o.original
             && self.opacity == o.opacity
             && self.npr_mode == o.npr_mode
@@ -795,6 +961,8 @@ impl Object {
         self.stroke = src.stroke.clone();
         self.effects = src.effects.clone();
         self.transparency = src.transparency.clone();
+        self.blend = src.blend;
+        self.adjust = src.adjust.clone();
         self.original = src.original.clone();
         self.opacity = src.opacity;
         self.npr_mode = src.npr_mode;
@@ -820,6 +988,8 @@ impl Object {
             && self.stroke == o.stroke
             && self.effects == o.effects
             && self.transparency == o.transparency
+            && self.blend == o.blend
+            && self.adjust == o.adjust
             && self.original == o.original
             && self.group == o.group
             && self.instance_of == o.instance_of

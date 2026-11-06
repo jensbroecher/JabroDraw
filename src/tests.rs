@@ -611,3 +611,54 @@ fn looks_stack_on_top_of_each_other() {
     let diff = single.data().iter().zip(stacked.data()).filter(|(a, b)| (**a as i32 - **b as i32).abs() > 20).count();
     assert!(diff > 1000, "the second look changes the picture ({diff})");
 }
+
+// ------------------------------------------------------------------ gradients, blend modes, adjustments
+
+#[test]
+fn multi_stop_gradient_along_chosen_points() {
+    let mut o = Object::new(1, ShapeKind::Rect { corner: 0.0 }, 0.0, 0.0, 200.0, 50.0);
+    o.fill = FillStyle {
+        kind: FillKind::Linear,
+        stops: vec![(0.0, [255, 0, 0, 255]), (0.5, [0, 255, 0, 255]), (1.0, [0, 0, 255, 255])],
+        points: Some(([0.0, 0.5], [1.0, 0.5])),
+        ..Default::default()
+    };
+    let out = render_one(o, 200, 50);
+    let c = |x| out.pixel(x, 25).unwrap().demultiply();
+    assert!(c(5).red() > 230 && c(5).green() < 30, "red at the start");
+    assert!(c(100).green() > 230 && c(100).red() < 30, "green in the middle");
+    assert!(c(195).blue() > 230 && c(195).green() < 30, "blue at the end");
+}
+
+#[test]
+fn multiply_blend_darkens_what_is_underneath() {
+    let mut d = Document::new(100, 100);
+    let mut a = Object::new(1, ShapeKind::Rect { corner: 0.0 }, 0.0, 0.0, 100.0, 100.0);
+    a.fill.a = [255, 0, 0, 255];
+    let mut b = Object::new(2, ShapeKind::Rect { corner: 0.0 }, 50.0, 0.0, 50.0, 100.0);
+    b.fill.a = [0, 0, 255, 255];
+    b.blend = Blend::Multiply;
+    d.objects = vec![a, b];
+    let out = Renderer::default().render(&d);
+    let p = out.pixel(75, 50).unwrap().demultiply();
+    assert!(p.red() < 20 && p.blue() < 20, "red × blue = black: {p:?}");
+    let q = out.pixel(25, 50).unwrap().demultiply();
+    assert!(q.red() > 240, "untouched part stays red");
+}
+
+#[test]
+fn colour_adjustments_shift_hue_saturation_and_levels() {
+    let red = |adjust: Adjust| {
+        let mut o = Object::new(1, ShapeKind::Rect { corner: 0.0 }, 0.0, 0.0, 40.0, 40.0);
+        o.fill.a = [200, 40, 40, 255];
+        o.adjust = adjust;
+        render_one(o, 40, 40).pixel(20, 20).unwrap().demultiply()
+    };
+    let green = red(Adjust { hue: 120.0, ..Default::default() });
+    assert!(green.green() > 150 && green.red() < 80, "hue +120: red becomes green {green:?}");
+    let grey = red(Adjust { saturation: -1.0, ..Default::default() });
+    assert!((grey.red() as i32 - grey.blue() as i32).abs() < 4, "no colour left {grey:?}");
+    let dark = red(Adjust { black: 0.5, ..Default::default() });
+    // black point 0.5: 0.78 -> (0.78 - 0.5) / 0.5 = 0.57 (145); 0.16 -> 0
+    assert!(dark.green() == 0 && (dark.red() as i32 - 145).abs() <= 2, "levels crush the shadows {dark:?}");
+}

@@ -50,6 +50,7 @@ Styles: `none watercolor oil impressionist pointillism pencil colorpencil comic`
 | F | Freehand closed shape (becomes a smooth vector curve). |
 | T | Text. Edit the text and font in the properties panel. |
 | B | Brush. Paints into the selected object, or into a new paint layer. Alt+click picks a colour. |
+| G | Gradient. Drag across an object to lay its fill gradient (linear or radial), then drag the handles. Add, move and recolour stops on the gradient bar in Fill. |
 | X | Transparency. Drag across an object to fade it: opaque where you start, transparent where you let go (linear or radial). Drag the two handles to adjust. |
 | L | Lights. Click an object to add a point light, spotlight or distant light; drag the lamp to move it, the spotlight's diamond to aim it. |
 
@@ -83,6 +84,9 @@ Styles: `none watercolor oil impressionist pointillism pencil colorpencil comic`
   the match, and Alt bypasses snapping. **Rulers**: drag from a ruler to make a guide, drop it back
   to remove it. **Arrange** (properties panel): align left, centre, right, top, middle or bottom (a
   single object aligns to the canvas), and give 3+ objects equal spacing.
+- **Blend modes and colour adjustments** per object: 16 blend modes (multiply, screen, overlay, soft
+  light, colour…) plus non-destructive hue, saturation, lightness, contrast and levels (black point,
+  white point, midtones).
 - **NPR per object and stacked looks**: every object can follow the document's look, stay clean, or
   get its own look (properties › NPR look). The look bar can layer up to three looks, such as
   watercolor washes with comic-ink outlines on top. Strokes spill slightly past an object's edges,

@@ -2,7 +2,7 @@
 //! point / spot / distant lights, transparency, paint outlines, drop shadow and outer glow.
 
 use crate::doc::{
-    Bevel, BevelProfile, Effects, Light, LightKind, Lighting, StrokePos, StrokeStyle, Transparency,
+    Adjust, Bevel, BevelProfile, Effects, Light, LightKind, Lighting, StrokePos, StrokeStyle, Transparency,
     TransparencyKind,
 };
 use crate::geom::Pt;
@@ -339,6 +339,77 @@ pub fn apply_lights(pm: &mut Pixmap, lighting: &Lighting, height: Option<&[f32]>
                 let v = (c * diff[k] + spec[k]).clamp(0.0, 1.0);
                 data[p + k] = (v * a * 255.0 + 0.5) as u8;
             }
+        }
+    }
+}
+
+fn rgb_to_hsl(r: f32, g: f32, b: f32) -> (f32, f32, f32) {
+    let max = r.max(g).max(b);
+    let min = r.min(g).min(b);
+    let l = (max + min) * 0.5;
+    if max - min < 1e-6 {
+        return (0.0, 0.0, l);
+    }
+    let d = max - min;
+    let s = if l > 0.5 { d / (2.0 - max - min) } else { d / (max + min) };
+    let h = if max == r {
+        (g - b) / d + if g < b { 6.0 } else { 0.0 }
+    } else if max == g {
+        (b - r) / d + 2.0
+    } else {
+        (r - g) / d + 4.0
+    };
+    (h * 60.0, s, l)
+}
+
+fn hsl_to_rgb(h: f32, s: f32, l: f32) -> (f32, f32, f32) {
+    if s <= 0.0 {
+        return (l, l, l);
+    }
+    let q = if l < 0.5 { l * (1.0 + s) } else { l + s - l * s };
+    let p = 2.0 * l - q;
+    let hk = h.rem_euclid(360.0) / 360.0;
+    let f = |t: f32| {
+        let t = t.rem_euclid(1.0);
+        if t < 1.0 / 6.0 {
+            p + (q - p) * 6.0 * t
+        } else if t < 0.5 {
+            q
+        } else if t < 2.0 / 3.0 {
+            p + (q - p) * (2.0 / 3.0 - t) * 6.0
+        } else {
+            p
+        }
+    };
+    (f(hk + 1.0 / 3.0), f(hk), f(hk - 1.0 / 3.0))
+}
+
+/// Levels, hue / saturation / lightness and contrast on the object's own pixels.
+pub fn apply_adjust(pm: &mut Pixmap, a: &Adjust) {
+    let range = (a.white - a.black).max(0.01);
+    let inv_gamma = 1.0 / a.gamma.clamp(0.1, 10.0);
+    let c = a.contrast.clamp(-1.0, 0.99);
+    let contrast = (1.0 + c) / (1.0 - c);
+    for px in pm.data_mut().chunks_exact_mut(4) {
+        let alpha = px[3] as f32 / 255.0;
+        if alpha <= 0.0 {
+            continue;
+        }
+        let mut v = [0.0f32; 3];
+        for k in 0..3 {
+            let x = (px[k] as f32 / 255.0 / alpha).min(1.0);
+            v[k] = ((x - a.black) / range).clamp(0.0, 1.0).powf(inv_gamma);
+        }
+        if a.hue != 0.0 || a.saturation != 0.0 || a.lightness != 0.0 {
+            let (h, s, l) = rgb_to_hsl(v[0], v[1], v[2]);
+            let s = (s * (1.0 + a.saturation)).clamp(0.0, 1.0);
+            let l = if a.lightness > 0.0 { l + (1.0 - l) * a.lightness } else { l * (1.0 + a.lightness) };
+            let (r, g, b) = hsl_to_rgb(h + a.hue, s, l.clamp(0.0, 1.0));
+            v = [r, g, b];
+        }
+        for k in 0..3 {
+            let x = ((v[k] - 0.5) * contrast + 0.5).clamp(0.0, 1.0);
+            px[k] = (x * alpha * 255.0 + 0.5) as u8;
         }
     }
 }

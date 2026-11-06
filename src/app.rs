@@ -26,12 +26,13 @@ pub enum Tool {
     Freehand,
     Text,
     Brush,
+    Gradient,
     Transparency,
     Light,
 }
 
 impl Tool {
-    const ALL: [Tool; 12] = [
+    const ALL: [Tool; 13] = [
         Tool::Select,
         Tool::Node,
         Tool::Perspective,
@@ -42,6 +43,7 @@ impl Tool {
         Tool::Freehand,
         Tool::Text,
         Tool::Brush,
+        Tool::Gradient,
         Tool::Transparency,
         Tool::Light,
     ];
@@ -57,6 +59,7 @@ impl Tool {
             Tool::Freehand => "Freehand shape  (F)",
             Tool::Text => "Text  (T)",
             Tool::Brush => "Brush  (B)",
+            Tool::Gradient => "Gradient  (G)",
             Tool::Transparency => "Transparency  (X)",
             Tool::Light => "Lights  (L)",
         }
@@ -73,6 +76,7 @@ impl Tool {
             Tool::Freehand => egui::Key::F,
             Tool::Text => egui::Key::T,
             Tool::Brush => egui::Key::B,
+            Tool::Gradient => egui::Key::G,
             Tool::Transparency => egui::Key::X,
             Tool::Light => egui::Key::L,
         }
@@ -89,6 +93,7 @@ impl Tool {
             Tool::Freehand => "Draw a closed freehand shape — it becomes a smooth vector curve.",
             Tool::Text => "Click or drag a box to place text, then edit it in the properties panel.",
             Tool::Brush => "Paint on the selected object (clipped to its shape) or on a new paint layer. Alt+click picks a colour.",
+            Tool::Gradient => "Drag across an object to lay its gradient: first colour where you start, last where you let go. Drag the handles to adjust; edit colours in Fill.",
             Tool::Transparency => "Drag across an object to fade it out: from opaque where you start to transparent where you let go. Drag the two handles to adjust.",
             Tool::Light => "Click an object to add a light there (type in the tool panel). Drag a lamp to move it, a spotlight's diamond to aim it.",
         }
@@ -106,6 +111,9 @@ enum Drag {
     TransNew { id: u64, q0: [f32; 2] },
     /// Moving the start (0) or end (1) handle of the fade.
     TransHandle { id: u64, which: usize },
+    /// Fill gradient being dragged out, or one of its two handles being moved.
+    GradNew { id: u64, q0: [f32; 2] },
+    GradHandle { id: u64, which: usize },
     LightPos { id: u64, idx: usize },
     LightTarget { id: u64, idx: usize },
     LightDir { id: u64, idx: usize },
@@ -316,6 +324,83 @@ fn doc_to_layer(obj: &Object, p: Pt, lw: u32, lh: u32) -> Option<((f32, f32), f3
     Some((((lx * kx) as f32, (ly * ky) as f32), ((sx + sy) * 0.5) as f32))
 }
 
+/// A gradient bar: click it to add a colour stop, drag the markers below it to move stops,
+/// click a marker to pick its colour.
+fn gradient_editor(ui: &mut egui::Ui, f: &mut FillStyle) {
+    let id = ui.make_persistent_id("gradient_editor");
+    let mut stops = f.stops.clone();
+    if stops.len() < 2 {
+        stops = vec![(0.0, f.a), (1.0, f.b)];
+    }
+    let mut sel: usize = ui.data(|d| d.get_temp(id)).unwrap_or(0).min(stops.len() - 1);
+    let mut changed = false;
+    let width = ui.available_width().min(270.0);
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(width, 20.0), Sense::click());
+    let painter = ui.painter_at(rect.expand2(Vec2::new(8.0, 16.0)));
+    // the bar itself (drawn from the current stops)
+    let preview = FillStyle { stops: stops.clone(), ..f.clone() };
+    let n = 64;
+    for i in 0..n {
+        let t0 = i as f32 / n as f32;
+        let c = preview.color_at(t0 + 0.5 / n as f32);
+        let r = Rect::from_min_max(
+            Pos2::new(rect.left() + t0 * rect.width(), rect.top()),
+            Pos2::new(rect.left() + (t0 + 1.0 / n as f32) * rect.width() + 0.5, rect.bottom()),
+        );
+        painter.rect_filled(r, 0.0, Color32::from_rgba_unmultiplied(c[0], c[1], c[2], c[3]));
+    }
+    if resp.clicked() {
+        if let Some(p) = resp.interact_pointer_pos() {
+            let t = ((p.x - rect.left()) / rect.width()).clamp(0.0, 1.0);
+            stops.push((t, preview.color_at(t)));
+            sel = stops.len() - 1;
+            changed = true;
+        }
+    }
+    let marker_row = ui.allocate_space(Vec2::new(width, 14.0)).1;
+    for (i, (pos, col)) in stops.clone().iter().enumerate() {
+        let x = rect.left() + pos * rect.width();
+        let r = Rect::from_center_size(Pos2::new(x, marker_row.top() + 7.0), Vec2::new(12.0, 14.0));
+        let mr = ui.interact(r, id.with(i), Sense::click_and_drag());
+        if mr.clicked() || mr.drag_started() {
+            sel = i;
+        }
+        if mr.dragged() {
+            if let Some(p) = mr.interact_pointer_pos() {
+                stops[i].0 = ((p.x - rect.left()) / rect.width()).clamp(0.0, 1.0);
+                changed = true;
+            }
+        }
+        let tip = Pos2::new(x, marker_row.top());
+        let fill = Color32::from_rgb(col[0], col[1], col[2]);
+        painter.add(Shape::convex_polygon(
+            vec![tip, Pos2::new(x + 6.0, marker_row.top() + 12.0), Pos2::new(x - 6.0, marker_row.top() + 12.0)],
+            fill,
+            Stroke::new(if i == sel { 2.0_f32 } else { 1.0_f32 }, if i == sel { Color32::WHITE } else { Color32::BLACK }),
+        ));
+    }
+    ui.horizontal(|ui| {
+        if let Some(stop) = stops.get_mut(sel) {
+            if ui.color_edit_button_srgba_unmultiplied(&mut stop.1).changed() {
+                changed = true;
+            }
+            ui.label(format!("stop at {:.0}%", stop.0 * 100.0));
+        }
+        if stops.len() > 2 && ui.small_button("Remove stop").clicked() {
+            stops.remove(sel);
+            sel = sel.saturating_sub(1);
+            changed = true;
+        }
+    });
+    ui.data_mut(|d| d.insert_temp(id, sel));
+    if changed {
+        f.stops = stops;
+        let sorted = f.gradient_stops();
+        f.a = sorted[0].1;
+        f.b = sorted[sorted.len() - 1].1;
+    }
+}
+
 /// Style, strength, brush size, paper and a "Vary" button for one look.
 fn look_controls(ui: &mut egui::Ui, id: impl std::hash::Hash, s: &mut NprSettings) {
     egui::ComboBox::from_id_salt(id).selected_text(s.style.label()).show_ui(ui, |ui| {
@@ -367,6 +452,8 @@ pub struct JabroApp {
     list_drag: Option<Vec<u64>>,
     /// Fade type a Transparency-tool drag creates.
     trans_kind: TransparencyKind,
+    /// Gradient type a Gradient-tool drag creates.
+    grad_kind: FillKind,
     /// Light type a Lights-tool click adds, and the light being edited.
     new_light_kind: LightKind,
     light_sel: Option<usize>,
@@ -470,6 +557,7 @@ impl JabroApp {
             focus_text: false,
             list_drag: None,
             trans_kind: TransparencyKind::Linear,
+            grad_kind: FillKind::Linear,
             new_light_kind: LightKind::Point,
             light_sel: None,
             bg_tol: 0.15,
@@ -1627,6 +1715,7 @@ impl JabroApp {
             Tool::Node => self.press_node(p, sp),
             Tool::Pen => self.press_pen(p, sp),
             Tool::Transparency => self.press_transparency(p, sp),
+            Tool::Gradient => self.press_gradient(p, sp),
             Tool::Light => self.press_light(p, sp),
             Tool::Rect | Tool::Ellipse | Tool::Polygon | Tool::Text => {
                 self.drag = Drag::Create { start: p, cur: p }
@@ -1745,6 +1834,30 @@ impl JabroApp {
         // nothing changes until the mouse actually moves (a plain click only selects)
         self.drag = match self.doc.find(id).and_then(|o| Self::doc_to_norm(o, p)) {
             Some(q0) => Drag::TransNew { id, q0 },
+            None => Drag::None,
+        };
+    }
+
+    fn press_gradient(&mut self, p: Pt, sp: Pos2) {
+        if let Some(o) = self.selected.and_then(|id| self.doc.find(id)) {
+            if let (Some((p0, p1)), FillKind::Linear | FillKind::Radial) = (o.fill.points, o.fill.kind) {
+                for (which, q) in [(1, p1), (0, p0)] {
+                    if self.norm_to_screen(o, q).is_some_and(|s| s.distance(sp) < 10.0) {
+                        self.drag = Drag::GradHandle { id: o.id, which };
+                        return;
+                    }
+                }
+            }
+        }
+        let Some(id) = self.hit_test(p).or(self.selected) else {
+            self.drag = Drag::None;
+            return;
+        };
+        if self.selected != Some(id) {
+            self.select_only(Some(id));
+        }
+        self.drag = match self.doc.find(id).and_then(|o| Self::doc_to_norm(o, p)) {
+            Some(q0) => Drag::GradNew { id, q0 },
             None => Drag::None,
         };
     }
@@ -2712,6 +2825,40 @@ impl JabroApp {
                 }
                 Drag::TransNew { id, q0 }
             }
+            Drag::GradNew { id, q0 } => {
+                let start_screen = self.doc.find(id).and_then(|o| self.norm_to_screen(o, q0));
+                if start_screen.is_some_and(|s| s.distance(self.to_screen(p)) > 4.0) {
+                    self.commit_snapshot();
+                    let (kind, a, b) = (self.grad_kind, self.color_a, self.color_b);
+                    if let Some(o) = self.doc.find_mut(id) {
+                        if let Some(q) = Self::doc_to_norm(o, p) {
+                            let f = &mut o.fill;
+                            if !matches!(f.kind, FillKind::Linear | FillKind::Radial) {
+                                f.kind = kind;
+                                if f.stops.len() < 2 {
+                                    f.a = a;
+                                    f.b = b;
+                                }
+                            }
+                            f.points = Some((q0, q));
+                            o.touch();
+                        }
+                    }
+                    self.dirty = true;
+                }
+                Drag::GradNew { id, q0 }
+            }
+            Drag::GradHandle { id, which } => {
+                self.commit_snapshot();
+                if let Some(o) = self.doc.find_mut(id) {
+                    if let (Some(q), Some((p0, p1))) = (Self::doc_to_norm(o, p), o.fill.points) {
+                        o.fill.points = Some(if which == 0 { (q, p1) } else { (p0, q) });
+                        o.touch();
+                    }
+                }
+                self.dirty = true;
+                Drag::GradHandle { id, which }
+            }
             Drag::TransHandle { id, which } => {
                 self.commit_snapshot();
                 if let Some(o) = self.doc.find_mut(id) {
@@ -3665,6 +3812,15 @@ impl JabroApp {
                     });
                 }
             }
+            Tool::Gradient => {
+                ui.strong("Gradient");
+                ui.label("Dragging creates a:");
+                ui.horizontal(|ui| {
+                    ui.radio_value(&mut self.grad_kind, FillKind::Linear, "Linear");
+                    ui.radio_value(&mut self.grad_kind, FillKind::Radial, "Radial");
+                });
+                ui.small("New gradients use your two colours. Add more colours in the Fill section's gradient bar.");
+            }
             Tool::Transparency => {
                 ui.strong("Transparency");
                 ui.label("Dragging creates a:");
@@ -4497,6 +4653,9 @@ impl JabroApp {
         if self.tool == Tool::Transparency {
             self.draw_transparency_overlay(painter);
         }
+        if self.tool == Tool::Gradient {
+            self.draw_gradient_overlay(painter);
+        }
         if self.tool == Tool::Light {
             self.draw_light_overlay(painter);
         }
@@ -4651,6 +4810,29 @@ impl JabroApp {
             .collect()
     }
 
+    fn draw_gradient_overlay(&self, painter: &egui::Painter) {
+        let Some(o) = self.selected.and_then(|id| self.doc.find(id)) else { return };
+        let f = &o.fill;
+        let (Some((p0, p1)), FillKind::Linear | FillKind::Radial) = (f.points, f.kind) else { return };
+        let (Some(a), Some(b)) = (self.norm_to_screen(o, p0), self.norm_to_screen(o, p1)) else { return };
+        painter.line_segment([a, b], Stroke::new(3.0_f32, Color32::from_black_alpha(140)));
+        painter.line_segment([a, b], Stroke::new(1.5_f32, Color32::WHITE));
+        if f.kind == FillKind::Radial {
+            let c = Pt::new(p0[0] * o.size[0], p0[1] * o.size[1]);
+            let e = Pt::new(p1[0] * o.size[0], p1[1] * o.size[1]);
+            let ring = self.local_circle_screen(o, c, c.dist(e));
+            painter.add(Shape::closed_line(ring, Stroke::new(1.0_f32, Color32::WHITE)));
+        }
+        // colour stops along the line
+        for (t, col) in f.gradient_stops() {
+            let pos = a + (b - a) * t;
+            let c = Color32::from_rgb(col[0], col[1], col[2]);
+            let r = if t <= 0.0 || t >= 1.0 { 8.0 } else { 5.0 };
+            painter.circle_filled(pos, r, c);
+            painter.circle_stroke(pos, r, Stroke::new(2.0_f32, Color32::WHITE));
+        }
+    }
+
     fn draw_transparency_overlay(&self, painter: &egui::Painter) {
         let Some(o) = self.selected.and_then(|id| self.doc.find(id)) else { return };
         let t = &o.transparency;
@@ -4802,6 +4984,16 @@ fn object_props(
         ui.text_edit_singleline(&mut obj.name);
     });
     ui.add(egui::Slider::new(&mut obj.opacity, 0.0..=1.0).text("Opacity"));
+    ui.horizontal(|ui| {
+        ui.label("Blend");
+        egui::ComboBox::from_id_salt("obj_blend")
+            .selected_text(obj.blend.label())
+            .show_ui(ui, |ui| {
+                for b in Blend::ALL {
+                    ui.selectable_value(&mut obj.blend, b, b.label());
+                }
+            });
+    });
     if obj.instance_of.is_some() {
         ui.horizontal_wrapped(|ui| {
             ui.label("Linked clone — changes here update every copy.");
@@ -4927,11 +5119,23 @@ fn object_props(
                 FillKind::None => {}
                 FillKind::Solid => rgba_label(ui, "Colour", &mut obj.fill.a),
                 FillKind::Linear | FillKind::Radial => {
-                    rgba_label(ui, "Start colour", &mut obj.fill.a);
-                    rgba_label(ui, "End colour", &mut obj.fill.b);
-                    if obj.fill.kind == FillKind::Linear {
-                        ui.add(egui::Slider::new(&mut obj.fill.angle, 0.0..=360.0).text("Angle"));
+                    gradient_editor(ui, &mut obj.fill);
+                    match obj.fill.points {
+                        None if obj.fill.kind == FillKind::Linear => {
+                            ui.add(egui::Slider::new(&mut obj.fill.angle, 0.0..=360.0).text("Angle"));
+                        }
+                        Some(_) => {
+                            if ui
+                                .small_button("Reset direction")
+                                .on_hover_text("Back to a gradient across the whole object")
+                                .clicked()
+                            {
+                                obj.fill.points = None;
+                            }
+                        }
+                        None => {}
                     }
+                    ui.small("Drag across the object with the Gradient tool (G) to set its direction.");
                 }
                 FillKind::Texture => {
                     egui::ComboBox::from_id_salt("tex_kind")
@@ -5128,6 +5332,26 @@ fn object_props(
         ui.add(egui::Slider::new(&mut b.shininess, 2.0..=120.0).logarithmic(true).text("Shininess"));
         ui.add(egui::Slider::new(&mut b.reflection, 0.0..=1.0).text("Chrome reflection"));
     });
+
+    egui::CollapsingHeader::new("Colour adjustments")
+        .default_open(!obj.adjust.is_identity())
+        .show(ui, |ui| {
+            let a = &mut obj.adjust;
+            ui.add(egui::Slider::new(&mut a.hue, -180.0..=180.0).text("Hue"));
+            ui.add(egui::Slider::new(&mut a.saturation, -1.0..=1.0).text("Saturation"));
+            ui.add(egui::Slider::new(&mut a.lightness, -1.0..=1.0).text("Lightness"));
+            ui.add(egui::Slider::new(&mut a.contrast, -1.0..=0.9).text("Contrast"));
+            ui.label("Levels");
+            ui.add(egui::Slider::new(&mut a.black, 0.0..=0.9).text("Black point"));
+            ui.add(egui::Slider::new(&mut a.white, 0.1..=1.0).text("White point"));
+            ui.add(egui::Slider::new(&mut a.gamma, 0.2..=4.0).logarithmic(true).text("Midtones"));
+            if a.white <= a.black + 0.05 {
+                a.white = (a.black + 0.05).min(1.0);
+            }
+            if !a.is_identity() && ui.small_button("Reset").clicked() {
+                *a = Adjust::default();
+            }
+        });
 
     let lit = obj.effects.lighting.enabled;
     egui::CollapsingHeader::new("Lights").default_open(lit).show(ui, |ui| {
@@ -5979,6 +6203,26 @@ mod tests {
         // tests never touch the real settings, recovery files or recent list
         let app = app_with(vec![]);
         assert!(!app.persist && !app.system_clipboard);
+    }
+
+    #[test]
+    fn gradient_tool_drag_lays_a_gradient() {
+        let mut app = app_with(vec![rect(1, 100.0, 100.0)]);
+        app.tool = Tool::Gradient;
+        app.color_a = [255, 0, 0, 255];
+        app.color_b = [0, 0, 255, 255];
+        drag(&mut app, Pt::new(110.0, 150.0), Pt::new(190.0, 150.0), Modifiers::NONE);
+        let f = &app.doc.objects[0].fill;
+        assert_eq!(f.kind, FillKind::Linear);
+        assert_eq!((f.a, f.b), ([255, 0, 0, 255], [0, 0, 255, 255]));
+        let (p0, p1) = f.points.unwrap();
+        assert!((p0[0] - 0.1).abs() < 1e-3 && (p1[0] - 0.9).abs() < 1e-3);
+        drag(&mut app, Pt::new(190.0, 150.0), Pt::new(150.0, 110.0), Modifiers::NONE); // move the end
+        let (_, p1) = app.doc.objects[0].fill.points.unwrap();
+        assert!((p1[0] - 0.5).abs() < 1e-3 && (p1[1] - 0.1).abs() < 1e-3);
+        app.undo();
+        app.undo();
+        assert_eq!(app.doc.objects[0].fill.kind, FillKind::Solid);
     }
 
     #[test]

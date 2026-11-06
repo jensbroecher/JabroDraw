@@ -51,30 +51,42 @@ fn fill_shader_paint<'a>(
     match fill.kind {
         FillKind::None => return None,
         FillKind::Solid => paint.set_color(color(fill.a)),
-        FillKind::Linear => {
-            let a = fill.angle.to_radians();
-            let (dx, dy) = (a.cos(), a.sin());
-            let half = 0.5 * ((w * dx).abs() + (h * dy).abs()).max(1.0);
-            let s = Point::from_xy(c.x - dx * half, c.y - dy * half);
-            let e = Point::from_xy(c.x + dx * half, c.y + dy * half);
-            paint.shader = LinearGradient::new(
-                s,
-                e,
-                vec![GradientStop::new(0.0, color(fill.a)), GradientStop::new(1.0, color(fill.b))],
-                SpreadMode::Pad,
-                Transform::identity(),
-            )?;
-        }
-        FillKind::Radial => {
-            let r = 0.5 * (w * w + h * h).sqrt();
-            paint.shader = RadialGradient::new(
-                c,
-                c,
-                r.max(1.0),
-                vec![GradientStop::new(0.0, color(fill.a)), GradientStop::new(1.0, color(fill.b))],
-                SpreadMode::Pad,
-                Transform::identity(),
-            )?;
+        FillKind::Linear | FillKind::Radial => {
+            let stops: Vec<GradientStop> = fill
+                .gradient_stops()
+                .iter()
+                .map(|(p, c)| GradientStop::new(p.clamp(0.0, 1.0), color(*c)))
+                .collect();
+            let local = |q: [f32; 2]| Point::from_xy(pad + q[0] * w, pad + q[1] * h);
+            let shader = if fill.kind == FillKind::Linear {
+                let (s, e) = match fill.points {
+                    Some((p0, p1)) => (local(p0), local(p1)),
+                    None => {
+                        let a = fill.angle.to_radians();
+                        let (dx, dy) = (a.cos(), a.sin());
+                        let half = 0.5 * ((w * dx).abs() + (h * dy).abs()).max(1.0);
+                        (
+                            Point::from_xy(c.x - dx * half, c.y - dy * half),
+                            Point::from_xy(c.x + dx * half, c.y + dy * half),
+                        )
+                    }
+                };
+                LinearGradient::new(s, e, stops, SpreadMode::Pad, Transform::identity())
+            } else {
+                let (center, r) = match fill.points {
+                    Some((p0, p1)) => {
+                        let (a, b) = (local(p0), local(p1));
+                        (a, ((b.x - a.x).powi(2) + (b.y - a.y).powi(2)).sqrt())
+                    }
+                    None => (c, 0.5 * (w * w + h * h).sqrt()),
+                };
+                RadialGradient::new(center, center, r.max(1.0), stops, SpreadMode::Pad, Transform::identity())
+            };
+            // a zero-length gradient: just the first colour
+            match shader {
+                Some(s) => paint.shader = s,
+                None => paint.set_color(color(fill.gradient_stops()[0].1)),
+            }
         }
         FillKind::Texture => {
             let (t, ts) = tex?;
@@ -231,7 +243,10 @@ pub fn render_local(obj: &Object, light: [f32; 3], ex: Pt, ey: Pt) -> (Pixmap, f
         effects::apply_lights(&mut pm, &obj.effects.lighting, heights.as_deref(), &frame);
     }
 
-    // 6. transparency
+    // 6. colour adjustments, then transparency
+    if !obj.adjust.is_identity() {
+        effects::apply_adjust(&mut pm, &obj.adjust);
+    }
     effects::apply_transparency(&mut pm, &obj.transparency, &frame, (obj.id as u32).wrapping_mul(31));
     (pm, pad)
 }
@@ -391,7 +406,7 @@ impl Renderer {
             {
                 let paint = PixmapPaint {
                     opacity: obj.opacity.clamp(0.0, 1.0),
-                    blend_mode: BlendMode::SourceOver,
+                    blend_mode: obj.blend.to_skia(),
                     quality: FilterQuality::Nearest,
                 };
                 out.draw_pixmap(*x, *y, lp.as_ref(), &paint, Transform::identity(), None);
@@ -441,7 +456,7 @@ impl Renderer {
             if let (Some(run), Some(Entry { layer: Some((lp, x, y)), .. })) = (runs.last_mut(), self.cache.get(&obj.id)) {
                 let paint = PixmapPaint {
                     opacity: obj.opacity.clamp(0.0, 1.0),
-                    blend_mode: BlendMode::SourceOver,
+                    blend_mode: obj.blend.to_skia(),
                     quality: FilterQuality::Nearest,
                 };
                 run.layer.draw_pixmap(*x, *y, lp.as_ref(), &paint, Transform::identity(), None);
