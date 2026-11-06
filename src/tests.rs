@@ -965,3 +965,19 @@ fn npr_preview_is_close_to_the_full_look() {
     let mean = total / n;
     assert!(mean < 12.0, "preview differs by {mean} per channel on average");
 }
+
+#[test]
+fn the_icon_has_every_size_and_reads_at_16_px() {
+    let images: Vec<(u32, Pixmap)> = crate::icon::SIZES.iter().map(|&s| (s, crate::icon::render(s).unwrap())).collect();
+    let ico = crate::icon::ico_bytes(&images).unwrap();
+    assert_eq!(u16::from_le_bytes([ico[4], ico[5]]) as usize, crate::icon::SIZES.len());
+    // the 256 px entry is a PNG, the small ones are 32-bit bitmaps
+    let off = |i: usize| u32::from_le_bytes(ico[6 + i * 16 + 12..6 + i * 16 + 16].try_into().unwrap()) as usize;
+    assert_eq!(&ico[off(0)..off(0) + 4], b"\x89PNG");
+    assert_eq!(u32::from_le_bytes(ico[off(7)..off(7) + 4].try_into().unwrap()), 40);
+    // at 16 px: transparent corners, a coloured tile and a light J in the middle
+    let small = &images.last().unwrap().1;
+    assert_eq!(small.pixel(0, 0).unwrap().alpha(), 0);
+    let mid = small.pixel(9, 8).unwrap().demultiply();
+    assert!(mid.alpha() == 255 && mid.green() > 180, "light letter in the middle: {mid:?}");
+}

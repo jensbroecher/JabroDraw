@@ -16,6 +16,7 @@ mod effects;
 mod export;
 mod fonts;
 mod geom;
+mod icon;
 mod imageops;
 mod io;
 mod npr;
@@ -45,6 +46,15 @@ fn main() -> eframe::Result {
         return Ok(());
     }
 
+    // Icon artwork: jabro-draw --make-icon assets
+    if args.len() >= 3 && args[1] == "--make-icon" {
+        if let Err(e) = icon::make_icon(std::path::Path::new(&args[2])) {
+            eprintln!("icon failed: {e}");
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
+
     // Headless AI cut-out: jabro-draw --ai-cutout in.jpg out.png [fast|best]
     if args.len() >= 4 && args[1] == "--ai-cutout" {
         let model = if args.get(4).map(|s| s.as_str()) == Some("fast") { ai::AiModel::Fast } else { ai::AiModel::Best };
@@ -55,14 +65,16 @@ fn main() -> eframe::Result {
         return Ok(());
     }
 
-    let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_title("Jabro Draw")
-            .with_inner_size([1500.0, 950.0])
-            .with_min_inner_size([900.0, 600.0])
-            .with_drag_and_drop(true),
-        ..Default::default()
-    };
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_title("Jabro Draw")
+        .with_inner_size([1500.0, 950.0])
+        .with_min_inner_size([900.0, 600.0])
+        .with_drag_and_drop(true);
+    if let Ok(img) = image::load_from_memory(include_bytes!("../assets/icon-256.png")) {
+        let img = img.to_rgba8();
+        viewport = viewport.with_icon(egui::IconData { width: img.width(), height: img.height(), rgba: img.into_raw() });
+    }
+    let options = eframe::NativeOptions { viewport, ..Default::default() };
     eframe::run_native(
         "Jabro Draw",
         options,
