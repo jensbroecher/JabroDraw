@@ -159,6 +159,8 @@ enum PropAction {
     ResetBrushWork,
     AiRemoveBackground,
     Trace,
+    Upscale(u32),
+    CancelUpscale,
     Detach,
     CopyStyle,
     PasteStyle,
@@ -267,6 +269,51 @@ struct PictureUi {
     ai_model: AiModel,
     ai_busy: bool,
     trace: crate::trace::TraceSettings,
+    /// AI upscaling of this picture in progress: (tiles done, tiles in all).
+    upscale: Option<(u32, u32)>,
+    /// Largest factor the picture can still be enlarged by (0 = none).
+    upscale_max: u32,
+}
+
+/// What the AI object select does with the object it finds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SelectMode {
+    /// Hide everything except the object.
+    Keep,
+    /// Hide the object.
+    Hide,
+    /// Copy the object out into a new picture object.
+    Copy,
+}
+
+impl SelectMode {
+    const ALL: [SelectMode; 3] = [SelectMode::Keep, SelectMode::Hide, SelectMode::Copy];
+    fn label(self) -> &'static str {
+        match self {
+            SelectMode::Keep => "Keep only it (hide the rest)",
+            SelectMode::Hide => "Hide it",
+            SelectMode::Copy => "Copy it out as a new object",
+        }
+    }
+}
+
+/// Clicks on one picture that refine the same AI selection (Shift / Alt+click).
+struct SelectSession {
+    id: u64,
+    img: Arc<Pixmap>,
+    points: Vec<crate::sam::Point>,
+    /// The picture's transparency before the first click, so refining starts from it again.
+    base_mask: Option<Arc<Pixmap>>,
+    mode: SelectMode,
+    /// Object made by Copy mode (replaced when the selection is refined).
+    copy_id: Option<u64>,
+}
+
+/// Mask value (0..1) of `mask` at picture pixel (x, y) of a `w` x `h` picture.
+fn mask_at(mask: &Pixmap, x: usize, y: usize, w: usize, h: usize) -> f32 {
+    let (mw, mh) = (mask.width() as usize, mask.height() as usize);
+    let (mx, my) = ((x * mw / w.max(1)).min(mw - 1), (y * mh / h.max(1)).min(mh - 1));
+    mask.data()[(my * mw + mx) * 4] as f32 / 255.0
 }
 
 /// Undo all brush work on an object: pictures go back to how they were imported, other
@@ -493,6 +540,13 @@ pub struct JabroApp {
     trace_settings: crate::trace::TraceSettings,
     /// Object the AI is currently working on.
     ai_busy: Option<u64>,
+    select: crate::sam::SelectWorker,
+    select_mode: SelectMode,
+    select_session: Option<SelectSession>,
+    select_busy: bool,
+    upscaler: crate::upscale::UpscaleWorker,
+    /// Picture being enlarged: (object, tiles done, tiles in all, cancel flag).
+    upscale_busy: Option<(u64, u32, u32, Arc<std::sync::atomic::AtomicBool>)>,
     /// The document as it was last saved / opened (to detect unsaved changes).
     saved_doc: Document,
     close_dialog: bool,
@@ -582,6 +636,9 @@ impl JabroApp {
             NprWorker::new(move || ctx.request_repaint()),
             AiWorker::new(move || ctx2.request_repaint()),
         );
+        let (ctx3, ctx4) = (cc.egui_ctx.clone(), cc.egui_ctx.clone());
+        app.select = crate::sam::SelectWorker::new(move || ctx3.request_repaint());
+        app.upscaler = crate::upscale::UpscaleWorker::new(move || ctx4.request_repaint());
         app.settings = Settings::load();
         app.system_clipboard = true;
         app.persist = true;
@@ -619,6 +676,12 @@ impl JabroApp {
             ai_model: AiModel::Best,
             trace_settings: Default::default(),
             ai_busy: None,
+            select: crate::sam::SelectWorker::new(|| {}),
+            select_mode: SelectMode::Keep,
+            select_session: None,
+            select_busy: false,
+            upscaler: crate::upscale::UpscaleWorker::new(|| {}),
+            upscale_busy: None,
             saved_doc,
             close_dialog: false,
             allow_close: false,
@@ -2360,6 +2423,11 @@ impl JabroApp {
     }
 
     fn press_brush(&mut self, p: Pt, mods: Modifiers) {
+        if self.brush.kind == BrushKind::AiSelect {
+            self.drag = Drag::None;
+            self.press_ai_select(p, mods);
+            return;
+        }
         if mods.alt {
             if let Some(c) = self.pick_color(p) {
                 self.color_a = c;
@@ -2505,6 +2573,209 @@ impl JabroApp {
                         "Background removed. Touch up with the Brush tool's Transparency: hide / reveal.".into();
                 }
                 ai::AiEvent::Error(e) => self.status = format!("AI background removal failed: {e}"),
+            }
+        }
+    }
+
+    /// AI object select: a click on a picture asks the AI for the object under it.
+    /// Shift+click adds to the same selection, Alt+click takes a part away.
+    fn press_ai_select(&mut self, p: Pt, mods: Modifiers) {
+        let is_picture = |o: &Object| o.kind == ShapeKind::Bitmap && o.paint.is_some();
+        let mut target = self.hit_test(p).filter(|id| self.doc.find(*id).is_some_and(is_picture));
+        // clicking on the copy we just made refines the selection on its source picture
+        if let (Some(t), Some(s)) = (target, self.select_session.as_ref()) {
+            if s.copy_id == Some(t) {
+                target = Some(s.id);
+            }
+        }
+        let target = target.or(self.selected.filter(|id| self.doc.find(*id).is_some_and(is_picture)));
+        let Some(id) = target else {
+            self.status = "Click on an object in a picture (import one with Ctrl+I first).".into();
+            return;
+        };
+        let o = self.doc.find(id).expect("found");
+        let img = o.paint.clone().expect("picture");
+        let Some(((lx, ly), _)) = doc_to_layer(o, p, img.width(), img.height()) else { return };
+        if lx < 0.0 || ly < 0.0 || lx >= img.width() as f32 || ly >= img.height() as f32 {
+            self.status = "Click inside the picture.".into();
+            return;
+        }
+        let refine = mods.shift || mods.alt;
+        let same = self.select_session.as_ref().is_some_and(|s| s.id == id && Arc::ptr_eq(&s.img, &img));
+        if !(refine && same) {
+            self.select_session = Some(SelectSession {
+                id,
+                img: img.clone(),
+                points: Vec::new(),
+                base_mask: o.mask.clone(),
+                mode: self.select_mode,
+                copy_id: None,
+            });
+        }
+        let s = self.select_session.as_mut().expect("session");
+        s.points.push((lx, ly, !mods.alt));
+        if s.points.len() > 7 {
+            s.points.remove(0);
+        }
+        let points = s.points.clone();
+        self.select.submit(crate::sam::SelectJob { id, img, points });
+        self.select_busy = true;
+        if self.selected != Some(id) {
+            self.select_only(Some(id));
+        }
+        self.status = "Finding the object…".into();
+    }
+
+    fn poll_select(&mut self) {
+        while let Ok(ev) = self.select.rx.try_recv() {
+            match ev {
+                crate::sam::SelectEvent::Analysing => {
+                    self.status = "Analysing the picture — the first click on a picture takes a few seconds…".into()
+                }
+                crate::sam::SelectEvent::Mask { id, points, alpha, w, h } => {
+                    self.select_busy = false;
+                    let current = self.select_session.as_ref().is_some_and(|s| s.id == id && s.points.len() == points);
+                    if current {
+                        self.apply_selection(&alpha, w, h);
+                    }
+                }
+                crate::sam::SelectEvent::Error(e) => {
+                    self.select_busy = false;
+                    self.status = e;
+                }
+            }
+        }
+    }
+
+    fn apply_selection(&mut self, alpha: &[f32], w: u32, h: u32) {
+        let Some(s) = self.select_session.as_ref() else { return };
+        let (id, mode, img, base, old_copy) = (s.id, s.mode, s.img.clone(), s.base_mask.clone(), s.copy_id);
+        let Some(o) = self.doc.find(id) else { return };
+        if !o.paint.as_ref().is_some_and(|p| Arc::ptr_eq(p, &img)) || img.width() != w || img.height() != h {
+            return; // the picture changed meanwhile
+        }
+        let (wu, hu) = (w as usize, h as usize);
+        let base_at = |i: usize| base.as_ref().map_or(1.0, |m| mask_at(m, i % wu, i / wu, wu, hu));
+        self.checkpoint();
+        match mode {
+            SelectMode::Keep | SelectMode::Hide => {
+                let combined: Vec<f32> = (0..wu * hu)
+                    .map(|i| base_at(i) * if mode == SelectMode::Keep { alpha[i] } else { 1.0 - alpha[i] })
+                    .collect();
+                if let Some(o) = self.doc.find_mut(id) {
+                    o.mask = ai::alpha_to_mask(&combined, w, h).map(Arc::new);
+                    o.touch();
+                }
+                self.status = format!(
+                    "{} — Shift+click to add to it, Alt+click to take a part away. Ctrl+Z steps back.",
+                    if mode == SelectMode::Keep { "Kept the object, the rest is hidden" } else { "Object hidden" }
+                );
+            }
+            SelectMode::Copy => {
+                if let Some(c) = old_copy {
+                    self.doc.objects.retain(|o| o.id != c);
+                }
+                // the object's pixels, cropped to where the AI found it
+                let a: Vec<f32> = (0..wu * hu).map(|i| alpha[i] * base_at(i)).collect();
+                let (mut x0, mut y0, mut x1, mut y1) = (wu, hu, 0, 0);
+                for (i, &v) in a.iter().enumerate() {
+                    if v > 0.02 {
+                        let (x, y) = (i % wu, i / wu);
+                        (x0, y0, x1, y1) = (x0.min(x), y0.min(y), x1.max(x), y1.max(y));
+                    }
+                }
+                if x0 > x1 {
+                    self.status = "The AI found nothing there — try clicking more inside the object.".into();
+                    return;
+                }
+                let (cw, ch) = ((x1 - x0 + 1) as u32, (y1 - y0 + 1) as u32);
+                let Some(mut cut) = Pixmap::new(cw, ch) else { return };
+                let src = img.data();
+                for (k, d) in cut.data_mut().chunks_exact_mut(4).enumerate() {
+                    let (x, y) = (x0 + k % cw as usize, y0 + k / cw as usize);
+                    let i = y * wu + x;
+                    for c in 0..4 {
+                        d[c] = (src[i * 4 + c] as f32 * a[i] + 0.5) as u8;
+                    }
+                }
+                let o = self.doc.find(id).expect("found");
+                let (sx, sy) = (o.size[0] / w as f32, o.size[1] / h as f32);
+                let hm = o.homography();
+                let corner = |x: usize, y: usize| hm.apply_pt(Pt::new(x as f32 * sx, y as f32 * sy));
+                let corners = [corner(x0, y0), corner(x1 + 1, y0), corner(x1 + 1, y1 + 1), corner(x0, y1 + 1)];
+                let [Some(q0), Some(q1), Some(q2), Some(q3)] = corners else { return };
+                let name = format!("{} cut-out", if o.name.is_empty() { "Picture" } else { &o.name });
+                let nid = self.doc.alloc_id();
+                let mut c = Object::new(nid, ShapeKind::Bitmap, 0.0, 0.0, cw as f32 * sx, ch as f32 * sy);
+                c.quad = [q0, q1, q2, q3];
+                c.update_size_from_quad();
+                c.fill.kind = FillKind::None;
+                c.name = name;
+                let cut = Arc::new(cut);
+                c.original = Some(ImageData(cut.clone()));
+                c.paint = Some(cut);
+                let at = self.doc.index_of(id).map_or(self.doc.objects.len(), |i| i + 1);
+                self.doc.objects.insert(at, c);
+                if let Some(s) = self.select_session.as_mut() {
+                    s.copy_id = Some(nid);
+                }
+                self.status = "Copied out as a new object above the picture — Shift+click to add more of it, Alt+click to take a part away.".into();
+            }
+        }
+        self.dirty = true;
+    }
+
+    fn start_upscale(&mut self, id: u64, factor: u32) {
+        if self.upscale_busy.is_some() {
+            return;
+        }
+        let Some(img) = self.doc.find(id).and_then(|o| o.paint.clone()) else { return };
+        if !crate::upscale::fits(img.width(), img.height(), factor) {
+            self.status = format!("Too large to enlarge {factor}× (at most {} px per side).", crate::upscale::MAX_SIDE / factor);
+            return;
+        }
+        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        self.upscaler.submit(crate::upscale::UpscaleJob { id, img, factor, cancel: cancel.clone() });
+        self.upscale_busy = Some((id, 0, 1, cancel));
+        self.status = format!("Enlarging {factor}× with AI…");
+    }
+
+    fn poll_upscale(&mut self) {
+        while let Ok(ev) = self.upscaler.rx.try_recv() {
+            match ev {
+                crate::upscale::UpscaleEvent::Progress(d, n) => {
+                    if let Some(u) = self.upscale_busy.as_mut() {
+                        (u.1, u.2) = (d, n);
+                    }
+                }
+                crate::upscale::UpscaleEvent::Done { id, img } => {
+                    self.upscale_busy = None;
+                    if self.doc.find(id).is_none() {
+                        continue;
+                    }
+                    self.checkpoint();
+                    let (w, h) = (img.width(), img.height());
+                    if let Some(o) = self.doc.find_mut(id) {
+                        // painted transparency follows at the new resolution
+                        if let Some(m) = o.mask.clone() {
+                            let mut big = Pixmap::new(w, h).expect("size");
+                            let k = (w as f32 / m.width() as f32, h as f32 / m.height() as f32);
+                            let paint = tiny_skia::PixmapPaint { quality: tiny_skia::FilterQuality::Bilinear, ..Default::default() };
+                            big.draw_pixmap(0, 0, m.as_ref().as_ref(), &paint, tiny_skia::Transform::from_scale(k.0, k.1), None);
+                            o.mask = Some(Arc::new(big));
+                        }
+                        let img = Arc::new(img);
+                        o.original = Some(ImageData(img.clone()));
+                        o.paint = Some(img);
+                        o.touch();
+                    }
+                    self.dirty = true;
+                    self.status = format!("Enlarged with AI to {w} × {h} px — same size on the canvas, much more detail.");
+                }
+                crate::upscale::UpscaleEvent::Error(e) => {
+                    self.upscale_busy = None;
+                    self.status = if e == "cancelled" { "AI enlarging cancelled.".into() } else { e };
+                }
             }
         }
     }
@@ -4326,6 +4597,18 @@ impl JabroApp {
                     ui.add(egui::Slider::new(&mut self.bg_tol, 0.01..=0.6).text("Tolerance"));
                     ui.add(egui::Slider::new(&mut self.bg_feather, 0.0..=8.0).text("Soft edge"));
                     ui.small("Click a picture: the connected area of similar colour becomes transparent. Nothing is deleted — paint it back with Transparency: reveal.");
+                } else if self.brush.kind == BrushKind::AiSelect {
+                    for m in SelectMode::ALL {
+                        ui.radio_value(&mut self.select_mode, m, m.label());
+                    }
+                    if self.select_busy {
+                        ui.horizontal(|ui| {
+                            ui.spinner();
+                            ui.label("Finding the object…");
+                        });
+                    }
+                    ui.small("Click an object in a picture and the AI finds its outline. Shift+click adds more of it, Alt+click takes a part away. The first click on a picture takes a few seconds.");
+                    ui.small(crate::sam::ATTRIBUTION);
                 } else {
                     ui.add(egui::Slider::new(&mut self.brush.size, 1.0..=300.0).logarithmic(true).text("Size"));
                     ui.add(egui::Slider::new(&mut self.brush.hardness, 0.0..=1.0).text("Hardness"));
@@ -4365,7 +4648,7 @@ impl JabroApp {
                 }
                 if self.brush.kind.is_mask() {
                     ui.small("Paints the selected object's transparency: hide makes it see-through, reveal brings it back. Works on pictures, shapes and text. Low flow = partly transparent.");
-                } else if self.brush.kind != BrushKind::MagicWand {
+                } else if !matches!(self.brush.kind, BrushKind::MagicWand | BrushKind::AiSelect) {
                     if ui.button("New paint layer").clicked() {
                         self.checkpoint();
                         self.new_paint_layer();
@@ -4595,6 +4878,11 @@ impl JabroApp {
             ai_model: self.ai_model,
             ai_busy: self.ai_busy.is_some(),
             trace: self.trace_settings,
+            upscale: self.upscale_busy.as_ref().filter(|u| Some(u.0) == selected).map(|u| (u.1, u.2)),
+            upscale_max: selected
+                .and_then(|id| self.doc.find(id))
+                .and_then(|o| o.paint.as_ref())
+                .map_or(0, |p| [4, 2].into_iter().find(|f| crate::upscale::fits(p.width(), p.height(), *f)).unwrap_or(0)),
         };
         egui::ScrollArea::vertical().id_salt("props").show(ui, |ui| {
             match selected.and_then(|id| self.doc.find_mut(id)) {
@@ -4684,6 +4972,16 @@ impl JabroApp {
                 PropAction::Trace => {
                     if let Some(id) = selected {
                         self.trace_object(id);
+                    }
+                }
+                PropAction::Upscale(f) => {
+                    if let Some(id) = selected {
+                        self.start_upscale(id, f);
+                    }
+                }
+                PropAction::CancelUpscale => {
+                    if let Some(u) = &self.upscale_busy {
+                        u.3.store(true, std::sync::atomic::Ordering::Relaxed);
                     }
                 }
                 PropAction::CopyStyle => {
@@ -5780,6 +6078,33 @@ fn object_props(
             }
             ui.small("Best for plain or studio backgrounds. Touch up with the Brush tool's Magic wand or Transparency: hide / reveal — the original pixels are always kept.");
             ui.add_space(6.0);
+            ui.strong("Enlarge with AI");
+            match pic.upscale {
+                Some((d, n)) => {
+                    ui.add(egui::ProgressBar::new(d as f32 / n.max(1) as f32).text(format!("{d} / {n}")));
+                    if ui.button("Cancel").clicked() {
+                        actions.push(PropAction::CancelUpscale);
+                    }
+                }
+                None => {
+                    ui.horizontal(|ui| {
+                        for f in [2u32, 4] {
+                            if ui
+                                .add_enabled(pic.upscale_max >= f, egui::Button::new(format!("{f}×")))
+                                .on_hover_text("Adds real detail instead of blurring: more pixels at the same size on the canvas")
+                                .clicked()
+                            {
+                                actions.push(PropAction::Upscale(f));
+                            }
+                        }
+                    });
+                    if pic.upscale_max == 0 {
+                        ui.small("Already at the largest size the AI can make.");
+                    }
+                }
+            }
+            ui.small(crate::upscale::ATTRIBUTION);
+            ui.add_space(6.0);
             ui.strong("Trace to vectors");
             let t = &mut pic.trace;
             ui.add(egui::Slider::new(&mut t.colors, 1..=16).text("Colours"))
@@ -6040,6 +6365,8 @@ impl eframe::App for JabroApp {
         self.recovery_dialog_ui(ctx);
         self.handle_dropped_files(ctx);
         self.poll_ai();
+        self.poll_select();
+        self.poll_upscale();
         self.canvas_dialog_ui(ctx);
         self.export_dialog_ui(ctx);
         self.update_title(ctx);
@@ -6078,6 +6405,8 @@ impl eframe::App for JabroApp {
                     ui.separator();
                     ui.strong("Credits & licenses");
                     ui.label(ai::ATTRIBUTION);
+                    ui.label(crate::sam::ATTRIBUTION);
+                    ui.label(crate::upscale::ATTRIBUTION);
                     ui.label(
                         "Built from open-source libraries under permissive licenses (MIT, Apache-2.0, BSD and \
                          similar). See THIRD_PARTY_NOTICES.md and the licenses folder that come with the program.",
@@ -7211,6 +7540,80 @@ mod tests {
         assert!(app.npr_inflight && app.npr_want.is_none());
         wait(&mut app, &|a| !a.npr_inflight);
         assert!(!app.npr_busy && app.npr_want.is_none(), "done after the full-quality pass");
+    }
+
+    fn two_discs() -> Pixmap {
+        let mut img = Pixmap::new(320, 200).unwrap();
+        for (i, px) in img.data_mut().chunks_exact_mut(4).enumerate() {
+            let n = (crate::textures::rand01((i % 320) as i32, (i / 320) as i32, 3) * 30.0) as u8;
+            px.copy_from_slice(&[200 + n / 2, 205 + n / 2, 190 + n / 2, 255]);
+        }
+        let mut paint = tiny_skia::Paint::default();
+        paint.set_color_rgba8(200, 40, 40, 255);
+        let a = tiny_skia::PathBuilder::from_circle(90.0, 100.0, 50.0).unwrap();
+        img.fill_path(&a, &paint, tiny_skia::FillRule::Winding, tiny_skia::Transform::identity(), None);
+        paint.set_color_rgba8(30, 60, 190, 255);
+        let b = tiny_skia::PathBuilder::from_circle(240.0, 100.0, 45.0).unwrap();
+        img.fill_path(&b, &paint, tiny_skia::FillRule::Winding, tiny_skia::Transform::identity(), None);
+        img
+    }
+
+    fn wait_for(app: &mut JabroApp, done: impl Fn(&JabroApp) -> bool, poll: impl Fn(&mut JabroApp)) {
+        let start = std::time::Instant::now();
+        while !done(app) {
+            poll(app);
+            assert!(start.elapsed().as_secs() < 120, "AI never answered: {}", app.status);
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
+    #[test]
+    fn ai_select_keeps_or_copies_the_clicked_object() {
+        let mut app = app_with(vec![]);
+        app.add_picture_object(two_discs(), "Discs".into(), Some(Pt::new(400.0, 300.0)));
+        let pid = app.selected.unwrap();
+        app.tool = Tool::Brush;
+        app.brush.kind = BrushKind::AiSelect;
+        // picture (90, 100) is canvas (330, 300): the red disc
+        click(&mut app, Pt::new(330.0, 300.0), Modifiers::NONE);
+        assert!(app.select_busy);
+        wait_for(&mut app, |a| !a.select_busy, |a| a.poll_select());
+        let o = app.doc.find(pid).unwrap();
+        let m = o.mask.as_ref().expect("transparency painted");
+        let at = |x: usize, y: usize| m.data()[(y * 320 + x) * 4];
+        assert!(at(90, 100) > 200 && at(240, 100) < 60 && at(10, 10) < 60, "only the red disc stays");
+        app.undo();
+        assert!(app.doc.find(pid).unwrap().mask.is_none());
+        // copy mode: a new picture object with just the disc, right above the original
+        app.select_mode = SelectMode::Copy;
+        click(&mut app, Pt::new(330.0, 300.0), Modifiers::NONE);
+        wait_for(&mut app, |a| !a.select_busy, |a| a.poll_select());
+        assert_eq!(app.doc.objects.len(), 2);
+        let c = &app.doc.objects[1];
+        assert_eq!(c.kind, ShapeKind::Bitmap);
+        let (lo, hi) = c.bounds();
+        assert!((lo.x - 280.0).abs() < 6.0 && (hi.x - 380.0).abs() < 6.0, "placed over the disc: {lo:?} {hi:?}");
+        assert!(app.doc.find(pid).unwrap().mask.is_none(), "the original is untouched");
+    }
+
+    #[test]
+    fn ai_upscale_adds_pixels_but_keeps_the_size_on_canvas() {
+        let mut app = app_with(vec![]);
+        let mut img = Pixmap::new(100, 60).unwrap();
+        img.fill(tiny_skia::Color::from_rgba8(200, 120, 40, 255));
+        app.add_picture_object(img, "Small".into(), Some(Pt::new(400.0, 300.0)));
+        let pid = app.selected.unwrap();
+        ensure_mask(app.doc.find_mut(pid).unwrap());
+        let size = app.doc.find(pid).unwrap().size;
+        app.start_upscale(pid, 2);
+        wait_for(&mut app, |a| a.upscale_busy.is_none(), |a| a.poll_upscale());
+        let o = app.doc.find(pid).unwrap();
+        let p = o.paint.as_ref().unwrap();
+        assert_eq!((p.width(), p.height()), (200, 120), "{}", app.status);
+        assert_eq!(o.mask.as_ref().map(|m| (m.width(), m.height())), Some((200, 120)));
+        assert_eq!(o.size, size);
+        app.undo();
+        assert_eq!(app.doc.find(pid).unwrap().paint.as_ref().unwrap().width(), 100);
     }
 
     #[test]

@@ -3,7 +3,7 @@ name = "jabro-models"
 version = "0.1.0"
 edition = "2021"
 publish = false
-description = "Embedded U²-Net weights for Jabro Draw's AI background removal (see NOTICE.md)"
+description = "Embedded AI model weights for Jabro Draw (U²-Net, MobileSAM, Real-ESRGAN; see NOTICE.md)"
 
 [build-dependencies]
 sha2 = "0.10"

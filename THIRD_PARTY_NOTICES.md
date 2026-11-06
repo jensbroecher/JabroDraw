@@ -21,6 +21,34 @@ for **Remove background (AI)**.
   `crates/jabro-models/build.rs`).
 - Inference runs locally. No picture is ever sent anywhere.
 
+## Embedded AI models: MobileSAM and Segment Anything (object selection)
+
+Used by the Brush tool's **AI object select**.
+
+- **MobileSAM** image encoder by Chaoning Zhang, Dongshen Han, Yu Qiao, Jung Uk Kim, Sung-Ho Bae,
+  Seungkyu Lee and Choong Seon Hong. *Faster Segment Anything: Towards Lightweight SAM for Mobile
+  Applications*, 2023. <https://github.com/ChaoningZhang/MobileSAM>. Licensed under the **Apache
+  License 2.0** (`licenses/Apache-2.0.txt`).
+- **Segment Anything** mask decoder by Meta AI Research (Kirillov et al., 2023), as shipped with
+  MobileSAM. <https://github.com/facebookresearch/segment-anything>. **Apache License 2.0**.
+- **ONNX exports** (`mobile_sam_image_encoder.onnx`, `sam_mask_decoder_single.onnx`) by Acly,
+  <https://huggingface.co/Acly/MobileSAM>. **MIT License** (`licenses/MobileSAM-ONNX-MIT.txt`).
+
+## Embedded AI model: Real-ESRGAN (picture enlarging)
+
+Used by **Enlarge with AI** in the Picture section.
+
+- **Real-ESRGAN** general x4v3 by Xintao Wang, Liangbin Xie, Chao Dong and Ying Shan. *Real-ESRGAN:
+  Training Real-World Blind Super-Resolution with Pure Synthetic Data*, ICCVW 2021.
+  <https://github.com/xinntao/Real-ESRGAN>. Copyright (c) 2021, Xintao Wang. Licensed under the
+  **BSD 3-Clause License** (`licenses/Real-ESRGAN-BSD-3-Clause.txt`).
+- **ONNX export** (`realesr-general-x4v3-dn50.onnx`) of the official checkpoints, blended 50/50 as
+  the official script does at its default denoise strength,
+  <https://huggingface.co/techycoder/realesrgan-general-x4v3> (BSD 3-Clause).
+
+All three files are redistributed **unmodified** (SHA-256 checked at build time). Like the
+background removal, these models run on the computer; no picture is ever sent anywhere.
+
 ## Fonts
 
 - Text objects use the fonts installed on your computer (for example Arial or Georgia). They are

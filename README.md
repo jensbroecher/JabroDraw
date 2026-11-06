@@ -78,6 +78,11 @@ Styles: `none watercolor oil impressionist pointillism pencil colorpencil comic`
   to how it was imported. The Brush tool's **Magic wand** clicks away single areas, and
   **Transparency: hide / reveal** paints transparency by hand on any object. All of this goes into a
   mask, so the original pixels are never destroyed (Clear / Invert under Transparency).
+- **AI object select** (Brush tool): click an object in a photo and the AI finds its outline. You
+  can keep only it, hide it, or copy it out as a new object. Shift+click adds to the selection and
+  Alt+click takes a part away. The first click on a picture takes a few seconds; after that it's
+  instant. **Enlarge with AI** (Picture section) makes a picture 2× or 4× bigger with real detail
+  instead of blur (Real-ESRGAN, up to 4096 px). Both run offline, like the background removal.
 - **Trace to vectors** (Picture section): turns a picture or paint layer into editable vector
   shapes, one per colour (1–16), grouped and in the picture's place and perspective. Detail,
   smoothness and speck size are adjustable. The colour layers are stacked so no gaps show between

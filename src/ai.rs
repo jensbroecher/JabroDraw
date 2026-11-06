@@ -35,7 +35,7 @@ impl AiModel {
 pub const ATTRIBUTION: &str = "AI background removal uses U²-Net by X. Qin et al. (Apache-2.0; \
 ONNX conversion by the rembg project, MIT). It runs on this computer; pictures are never uploaded.";
 
-type Plan = Arc<TypedRunnableModel>;
+pub(crate) type Plan = Arc<TypedRunnableModel>;
 
 fn load_plan(m: AiModel) -> TractResult<Plan> {
     tract_onnx::onnx()
@@ -94,7 +94,7 @@ pub fn segment(plan: &Plan, img: &Pixmap) -> Result<Vec<f32>, String> {
 }
 
 /// Guided filter (He et al.): snaps the low-resolution prediction to the picture's real edges.
-fn refine(p: &[f32], img: &Pixmap) -> Vec<f32> {
+pub(crate) fn refine(p: &[f32], img: &Pixmap) -> Vec<f32> {
     let (w, h) = (img.width() as usize, img.height() as usize);
     let guide: Vec<f32> = img
         .data()

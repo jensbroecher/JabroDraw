@@ -21,10 +21,12 @@ pub enum BrushKind {
     Reveal,
     /// Click to hide a connected area of similar colour (pictures / paint layers).
     MagicWand,
+    /// Click an object in a picture: AI finds its outline (keep it, hide it or copy it out).
+    AiSelect,
 }
 
 impl BrushKind {
-    pub const ALL: [BrushKind; 10] = [
+    pub const ALL: [BrushKind; 11] = [
         BrushKind::Round,
         BrushKind::Airbrush,
         BrushKind::Chalk,
@@ -35,6 +37,7 @@ impl BrushKind {
         BrushKind::Hide,
         BrushKind::Reveal,
         BrushKind::MagicWand,
+        BrushKind::AiSelect,
     ];
     pub fn label(self) -> &'static str {
         match self {
@@ -48,6 +51,7 @@ impl BrushKind {
             BrushKind::Hide => "Transparency: hide",
             BrushKind::Reveal => "Transparency: reveal",
             BrushKind::MagicWand => "Magic wand (click to hide an area)",
+            BrushKind::AiSelect => "AI object select (click an object)",
         }
     }
     /// Works on the transparency mask instead of the paint.

@@ -21,10 +21,12 @@ mod io;
 mod npr;
 mod raster;
 mod render;
+mod sam;
 mod shapes;
 mod styles;
 mod textures;
 mod trace;
+mod upscale;
 mod vector;
 #[cfg(test)]
 mod tests;
