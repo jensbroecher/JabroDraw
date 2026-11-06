@@ -412,6 +412,11 @@ pub struct JabroApp {
     export_dialog: Option<export::Options>,
     /// Last used export settings.
     export_opts: export::Options,
+    /// Real session (not a test): may write settings, recent files and autosaves.
+    persist: bool,
+    last_autosave: std::time::Instant,
+    autosaved_gen: Option<u64>,
+    recovery: Option<Vec<PathBuf>>,
 }
 
 impl JabroApp {
@@ -425,6 +430,11 @@ impl JabroApp {
         );
         app.settings = Settings::load();
         app.system_clipboard = true;
+        app.persist = true;
+        let orphans = Self::find_orphans();
+        if !orphans.is_empty() {
+            app.recovery = Some(orphans);
+        }
         app
     }
 
@@ -496,6 +506,10 @@ impl JabroApp {
             snap_lines: Vec::new(),
             export_dialog: None,
             export_opts: export::Options::default(),
+            persist: false,
+            last_autosave: std::time::Instant::now(),
+            autosaved_gen: None,
+            recovery: None,
         }
     }
 
@@ -1055,6 +1069,7 @@ impl JabroApp {
             Ok(d) => {
                 self.replace_doc(d);
                 self.status = format!("Opened {}", path.display());
+                self.remember_recent(&path);
                 self.path = Some(path);
             }
             Err(e) => self.status = format!("Could not open: {e}"),
@@ -1079,6 +1094,7 @@ impl JabroApp {
         match io::save(&self.doc, &path) {
             Ok(()) => {
                 self.status = format!("Saved {}", path.display());
+                self.remember_recent(&path);
                 self.path = Some(path);
                 self.saved_doc = self.doc.clone();
                 true
@@ -1087,6 +1103,147 @@ impl JabroApp {
                 self.status = format!("Could not save: {e}");
                 false
             }
+        }
+    }
+
+    // ---------------------------------------------------------------- autosave & recovery
+
+    fn autosave_file(&self) -> Option<PathBuf> {
+        canvas::autosave_dir().map(|d| d.join(format!("autosave-{}.jabro", std::process::id())))
+    }
+
+    /// Every minute, unsaved work is written to a recovery file in the background.
+    fn autosave_tick(&mut self, ctx: &egui::Context) {
+        if !self.persist {
+            return;
+        }
+        let Some(file) = self.autosave_file() else { return };
+        if !self.has_unsaved_changes() {
+            if self.autosaved_gen.take().is_some() {
+                let _ = std::fs::remove_file(&file);
+                let _ = std::fs::remove_file(file.with_extension("txt"));
+            }
+            return;
+        }
+        ctx.request_repaint_after(std::time::Duration::from_secs(20));
+        if self.last_autosave.elapsed().as_secs() < 60 || self.pressing {
+            return;
+        }
+        self.last_autosave = std::time::Instant::now();
+        if self.autosaved_gen == Some(self.gen) {
+            // nothing new: keep the file fresh so it isn't mistaken for a crash leftover
+            if let Ok(f) = std::fs::File::options().append(true).open(&file) {
+                let _ = f.set_modified(std::time::SystemTime::now());
+            }
+            return;
+        }
+        self.autosaved_gen = Some(self.gen);
+        let doc = self.doc.clone();
+        let name = self.path.as_ref().map(|p| p.display().to_string()).unwrap_or_default();
+        std::thread::spawn(move || {
+            if let Some(dir) = file.parent() {
+                let _ = std::fs::create_dir_all(dir);
+            }
+            let tmp = file.with_extension("tmp");
+            if io::save(&doc, &tmp).is_ok() {
+                let _ = std::fs::rename(&tmp, &file);
+                let _ = std::fs::write(file.with_extension("txt"), name);
+            }
+        });
+    }
+
+    fn remove_autosave(&self) {
+        if let Some(file) = self.autosave_file().filter(|_| self.persist) {
+            let _ = std::fs::remove_file(&file);
+            let _ = std::fs::remove_file(file.with_extension("txt"));
+        }
+    }
+
+    /// Recovery files left behind by a session that ended unexpectedly (newest first).
+    fn find_orphans() -> Vec<PathBuf> {
+        let Some(dir) = canvas::autosave_dir() else { return Vec::new() };
+        let own = format!("autosave-{}.jabro", std::process::id());
+        let mut found: Vec<(std::time::SystemTime, PathBuf)> = std::fs::read_dir(dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| {
+                p.extension().is_some_and(|e| e == "jabro") && p.file_name().is_some_and(|n| n.to_string_lossy() != own)
+            })
+            .filter_map(|p| {
+                let m = p.metadata().ok()?.modified().ok()?;
+                // a running Jabro Draw refreshes its file every minute
+                (m.elapsed().map_or(false, |a| a.as_secs() > 180)).then_some((m, p))
+            })
+            .collect();
+        found.sort_by(|a, b| b.0.cmp(&a.0));
+        found.into_iter().map(|(_, p)| p).collect()
+    }
+
+    fn recovery_dialog_ui(&mut self, ctx: &egui::Context) {
+        let Some(files) = self.recovery.clone() else { return };
+        let mut done = false;
+        egui::Window::new("Recover unsaved work")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
+            .show(ctx, |ui| {
+                ui.label("Jabro Draw was closed without saving. This work can be recovered:");
+                ui.add_space(6.0);
+                for f in &files {
+                    let when = f
+                        .metadata()
+                        .and_then(|m| m.modified())
+                        .ok()
+                        .and_then(|t| t.elapsed().ok())
+                        .map(|a| {
+                            let m = a.as_secs() / 60;
+                            if m < 120 { format!("{m} min ago") } else { format!("{} h ago", m / 60) }
+                        })
+                        .unwrap_or_default();
+                    let orig = std::fs::read_to_string(f.with_extension("txt")).unwrap_or_default();
+                    let label = if orig.is_empty() {
+                        "Untitled".to_string()
+                    } else {
+                        std::path::Path::new(&orig).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or(orig)
+                    };
+                    ui.horizontal(|ui| {
+                        ui.label(format!("{label} — {when}"));
+                        if ui.button("Recover").clicked() {
+                            match io::load(f) {
+                                Ok(d) => {
+                                    self.replace_doc(d);
+                                    self.saved_doc = Document::new(1, 1); // still unsaved
+                                    self.path = None;
+                                    self.status = "Recovered — save it under a name of your choice.".into();
+                                }
+                                Err(e) => self.status = format!("Could not recover: {e}"),
+                            }
+                            let _ = std::fs::remove_file(f);
+                            let _ = std::fs::remove_file(f.with_extension("txt"));
+                            done = true;
+                        }
+                    });
+                }
+                ui.add_space(6.0);
+                if ui.button("Discard").on_hover_text("Delete the recovery files").clicked() {
+                    for f in &files {
+                        let _ = std::fs::remove_file(f);
+                        let _ = std::fs::remove_file(f.with_extension("txt"));
+                    }
+                    done = true;
+                }
+            });
+        if done {
+            self.recovery = None;
+        }
+    }
+
+    fn remember_recent(&mut self, path: &std::path::Path) {
+        if self.persist {
+            self.settings.add_recent(path);
+            self.settings.save();
         }
     }
 
@@ -3162,6 +3319,31 @@ impl JabroApp {
                     ui.close_menu();
                     self.open();
                 }
+                ui.menu_button("Open recent", |ui| {
+                    if self.settings.recent.is_empty() {
+                        ui.weak("No recent files yet");
+                    }
+                    let mut open = None;
+                    for r in &self.settings.recent {
+                        let p = std::path::Path::new(r);
+                        let name = p.file_name().map_or(r.clone(), |n| n.to_string_lossy().into_owned());
+                        if ui.add_enabled(p.exists(), egui::Button::new(name)).on_hover_text(r).clicked() {
+                            open = Some(PathBuf::from(r));
+                        }
+                    }
+                    if let Some(p) = open {
+                        ui.close_menu();
+                        self.open_path(p);
+                    }
+                    if !self.settings.recent.is_empty() {
+                        ui.separator();
+                        if ui.button("Clear list").clicked() {
+                            self.settings.recent.clear();
+                            self.settings.save();
+                            ui.close_menu();
+                        }
+                    }
+                });
                 if ui.button("Save  (Ctrl+S)").clicked() {
                     ui.close_menu();
                     self.save(false);
@@ -5064,6 +5246,12 @@ fn doc_props(ui: &mut egui::Ui, doc: &mut Document, auto_grow: bool, act: &mut O
 impl eframe::App for JabroApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.handle_close(ctx);
+        // a clean exit leaves no recovery file behind
+        if ctx.input(|i| i.viewport().close_requested()) && (self.allow_close || !self.has_unsaved_changes()) {
+            self.remove_autosave();
+        }
+        self.autosave_tick(ctx);
+        self.recovery_dialog_ui(ctx);
         self.handle_dropped_files(ctx);
         self.poll_ai();
         self.canvas_dialog_ui(ctx);
@@ -5728,6 +5916,21 @@ mod tests {
         app.select_only(Some(1));
         app.duplicate_selected();
         assert!(app.doc.objects.iter().all(|o| o.instance_of.is_none()));
+    }
+
+    #[test]
+    fn recent_files_are_deduplicated_and_capped() {
+        let mut s = Settings::default();
+        for i in 0..12 {
+            s.add_recent(std::path::Path::new(&format!("C:/art/{i}.jabro")));
+        }
+        s.add_recent(std::path::Path::new("C:/art/5.jabro"));
+        assert_eq!(s.recent.len(), 10);
+        assert_eq!(s.recent[0], "C:/art/5.jabro", "reopened file moves to the top");
+        assert_eq!(s.recent.iter().filter(|r| r.ends_with("/5.jabro")).count(), 1);
+        // tests never touch the real settings, recovery files or recent list
+        let app = app_with(vec![]);
+        assert!(!app.persist && !app.system_clipboard);
     }
 
     #[test]

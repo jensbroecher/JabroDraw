@@ -147,6 +147,8 @@ pub struct Settings {
     pub grid: bool,
     pub grid_size: f32,
     pub rulers: bool,
+    /// Recently opened / saved documents, newest first.
+    pub recent: Vec<String>,
 }
 
 impl Default for Settings {
@@ -157,8 +159,23 @@ impl Default for Settings {
             grid: false,
             grid_size: 20.0,
             rulers: true,
+            recent: Vec::new(),
         }
     }
+}
+
+impl Settings {
+    pub fn add_recent(&mut self, path: &std::path::Path) {
+        let p = path.to_string_lossy().into_owned();
+        self.recent.retain(|r| *r != p);
+        self.recent.insert(0, p);
+        self.recent.truncate(10);
+    }
+}
+
+/// Folder for autosave / recovery files.
+pub fn autosave_dir() -> Option<std::path::PathBuf> {
+    settings_path().and_then(|p| p.parent().map(|d| d.join("autosave")))
 }
 
 /// Snap `v` to the nearest of `targets` within `tol`: (snapped value, target).

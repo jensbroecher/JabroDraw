@@ -78,6 +78,9 @@ Styles: `none watercolor oil impressionist pointillism pencil colorpencil comic`
   the match, and Alt bypasses snapping. **Rulers**: drag from a ruler to make a guide, drop it back
   to remove it. **Arrange** (properties panel): align left, centre, right, top, middle or bottom (a
   single object aligns to the canvas), and give 3+ objects equal spacing.
+- **Never lose work**: unsaved changes are written to a recovery file every minute, in the
+  background. If Jabro Draw is closed unexpectedly, the next start offers to recover the drawing.
+  File › **Open recent** lists the last 10 files.
 - **Export** (File › Export…, Ctrl+E):
   - **Formats:** PNG, JPEG (with quality), WebP, SVG, or a layered PSD with one named layer per
     object.
