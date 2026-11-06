@@ -981,3 +981,46 @@ fn the_icon_has_every_size_and_reads_at_16_px() {
     let mid = small.pixel(9, 8).unwrap().demultiply();
     assert!(mid.alpha() == 255 && mid.green() > 180, "light letter in the middle: {mid:?}");
 }
+
+// ------------------------------------------------------------------ picture formats
+
+fn sample_picture() -> image::RgbaImage {
+    image::RgbaImage::from_fn(40, 30, |x, y| image::Rgba([(x * 6) as u8, (y * 8) as u8, 120, 255]))
+}
+
+#[test]
+fn qoi_pictures_open() {
+    let p = std::env::temp_dir().join("jabro_fmt_test.qoi");
+    sample_picture().save(&p).unwrap();
+    let pm = crate::imageops::load_image(&p).unwrap();
+    let _ = std::fs::remove_file(&p);
+    assert_eq!((pm.width(), pm.height()), (40, 30));
+    assert_eq!(pm.pixel(10, 5).unwrap().demultiply().red(), 60);
+}
+
+#[test]
+fn formats_the_built_in_decoders_lack_go_through_windows_codecs() {
+    // a PNG that claims to be HEIC: the image crate gives up, Windows (WIC) reads it by content
+    let p = std::env::temp_dir().join("jabro_fmt_test.heic");
+    sample_picture().save_with_format(&p, image::ImageFormat::Png).unwrap();
+    let pm = crate::imageops::load_image(&p);
+    let _ = std::fs::remove_file(&p);
+    let pm = pm.expect("decoded through WIC");
+    assert_eq!((pm.width(), pm.height()), (40, 30));
+    assert_eq!(pm.pixel(10, 5).unwrap().demultiply().green(), 40);
+}
+
+#[test]
+fn avif_export_writes_an_avif_file() {
+    let doc = export_doc();
+    let p = std::env::temp_dir().join("jabro_export_test.avif");
+    export::export(&doc, None, &Options { format: Format::Avif, quality: 70, ..Default::default() }, &p).unwrap();
+    let bytes = std::fs::read(&p).unwrap();
+    assert_eq!(&bytes[4..12], b"ftypavif", "an AVIF container");
+    // reading it back needs Windows' AV1 codec; when it is there the size must match
+    match crate::imageops::load_image(&p) {
+        Ok(pm) => assert_eq!((pm.width(), pm.height()), (doc.width, doc.height)),
+        Err(e) => assert!(e.contains("AV1"), "a helpful hint: {e}"),
+    }
+    let _ = std::fs::remove_file(&p);
+}

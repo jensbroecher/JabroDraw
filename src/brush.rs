@@ -74,6 +74,8 @@ pub struct BrushSettings {
     /// Scatter brush: what it sprays and how much the colour varies (0..1).
     pub scatter: ScatterShape,
     pub jitter: f32,
+    /// Paint mirrored / turned copies of every stroke.
+    pub symmetry: Symmetry,
 }
 
 impl Default for BrushSettings {
@@ -88,6 +90,7 @@ impl Default for BrushSettings {
             pressure: true,
             scatter: ScatterShape::Leaves,
             jitter: 0.6,
+            symmetry: Symmetry::Off,
         }
     }
 }
@@ -478,6 +481,92 @@ fn stamp(pm: &mut Pixmap, c: (f32, f32), r: f32, s: &BrushSettings, prev: Option
                     data[i + 3] = na as u8;
                 }
             }
+        }
+    }
+}
+
+/// Paint several copies of every stroke at once, mirrored or turned around the layer's centre.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum Symmetry {
+    #[default]
+    Off,
+    /// Left and right mirror each other.
+    Mirror,
+    /// Mirrored left / right and top / bottom.
+    Quad,
+    /// The stroke turned `n` times around the centre.
+    Radial(u8),
+    /// Turned `n` times, each copy also mirrored (a kaleidoscope / mandala).
+    Kaleido(u8),
+}
+
+impl Symmetry {
+    pub fn label(self) -> String {
+        match self {
+            Symmetry::Off => "Off".into(),
+            Symmetry::Mirror => "Mirror".into(),
+            Symmetry::Quad => "4-way mirror".into(),
+            Symmetry::Radial(n) => format!("Radial × {n}"),
+            Symmetry::Kaleido(n) => format!("Kaleidoscope × {n}"),
+        }
+    }
+
+    pub fn copies(self) -> usize {
+        match self {
+            Symmetry::Off => 1,
+            Symmetry::Mirror => 2,
+            Symmetry::Quad => 4,
+            Symmetry::Radial(n) => n.max(2) as usize,
+            Symmetry::Kaleido(n) => 2 * n.max(2) as usize,
+        }
+    }
+
+    /// Every copy of point `p` (the first is `p` itself), around centre `c`.
+    pub fn points(self, p: (f32, f32), c: (f32, f32)) -> Vec<(f32, f32)> {
+        let (dx, dy) = (p.0 - c.0, p.1 - c.1);
+        let turn = |a: f32, x: f32, y: f32| {
+            let (s, co) = a.sin_cos();
+            (c.0 + x * co - y * s, c.1 + x * s + y * co)
+        };
+        match self {
+            Symmetry::Off => vec![p],
+            Symmetry::Mirror => vec![p, (c.0 - dx, p.1)],
+            Symmetry::Quad => vec![p, (c.0 - dx, p.1), (p.0, c.1 - dy), (c.0 - dx, c.1 - dy)],
+            Symmetry::Radial(n) => {
+                let n = n.max(2) as usize;
+                (0..n).map(|i| turn(i as f32 * std::f32::consts::TAU / n as f32, dx, dy)).collect()
+            }
+            Symmetry::Kaleido(n) => {
+                let n = n.max(2) as usize;
+                (0..n)
+                    .flat_map(|i| {
+                        let a = i as f32 * std::f32::consts::TAU / n as f32;
+                        [turn(a, dx, dy), turn(a, dx, -dy)]
+                    })
+                    .collect()
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod symmetry_tests {
+    use super::*;
+
+    #[test]
+    fn copies_land_where_they_should() {
+        let c = (50.0, 50.0);
+        assert_eq!(Symmetry::Mirror.points((60.0, 30.0), c), vec![(60.0, 30.0), (40.0, 30.0)]);
+        let q = Symmetry::Quad.points((60.0, 30.0), c);
+        assert!(q.contains(&(40.0, 70.0)) && q.len() == 4);
+        let r = Symmetry::Radial(4).points((60.0, 50.0), c);
+        assert_eq!(r.len(), 4);
+        assert!((r[1].0 - 50.0).abs() < 1e-4 && (r[1].1 - 60.0).abs() < 1e-4, "a quarter turn: {:?}", r[1]);
+        let k = Symmetry::Kaleido(3).points((60.0, 45.0), c);
+        assert_eq!(k.len(), 6);
+        assert!((k[1].1 - 55.0).abs() < 1e-4, "mirrored copy: {:?}", k[1]);
+        for s in [Symmetry::Off, Symmetry::Mirror, Symmetry::Quad, Symmetry::Radial(5), Symmetry::Kaleido(6)] {
+            assert_eq!(s.points((1.0, 2.0), c).len(), s.copies());
         }
     }
 }

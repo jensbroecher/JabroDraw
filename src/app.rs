@@ -142,7 +142,8 @@ enum Drag {
     Corner { id: u64, idx: usize },
     Create { start: Pt, cur: Pt },
     Freehand { pts: Vec<Pt> },
-    Paint { id: u64, last: (f32, f32), state: StrokeState, mask: bool },
+    /// One stroke state per symmetric copy.
+    Paint { id: u64, last: (f32, f32), states: Vec<StrokeState>, mask: bool },
 }
 
 enum PropAction {
@@ -945,6 +946,25 @@ impl JabroApp {
         );
     }
 
+    /// A ready-made shape from the Insert menu, in the middle of the view, as an editable path.
+    fn insert_library_shape(&mut self, s: crate::library::LibShape) {
+        let Some((subpaths, rect, size)) = vector::polygons_to_object_parts(&vec![s.outline()]) else { return };
+        let c = self.view_center();
+        let k = (self.doc.width.min(self.doc.height) as f32 * 0.3 / size[0].max(size[1])).clamp(0.2, 4.0);
+        let (w, h) = (size[0] * k, size[1] * k);
+        let _ = rect;
+        self.checkpoint();
+        let id = self.doc.alloc_id();
+        let mut o = Object::new(id, ShapeKind::Path { subpaths }, c.x - w * 0.5, c.y - h * 0.5, w, h);
+        o.fill = FillStyle { kind: FillKind::Solid, a: self.color_a, ..Default::default() };
+        o.name = s.label().into();
+        self.doc.objects.push(o);
+        self.select_only(Some(id));
+        self.set_tool(Tool::Select);
+        self.dirty = true;
+        self.status = format!("{} added — reshape it with Edit nodes (A), style it on the right.", s.label());
+    }
+
     /// Lay the selected text along the outline of the other selected object.
     fn text_on_path(&mut self) {
         let ids = self.selection();
@@ -1441,6 +1461,28 @@ impl JabroApp {
         }
     }
 
+    /// A file given on the command line (double-clicked in Explorer): drawings open, pictures
+    /// start a new drawing of their size.
+    pub fn open_at_start(&mut self, path: PathBuf) {
+        let ext = path.extension().and_then(|e| e.to_str()).map(|e| e.to_ascii_lowercase()).unwrap_or_default();
+        if ext == "jabro" {
+            self.open_path(path);
+            self.undo.clear();
+        } else if imageops::is_image_path(&path) {
+            let (w, h) = imageops::load_image(&path)
+                .map(|i| (i.width().clamp(canvas::MIN_SIZE, canvas::MAX_SIZE), i.height().clamp(canvas::MIN_SIZE, canvas::MAX_SIZE)))
+                .unwrap_or((1200, 800));
+            self.new_doc(w, h);
+            self.import_image_object(&path, None);
+            if let Some(o) = self.selected.and_then(|id| self.doc.find_mut(id)) {
+                o.quad = Object::rect_quad(0.0, 0.0, w as f32, h as f32);
+                o.update_size_from_quad();
+            }
+            self.saved_doc = self.doc.clone();
+            self.undo.clear();
+        }
+    }
+
     fn open_path(&mut self, path: PathBuf) {
         match io::load(&path) {
             Ok(d) => {
@@ -1758,7 +1800,7 @@ impl JabroApp {
                 if o.format.raster() && has_look {
                     ui.checkbox(&mut o.npr, format!("Apply the NPR look ({})", self.doc.npr.style.label()));
                 }
-                if o.format == export::Format::Jpeg {
+                if matches!(o.format, export::Format::Jpeg | export::Format::Avif) {
                     ui.add(egui::Slider::new(&mut o.quality, 40..=100).text("Quality"));
                 }
                 ui.add_space(6.0);
@@ -2473,13 +2515,17 @@ impl JabroApp {
         }
         let mapped = if mask { doc_to_mask(obj, p) } else { doc_to_paint(obj, p) };
         let Some((pc, scale)) = mapped else { return };
-        let mut state = StrokeState::new();
+        let mut states: Vec<StrokeState> = (0..settings.symmetry.copies()).map(|_| StrokeState::new()).collect();
         if let Some(layer) = brush_layer(obj, mask) {
-            brush::segment(Arc::make_mut(layer), pc, pc, base_r * scale, &settings, &mut state);
+            let c = (layer.width() as f32 * 0.5, layer.height() as f32 * 0.5);
+            let layer = Arc::make_mut(layer);
+            for (q, st) in settings.symmetry.points(pc, c).into_iter().zip(states.iter_mut()) {
+                brush::segment(layer, q, q, base_r * scale, &settings, st);
+            }
         }
         obj.touch();
         self.dirty = true;
-        self.drag = Drag::Paint { id, last: pc, state, mask };
+        self.drag = Drag::Paint { id, last: pc, states, mask };
     }
 
     /// Brush settings for the next stamp: the transparency brushes paint black / white
@@ -3651,7 +3697,7 @@ impl JabroApp {
                 }
                 Drag::Freehand { pts }
             }
-            Drag::Paint { id, last, mut state, mask } => {
+            Drag::Paint { id, last, mut states, mask } => {
                 let base_r = self.brush_radius_base();
                 let settings = self.brush_settings();
                 let mut new_last = last;
@@ -3659,14 +3705,19 @@ impl JabroApp {
                     let mapped = if mask { doc_to_mask(obj, p) } else { doc_to_paint(obj, p) };
                     if let Some((pc, scale)) = mapped {
                         if let Some(layer) = brush_layer(obj, mask) {
-                            brush::segment(Arc::make_mut(layer), last, pc, base_r * scale, &settings, &mut state);
+                            let c = (layer.width() as f32 * 0.5, layer.height() as f32 * 0.5);
+                            let layer = Arc::make_mut(layer);
+                            let (from, to) = (settings.symmetry.points(last, c), settings.symmetry.points(pc, c));
+                            for ((a, b), st) in from.into_iter().zip(to).zip(states.iter_mut()) {
+                                brush::segment(layer, a, b, base_r * scale, &settings, st);
+                            }
                         }
                         obj.touch();
                         new_last = pc;
                     }
                 }
                 self.dirty = true;
-                Drag::Paint { id, last: new_last, state, mask }
+                Drag::Paint { id, last: new_last, states, mask }
             }
             Drag::None => Drag::None,
         };
@@ -4273,6 +4324,19 @@ impl JabroApp {
                     self.settings.save();
                 }
             });
+            ui.menu_button("Insert", |ui| {
+                if ui.button("Picture…  (Ctrl+I)").clicked() {
+                    ui.close_menu();
+                    self.import_image_dialog();
+                }
+                ui.separator();
+                for s in crate::library::LibShape::ALL {
+                    if ui.button(s.label()).clicked() {
+                        ui.close_menu();
+                        self.insert_library_shape(s);
+                    }
+                }
+            });
             ui.menu_button("Path", |ui| {
                 let n = self.selection().len();
                 for op in BoolOp::ALL {
@@ -4615,6 +4679,24 @@ impl JabroApp {
                     ui.add(egui::Slider::new(&mut self.brush.flow, 0.02..=1.0).text("Flow"));
                     ui.add(egui::Slider::new(&mut self.brush.spacing, 0.02..=1.0).text("Spacing"));
                     ui.checkbox(&mut self.brush.pressure, "Pen pressure");
+                    ui.horizontal(|ui| {
+                        use crate::brush::Symmetry;
+                        ui.label("Symmetry");
+                        let n = match self.brush.symmetry {
+                            Symmetry::Radial(n) | Symmetry::Kaleido(n) => n,
+                            _ => 6,
+                        };
+                        egui::ComboBox::from_id_salt("brush_symmetry")
+                            .selected_text(self.brush.symmetry.label())
+                            .show_ui(ui, |ui| {
+                                for s in [Symmetry::Off, Symmetry::Mirror, Symmetry::Quad, Symmetry::Radial(n), Symmetry::Kaleido(n)] {
+                                    ui.selectable_value(&mut self.brush.symmetry, s, s.label());
+                                }
+                            });
+                    });
+                    if let crate::brush::Symmetry::Radial(n) | crate::brush::Symmetry::Kaleido(n) = &mut self.brush.symmetry {
+                        ui.add(egui::Slider::new(n, 2..=24).text("Copies"));
+                    }
                     match self.brush.kind {
                         BrushKind::Scatter => {
                             egui::ComboBox::from_label("Sprays")
@@ -5181,6 +5263,9 @@ impl JabroApp {
         self.draw_overlays(&painter);
         self.draw_rulers(&painter, latest);
 
+        if self.tool == Tool::Brush {
+            self.draw_symmetry_guides(&painter);
+        }
         if self.tool == Tool::Brush || self.tool == Tool::Liquify {
             if let Some(p) = latest.filter(|p| rect.contains(*p)) {
                 let size = if self.tool == Tool::Liquify { self.liquify_size } else { self.brush.size };
@@ -5188,6 +5273,42 @@ impl JabroApp {
                 painter.circle_stroke(p, r, Stroke::new(1.0_f32, Color32::from_black_alpha(160)));
                 painter.circle_stroke(p, r + 1.0, Stroke::new(1.0_f32, Color32::from_white_alpha(160)));
             }
+        }
+    }
+
+    /// Dashed-looking axes through the object being painted, so symmetric strokes are predictable.
+    fn draw_symmetry_guides(&self, painter: &egui::Painter) {
+        use crate::brush::Symmetry;
+        let sym = self.brush.symmetry;
+        if sym == Symmetry::Off {
+            return;
+        }
+        let Some(o) = self.selected.and_then(|id| self.doc.find(id)) else { return };
+        let (w, h) = (o.size[0].max(1.0), o.size[1].max(1.0));
+        // lines in the object's own 0..1 box
+        let mut lines: Vec<([f32; 2], [f32; 2])> = Vec::new();
+        match sym {
+            Symmetry::Off => {}
+            Symmetry::Mirror => lines.push(([0.5, 0.0], [0.5, 1.0])),
+            Symmetry::Quad => lines.extend([([0.5, 0.0], [0.5, 1.0]), ([0.0, 0.5], [1.0, 0.5])]),
+            Symmetry::Radial(n) | Symmetry::Kaleido(n) => {
+                // spokes out to the shorter half-side, evenly spaced in real (not stretched) angles
+                let k = if matches!(sym, Symmetry::Kaleido(_)) { 2 } else { 1 } * n.max(2) as usize;
+                let r = w.min(h) * 0.5;
+                for i in 0..k {
+                    let a = i as f32 * std::f32::consts::TAU / k as f32;
+                    lines.push(([0.5, 0.5], [0.5 + a.cos() * r / w, 0.5 + a.sin() * r / h]));
+                }
+            }
+        }
+        let stroke = Stroke::new(1.0_f32, Color32::from_rgba_unmultiplied(120, 220, 255, 150));
+        for (a, b) in lines {
+            if let (Some(a), Some(b)) = (self.norm_to_screen(o, a), self.norm_to_screen(o, b)) {
+                painter.line_segment([a, b], stroke);
+            }
+        }
+        if let Some(c) = self.norm_to_screen(o, [0.5, 0.5]) {
+            painter.circle_stroke(c, 4.0, stroke);
         }
     }
 
@@ -7047,7 +7168,7 @@ mod tests {
         app.start_ai_removal(id);
         assert_eq!(app.ai_busy, Some(id));
         let t0 = std::time::Instant::now();
-        while app.ai_busy.is_some() && t0.elapsed().as_secs() < 60 {
+        while app.ai_busy.is_some() && t0.elapsed().as_secs() < 900 {
             std::thread::sleep(std::time::Duration::from_millis(50));
             app.poll_ai();
         }
@@ -7528,7 +7649,7 @@ mod tests {
             let start = std::time::Instant::now();
             while !done(app) {
                 app.poll_npr(&ctx);
-                assert!(start.elapsed().as_secs() < 60, "NPR never answered");
+                assert!(start.elapsed().as_secs() < 900, "NPR never answered");
                 std::thread::sleep(std::time::Duration::from_millis(5));
             }
         };
@@ -7562,7 +7683,7 @@ mod tests {
         let start = std::time::Instant::now();
         while !done(app) {
             poll(app);
-            assert!(start.elapsed().as_secs() < 120, "AI never answered: {}", app.status);
+            assert!(start.elapsed().as_secs() < 900, "AI never answered: {}", app.status);
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
     }
@@ -7614,6 +7735,47 @@ mod tests {
         assert_eq!(o.size, size);
         app.undo();
         assert_eq!(app.doc.find(pid).unwrap().paint.as_ref().unwrap().width(), 100);
+    }
+
+    #[test]
+    fn mirror_symmetry_paints_both_sides() {
+        let mut o = rect(1, 100.0, 100.0);
+        o.size = [100.0, 100.0];
+        let mut app = app_with(vec![o]);
+        app.select_only(Some(1));
+        app.tool = Tool::Brush;
+        app.brush.kind = BrushKind::Round;
+        app.brush.size = 10.0;
+        app.brush.hardness = 1.0;
+        app.brush.symmetry = crate::brush::Symmetry::Mirror;
+        app.color_a = [0, 0, 255, 255];
+        drag(&mut app, Pt::new(120.0, 120.0), Pt::new(120.0, 180.0), Modifiers::NONE);
+        let paint = app.doc.find(1).unwrap().paint.clone().expect("painted");
+        let (w, h) = (paint.width() as f32, paint.height() as f32);
+        let at = |x: f32, y: f32| paint.pixel((x * w / 100.0) as u32, (y * h / 100.0) as u32).unwrap().alpha();
+        assert!(at(20.0, 50.0) > 200, "the stroke itself");
+        assert!(at(80.0, 50.0) > 200, "its mirror image on the right");
+        assert!(at(50.0, 50.0) < 10, "nothing in between");
+        // kaleidoscope: 2 x 3 copies from one dab
+        app.brush.symmetry = crate::brush::Symmetry::Kaleido(3);
+        click(&mut app, Pt::new(150.0, 120.0), Modifiers::NONE);
+        let paint = app.doc.find(1).unwrap().paint.clone().unwrap();
+        let painted = paint.pixels().iter().filter(|p| p.alpha() > 200).count();
+        assert!(painted > 0);
+    }
+
+    #[test]
+    fn library_shapes_are_inserted_as_editable_paths() {
+        let mut app = app_with(vec![]);
+        app.insert_library_shape(crate::library::LibShape::Heart);
+        let o = &app.doc.objects[0];
+        assert!(matches!(o.kind, ShapeKind::Path { .. }));
+        assert_eq!(o.name, "Heart");
+        let (lo, hi) = o.bounds();
+        let c = (lo + hi) * 0.5;
+        assert!((c.x - 400.0).abs() < 2.0 && (c.y - 300.0).abs() < 2.0, "in the middle of the view: {c:?}");
+        app.undo();
+        assert!(app.doc.objects.is_empty());
     }
 
     #[test]

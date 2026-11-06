@@ -6,7 +6,10 @@ use std::collections::VecDeque;
 use std::path::Path;
 use tiny_skia::Pixmap;
 
-pub const IMAGE_EXTENSIONS: [&str; 10] = ["png", "jpg", "jpeg", "webp", "bmp", "gif", "tif", "tiff", "tga", "ico"];
+pub const IMAGE_EXTENSIONS: [&str; 26] = [
+    "png", "jpg", "jpeg", "webp", "bmp", "gif", "tif", "tiff", "tga", "ico", "qoi", "jxl", "avif", "heic", "heif", "hif", "jxr",
+    "wdp", "hdp", "dng", "cr2", "cr3", "nef", "arw", "orf", "rw2",
+];
 
 pub fn is_image_path(p: &Path) -> bool {
     p.extension()
@@ -14,10 +17,30 @@ pub fn is_image_path(p: &Path) -> bool {
         .is_some_and(|e| IMAGE_EXTENSIONS.contains(&e.to_ascii_lowercase().as_str()))
 }
 
+/// JPEG XL, decoded in pure Rust (jxl-oxide).
+fn load_jxl(path: &Path) -> Result<image::RgbaImage, String> {
+    let file = std::fs::File::open(path).map_err(|e| e.to_string())?;
+    let dec = jxl_oxide::integration::JxlDecoder::new(std::io::BufReader::new(file)).map_err(|e| e.to_string())?;
+    let img = image::DynamicImage::from_decoder(dec).map_err(|e| e.to_string())?;
+    Ok(img.to_rgba8())
+}
+
+/// Pixels of a picture file: the built-in decoders first, then Windows' own codecs for the
+/// rest (HEIC, AVIF, camera RAW…).
+fn decode(path: &Path) -> Result<image::RgbaImage, String> {
+    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
+    if ext == "jxl" {
+        return load_jxl(path);
+    }
+    match image::open(path) {
+        Ok(img) => Ok(img.to_rgba8()),
+        Err(e) => crate::wic::load(path).map_err(|w| if crate::wic::EXTENSIONS.contains(&ext.as_str()) { w } else { e.to_string() }),
+    }
+}
+
 /// Decode any common image file into a premultiplied pixmap (at most 4096 px per side).
 pub fn load_image(path: &Path) -> Result<Pixmap, String> {
-    let img = image::open(path).map_err(|e| e.to_string())?;
-    let mut rgba = img.to_rgba8();
+    let mut rgba = decode(path)?;
     let (w, h) = rgba.dimensions();
     let max = w.max(h);
     if max > 4096 {

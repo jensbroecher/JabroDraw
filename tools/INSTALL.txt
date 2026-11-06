@@ -1,0 +1,22 @@
+Jabro Draw - test version
+=========================
+
+1. Double-click "Jabro-Draw-0.1.0-Setup.exe".
+
+2. Windows will probably say "Windows protected your PC", because the program is
+   new and not signed with a paid certificate. Click "More info", then
+   "Run anyway".
+
+3. Click "Install". It installs just for you (no administrator password needed)
+   and puts Jabro Draw in the Start menu and on the desktop.
+
+To remove it later: Settings > Apps > Installed apps > Jabro Draw > Uninstall.
+Your drawings are never touched by installing or removing it.
+
+Opening HEIC (iPhone) photos needs the "HEIF Image Extensions" (free) and the
+"HEVC Video Extensions" (a small fee, or preinstalled by many PC makers) from
+the Microsoft Store. AVIF needs the free "AV1 Video Extension". Many Windows 11
+computers already have them.
+
+Everything, including the AI tools, runs on your own computer. Pictures are
+never uploaded anywhere.

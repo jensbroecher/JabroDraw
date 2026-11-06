@@ -17,8 +17,11 @@ mod export;
 mod fonts;
 mod geom;
 mod icon;
+#[path = "../tools/install.rs"]
+mod install;
 mod imageops;
 mod io;
+mod library;
 mod npr;
 mod raster;
 mod render;
@@ -28,6 +31,7 @@ mod styles;
 mod textures;
 mod trace;
 mod upscale;
+mod wic;
 mod vector;
 #[cfg(test)]
 mod tests;
@@ -55,6 +59,12 @@ fn main() -> eframe::Result {
         return Ok(());
     }
 
+    // Remove the installed program (Settings > Apps runs this)
+    if args.len() >= 2 && args[1] == "--uninstall" {
+        uninstall(args.iter().any(|a| a == "--quiet"));
+        return Ok(());
+    }
+
     // Headless AI cut-out: jabro-draw --ai-cutout in.jpg out.png [fast|best]
     if args.len() >= 4 && args[1] == "--ai-cutout" {
         let model = if args.get(4).map(|s| s.as_str()) == Some("fast") { ai::AiModel::Fast } else { ai::AiModel::Best };
@@ -65,6 +75,8 @@ fn main() -> eframe::Result {
         return Ok(());
     }
 
+    // a drawing or picture double-clicked in Explorer
+    let start_file = args.get(1).filter(|a| !a.starts_with("--")).map(std::path::PathBuf::from).filter(|p| p.is_file());
     let mut viewport = egui::ViewportBuilder::default()
         .with_title("Jabro Draw")
         .with_inner_size([1500.0, 950.0])
@@ -78,6 +90,41 @@ fn main() -> eframe::Result {
     eframe::run_native(
         "Jabro Draw",
         options,
-        Box::new(|cc| Ok(Box::new(app::JabroApp::new(cc)))),
+        Box::new(move |cc| {
+            let mut app = app::JabroApp::new(cc);
+            if let Some(p) = start_file {
+                app.open_at_start(p);
+            }
+            Ok(Box::new(app))
+        }),
     )
+}
+
+/// `--uninstall`: remove shortcuts, the Settings > Apps entry, the file type and the program
+/// folder (only if our setup made it). Drawings and settings are left alone.
+fn uninstall(quiet: bool) {
+    let ask = |text: &str| {
+        quiet
+            || rfd::MessageDialog::new()
+                .set_title("Uninstall Jabro Draw")
+                .set_description(text)
+                .set_buttons(rfd::MessageButtons::YesNo)
+                .show()
+                == rfd::MessageDialogResult::Yes
+    };
+    if !ask("Remove Jabro Draw from this computer?\n\nYour drawings are not touched.") {
+        return;
+    }
+    install::remove_shortcuts();
+    install::unregister();
+    let dir = std::env::current_exe().ok().and_then(|e| e.parent().map(|p| p.to_path_buf()));
+    let removed = dir.as_deref().is_some_and(|d| install::delete_dir_after_exit(d).is_ok());
+    if !quiet {
+        let text = if removed {
+            "Jabro Draw has been removed."
+        } else {
+            "Shortcuts and the Settings entry are removed. This copy was not installed by the setup, so its files were left in place."
+        };
+        rfd::MessageDialog::new().set_title("Uninstall Jabro Draw").set_description(text).show();
+    }
 }

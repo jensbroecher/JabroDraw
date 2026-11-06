@@ -18,17 +18,19 @@ pub enum Format {
     Png,
     Jpeg,
     Webp,
+    Avif,
     Svg,
     Psd,
 }
 
 impl Format {
-    pub const ALL: [Format; 5] = [Format::Png, Format::Jpeg, Format::Webp, Format::Svg, Format::Psd];
+    pub const ALL: [Format; 6] = [Format::Png, Format::Jpeg, Format::Webp, Format::Avif, Format::Svg, Format::Psd];
     pub fn label(self) -> &'static str {
         match self {
             Format::Png => "PNG — lossless, transparency",
             Format::Jpeg => "JPEG — small photos, no transparency",
             Format::Webp => "WebP — lossless, transparency",
+            Format::Avif => "AVIF — very small, modern, transparency",
             Format::Svg => "SVG — vectors (effects as pictures)",
             Format::Psd => "PSD — one layer per object",
         }
@@ -38,12 +40,13 @@ impl Format {
             Format::Png => "png",
             Format::Jpeg => "jpg",
             Format::Webp => "webp",
+            Format::Avif => "avif",
             Format::Svg => "svg",
             Format::Psd => "psd",
         }
     }
     pub fn raster(self) -> bool {
-        matches!(self, Format::Png | Format::Jpeg | Format::Webp)
+        matches!(self, Format::Png | Format::Jpeg | Format::Webp | Format::Avif)
     }
 }
 
@@ -181,6 +184,17 @@ pub fn save_raster(pm: &Pixmap, path: &Path, opts: &Options, bg: Rgba) -> Result
         Format::Webp => image::codecs::webp::WebPEncoder::new_lossless(file()?)
             .encode(&straight_rgba(pm), pm.width(), pm.height(), ExtendedColorType::Rgba8)
             .map_err(|e| e.to_string()),
+        Format::Avif => {
+            use image::ImageEncoder;
+            // speed 6 of 1..10: a good size at a few seconds for a large picture
+            let enc = image::codecs::avif::AvifEncoder::new_with_speed_quality(file()?, 6, opts.quality.clamp(1, 100));
+            if opts.transparent {
+                enc.write_image(&straight_rgba(pm), pm.width(), pm.height(), ExtendedColorType::Rgba8)
+            } else {
+                enc.write_image(&rgb_over(pm, bg), pm.width(), pm.height(), ExtendedColorType::Rgb8)
+            }
+            .map_err(|e| e.to_string())
+        }
         _ => Err("not a picture format".into()),
     }
 }

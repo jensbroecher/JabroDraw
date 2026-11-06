@@ -59,13 +59,13 @@ background removal, these models run on the computer; no picture is ever sent an
 
 ## Rust libraries
 
-The program links about 500 crates. Their licenses (checked with `cargo metadata`, 2026-11-06)
+The program links about 540 crates. Their licenses (checked with `cargo metadata`, 2026-11-06)
 are all permissive:
 
 | License | Notes |
 |---|---|
 | MIT and/or Apache-2.0 | the large majority (egui, eframe, tract, image, serde, i_overlay, …) |
-| BSD-2-Clause / BSD-3-Clause | e.g. tiny-skia (BSD-3-Clause) |
+| BSD-2-Clause / BSD-3-Clause | e.g. tiny-skia (BSD-3-Clause), rav1e (BSD-2-Clause), ravif (BSD-3-Clause) |
 | ISC, Zlib, BSL-1.0, 0BSD, Unlicense, CC0-1.0 | small helper crates |
 | Unicode-3.0 | ICU4X data crates (Unicode data license, permissive) |
 | CDLA-Permissive-2.0 | `webpki-roots` (root certificate list), only if TLS is ever used |
@@ -79,11 +79,24 @@ cargo install cargo-about
 cargo about generate about.hbs > licenses/third-party-crates.html
 ```
 
+## Picture formats and patents
+
+- **AVIF export** encodes AV1 with **rav1e** (BSD-2-Clause, Xiph.Org / the rav1e contributors).
+  AV1 is royalty-free; rav1e ships the **AOMedia Patent License 1.0**, a royalty-free patent grant
+  for AV1 implementations.
+- **JPEG XL** pictures are decoded by **jxl-oxide** (MIT or Apache-2.0). JPEG XL is royalty-free.
+- **HEIC / HEIF, AVIF opening, JPEG XR and camera RAW** are decoded by **Windows' own codecs**
+  (Windows Imaging Component and the Microsoft Store codec extensions). Jabro Draw contains no HEVC
+  decoder, so the HEVC patent pools do not concern it; Microsoft licenses those codecs to the
+  user.
+
 ## Algorithms
 
 The NPR looks, bevels and filters are original implementations of published techniques: the
 Kuwahara filter, Hertzmann's painterly rendering, extended difference-of-Gaussians edges, the
-guided filter (He et al.), Felzenszwalb's distance transform and value / Worley noise. No code or
+guided filter (He et al.), Felzenszwalb's distance transform, value / Worley noise, and for
+bitmap tracing k-means colour reduction, pixel-edge contour tracing, Taubin smoothing and
+Douglas-Peucker simplification (no code from potrace or other tracers). No code or
 assets from other drawing programs are used.
 
 ## Name

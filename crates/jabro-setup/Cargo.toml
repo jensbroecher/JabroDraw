@@ -1,0 +1,15 @@
+[package]
+name = "jabro-setup"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Installer for Jabro Draw: one .exe that carries the program and installs it for the current user"
+
+[[bin]]
+name = "jabro-draw-setup"
+path = "src/main.rs"
+
+[dependencies]
+eframe = "0.31"
+rfd = "0.15"
+image = { version = "0.25", default-features = false, features = ["png"] }

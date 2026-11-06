@@ -14,10 +14,16 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 base64 = "0.22"
 i_overlay = "9.1"
-image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "bmp", "gif", "tiff", "tga", "ico"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "bmp", "gif", "tiff", "tga", "ico", "qoi", "avif"] }
 tract-onnx = "0.23"
 jabro-models = { version = "0.1.0", path = "crates/jabro-models" }
 arboard = "3"
+# JPEG XL pictures (pure Rust)
+jxl-oxide = { version = "0.12", features = ["image"] }
+
+[target.'cfg(windows)'.dependencies]
+# Windows' own image codecs (HEIC, AVIF, camera RAW…) through WIC
+windows = { version = "0.58", features = ["Win32_Foundation", "Win32_Graphics_Imaging", "Win32_System_Com"] }
 
 # Pixel loops are painfully slow unoptimised, so even dev builds get optimised.
 [profile.dev]
@@ -32,3 +38,6 @@ lto = "thin"
 
 [dev-dependencies]
 psd = "0.3"
+
+[workspace]
+members = ["crates/jabro-models", "crates/jabro-setup"]
