@@ -253,10 +253,11 @@ See [docs/DESIGN.md](docs/DESIGN.md) for the design notes, the architecture and 
 
 ## Licenses
 
-Jabro Draw has no license chosen yet (all rights reserved by its author). The open-source parts it
-is built from, including the embedded AI models (U²-Net, MobileSAM and Real-ESRGAN), are listed
-with their licenses in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md). Ship that file and the
-`licenses/` folder with every copy of the program you distribute.
+Jabro Draw is free software under the [MIT License](LICENSE): use it, change it and pass it on,
+as long as the licence note stays with it. The open-source parts it is built from, including the
+embedded AI models (U²-Net, MobileSAM and Real-ESRGAN), are listed with their licenses in
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md). Ship that file and the `licenses/` folder with
+every copy of the program you distribute.
 
 The AI model files (about 230 MB) are too big for git. The first build downloads them once from
 their publishers (the rembg project on GitHub, MobileSAM and Real-ESRGAN on Hugging Face) and

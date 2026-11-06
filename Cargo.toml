@@ -3,6 +3,7 @@ name = "jabro-draw"
 version = "0.1.0"
 edition = "2021"
 description = "Jabro Draw - a hybrid vector + paint editor with bevels, textures, perspective and NPR looks"
+license = "MIT"
 publish = false  # no license chosen yet — all rights reserved until you pick one
 
 [dependencies]
