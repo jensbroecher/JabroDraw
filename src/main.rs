@@ -23,6 +23,7 @@ mod render;
 mod shapes;
 mod styles;
 mod textures;
+mod trace;
 mod vector;
 #[cfg(test)]
 mod tests;

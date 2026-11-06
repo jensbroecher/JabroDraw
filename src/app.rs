@@ -158,6 +158,7 @@ enum PropAction {
     FlipV,
     ResetBrushWork,
     AiRemoveBackground,
+    Trace,
     Detach,
     CopyStyle,
     PasteStyle,
@@ -265,6 +266,7 @@ struct PictureUi {
     feather: f32,
     ai_model: AiModel,
     ai_busy: bool,
+    trace: crate::trace::TraceSettings,
 }
 
 /// Undo all brush work on an object: pictures go back to how they were imported, other
@@ -488,6 +490,7 @@ pub struct JabroApp {
     bg_feather: f32,
     ai: AiWorker,
     ai_model: AiModel,
+    trace_settings: crate::trace::TraceSettings,
     /// Object the AI is currently working on.
     ai_busy: Option<u64>,
     /// The document as it was last saved / opened (to detect unsaved changes).
@@ -594,6 +597,7 @@ impl JabroApp {
             bg_feather: 1.5,
             ai,
             ai_model: AiModel::Best,
+            trace_settings: Default::default(),
             ai_busy: None,
             saved_doc,
             close_dialog: false,
@@ -769,6 +773,78 @@ impl JabroApp {
         self.select_only(Some(id));
         self.dirty = true;
         self.status = format!("{}: {} objects combined into one editable path.", op.label(), used.len());
+    }
+
+    /// Trace a picture or paint layer into grouped vector shapes (one per colour) right above
+    /// it, keeping its placement and perspective. The picture is hidden, not deleted.
+    fn trace_object(&mut self, id: u64) {
+        let Some(o) = self.doc.find(id) else { return };
+        let Some(paint) = o.paint.clone() else {
+            self.status = "Only pictures and paint layers can be traced.".into();
+            return;
+        };
+        // what is visible: the pixels with any painted transparency applied
+        let mut src = (*paint).clone();
+        if let Some(mask) = &o.mask {
+            let (pw, ph) = (src.width(), src.height());
+            let (mw, mh) = (mask.width() as f32, mask.height() as f32);
+            let md = mask.data();
+            for (i, px) in src.data_mut().chunks_exact_mut(4).enumerate() {
+                let (x, y) = ((i as u32 % pw) as f32 + 0.5, (i as u32 / pw) as f32 + 0.5);
+                let u = (x / pw as f32 * mw).clamp(0.5, mw - 0.5);
+                let v = (y / ph as f32 * mh).clamp(0.5, mh - 0.5);
+                let k = crate::raster::sample_bilinear(md, mask.width() as i32, mask.height() as i32, u, v)[0] / 255.0;
+                for c in px.iter_mut() {
+                    *c = (*c as f32 * k + 0.5) as u8;
+                }
+            }
+        }
+        let layers = crate::trace::trace(&src, &self.trace_settings);
+        if layers.is_empty() {
+            self.status = "Nothing to trace — the picture is fully transparent.".into();
+            return;
+        }
+        let (sx, sy) = (o.size[0] / src.width() as f32, o.size[1] / src.height() as f32);
+        let hm = o.homography();
+        let name = o.name.clone();
+        let at = self.doc.index_of(id).map_or(self.doc.objects.len(), |i| i + 1);
+        self.checkpoint();
+        let gid = (layers.len() > 1).then(|| self.doc.alloc_id());
+        let mut made = Vec::new();
+        for (i, layer) in layers.iter().enumerate() {
+            let shape: Vec<Vec<[f64; 2]>> = layer
+                .contours
+                .iter()
+                .map(|c| c.iter().map(|p| [(p.x * sx) as f64, (p.y * sy) as f64]).collect())
+                .collect();
+            let Some((subpaths, rect, size)) = vector::polygons_to_object_parts(&vec![shape]) else { continue };
+            let Some(quad) = rect.iter().map(|p| hm.apply_pt(*p)).collect::<Option<Vec<Pt>>>() else { continue };
+            let nid = self.doc.alloc_id();
+            let mut t = Object::new(nid, ShapeKind::Path { subpaths }, 0.0, 0.0, size[0].max(1.0), size[1].max(1.0));
+            t.quad = [quad[0], quad[1], quad[2], quad[3]];
+            t.update_size_from_quad();
+            t.name = format!("{} trace {}", if name.is_empty() { "Picture" } else { &name }, i + 1);
+            t.fill = FillStyle { kind: FillKind::Solid, a: layer.color, ..Default::default() };
+            t.stroke.enabled = false;
+            t.group = gid;
+            made.push(t);
+        }
+        let n = made.len();
+        let first = made.first().map(|t| t.id);
+        for (k, t) in made.into_iter().enumerate() {
+            self.doc.objects.insert(at + k, t);
+        }
+        if let Some(o) = self.doc.find_mut(id) {
+            o.visible = false;
+        }
+        if let Some(f) = first {
+            self.select_only(Some(f));
+            self.extend_to_group(f);
+        }
+        self.dirty = true;
+        self.status = format!(
+            "Traced into {n} vector shape(s), grouped. The picture is hidden in the objects list — delete it or switch it back on."
+        );
     }
 
     /// Lay the selected text along the outline of the other selected object.
@@ -4426,6 +4502,7 @@ impl JabroApp {
             feather: self.bg_feather,
             ai_model: self.ai_model,
             ai_busy: self.ai_busy.is_some(),
+            trace: self.trace_settings,
         };
         egui::ScrollArea::vertical().id_salt("props").show(ui, |ui| {
             match selected.and_then(|id| self.doc.find_mut(id)) {
@@ -4435,7 +4512,7 @@ impl JabroApp {
                 }
             }
         });
-        (self.bg_tol, self.bg_feather, self.ai_model) = (pic.tol, pic.feather, pic.ai_model);
+        (self.bg_tol, self.bg_feather, self.ai_model, self.trace_settings) = (pic.tol, pic.feather, pic.ai_model, pic.trace);
 
         for a in actions {
             match a {
@@ -4510,6 +4587,11 @@ impl JabroApp {
                 PropAction::AiRemoveBackground => {
                     if let Some(id) = selected {
                         self.start_ai_removal(id);
+                    }
+                }
+                PropAction::Trace => {
+                    if let Some(id) = selected {
+                        self.trace_object(id);
                     }
                 }
                 PropAction::CopyStyle => {
@@ -5606,6 +5688,21 @@ fn object_props(
             }
             ui.small("Best for plain or studio backgrounds. Touch up with the Brush tool's Magic wand or Transparency: hide / reveal — the original pixels are always kept.");
             ui.add_space(6.0);
+            ui.strong("Trace to vectors");
+            let t = &mut pic.trace;
+            ui.add(egui::Slider::new(&mut t.colors, 1..=16).text("Colours"))
+                .on_hover_text("1 = a single silhouette");
+            ui.add(egui::Slider::new(&mut t.detail, 0.0..=1.0).text("Detail"));
+            ui.add(egui::Slider::new(&mut t.smooth, 0.0..=1.0).text("Smoothness"));
+            ui.add(egui::Slider::new(&mut t.speckle, 1..=400).logarithmic(true).text("Ignore specks (px)"));
+            if ui
+                .button("Trace")
+                .on_hover_text("Turns the picture into editable vector shapes, one per colour, grouped. The picture is hidden, not deleted.")
+                .clicked()
+            {
+                actions.push(PropAction::Trace);
+            }
+            ui.add_space(6.0);
             if ui
                 .button("Reset brush work")
                 .on_hover_text("Back to the picture as imported: removes painting and all hidden / revealed areas")
@@ -6640,6 +6737,48 @@ mod tests {
         }
         o.relayout_text(before);
         assert!((o.size[1] - h0).abs() < h0 * 0.15, "letters keep their size: {} vs {}", o.size[1], h0);
+    }
+
+    #[test]
+    fn trace_turns_a_picture_into_grouped_vectors_that_look_the_same() {
+        let mut img = Pixmap::new(160, 120).unwrap();
+        img.fill(tiny_skia::Color::from_rgba8(250, 250, 250, 255));
+        let mut paint = tiny_skia::Paint::default();
+        paint.set_color_rgba8(220, 30, 30, 255);
+        let disc = tiny_skia::PathBuilder::from_circle(80.0, 60.0, 45.0).unwrap();
+        img.fill_path(&disc, &paint, tiny_skia::FillRule::Winding, tiny_skia::Transform::identity(), None);
+        paint.set_color_rgba8(20, 40, 200, 255);
+        img.fill_rect(tiny_skia::Rect::from_xywh(65.0, 45.0, 30.0, 30.0).unwrap(), &paint, tiny_skia::Transform::identity(), None);
+        let mut app = app_with(vec![]);
+        app.add_picture_object(img, "Test".into(), Some(Pt::new(300.0, 300.0)));
+        let pid = app.selected.unwrap();
+        // a little perspective, which the traced shapes must keep
+        app.doc.find_mut(pid).unwrap().quad[1].y -= 20.0;
+        app.doc.find_mut(pid).unwrap().update_size_from_quad();
+        let before = Renderer::default().render(&app.doc);
+        app.trace_settings.colors = 3;
+        app.trace_object(pid);
+        assert_eq!(app.doc.objects.len(), 4);
+        assert!(!app.doc.find(pid).unwrap().visible, "picture hidden, not deleted");
+        let traced: Vec<&Object> = app.doc.objects.iter().filter(|o| o.id != pid).collect();
+        assert!(traced.iter().all(|o| matches!(o.kind, ShapeKind::Path { .. }) && o.group.is_some()));
+        assert!(traced.iter().all(|o| o.group == traced[0].group));
+        assert_eq!(app.selection().len(), 3, "the whole group is selected");
+        let after = Renderer::default().render(&app.doc);
+        let mut differ = 0;
+        for y in (200..400).step_by(3) {
+            for x in (200..400).step_by(3) {
+                let (a, b) = (before.pixel(x, y).unwrap().demultiply(), after.pixel(x, y).unwrap().demultiply());
+                let d = (a.red() as i32 - b.red() as i32).abs() + (a.green() as i32 - b.green() as i32).abs() + (a.blue() as i32 - b.blue() as i32).abs();
+                if d > 60 {
+                    differ += 1;
+                }
+            }
+        }
+        assert!(differ < 60, "traced vectors look like the picture ({differ} differing samples)");
+        app.undo();
+        assert_eq!(app.doc.objects.len(), 1);
+        assert!(app.doc.objects[0].visible);
     }
 
     #[test]

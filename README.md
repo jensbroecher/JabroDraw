@@ -78,6 +78,10 @@ Styles: `none watercolor oil impressionist pointillism pencil colorpencil comic`
   to how it was imported. The Brush tool's **Magic wand** clicks away single areas, and
   **Transparency: hide / reveal** paints transparency by hand on any object. All of this goes into a
   mask, so the original pixels are never destroyed (Clear / Invert under Transparency).
+- **Trace to vectors** (Picture section): turns a picture or paint layer into editable vector
+  shapes, one per colour (1–16), grouped and in the picture's place and perspective. Detail,
+  smoothness and speck size are adjustable. The colour layers are stacked so no gaps show between
+  neighbours, and the picture is only hidden, not deleted. The tracer is Jabro Draw's own code.
 - **Picture textures**: Fill › Texture › Image file… fills any shape with a picture (stretched or
   tiled). Transparency › Texture › Image file… uses a picture's brightness as opacity.
 - **Transparency** (properties panel): flat, linear, radial or texture, with start and end opacity,
