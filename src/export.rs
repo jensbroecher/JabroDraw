@@ -83,6 +83,10 @@ pub fn scale_object(o: &mut Object, k: f32) {
     o.effects.shadow.dy *= k;
     o.effects.shadow.blur *= k;
     o.effects.glow.size *= k;
+    o.effects.extrude.depth *= k;
+    for key in &mut o.keys {
+        key.quad = key.quad.map(|c| c * k);
+    }
     o.fill.tex_scale *= k;
     o.transparency.tex_scale *= k;
     o.touch();
@@ -98,7 +102,7 @@ pub fn prepare(doc: &Document, ids: Option<&[u64]>, k: f32) -> Result<Document, 
         d.width = ((hi.x - lo.x).ceil() as u32).max(1);
         d.height = ((hi.y - lo.y).ceil() as u32).max(1);
         for o in &mut d.objects {
-            o.quad = o.quad.map(|c| c - lo);
+            o.translate(Pt::new(-lo.x, -lo.y));
         }
     }
     if (k - 1.0).abs() > 1e-3 {
@@ -117,12 +121,16 @@ pub fn prepare(doc: &Document, ids: Option<&[u64]>, k: f32) -> Result<Document, 
 /// Finished raster picture.
 pub fn render(doc: &Document, ids: Option<&[u64]>, opts: &Options) -> Result<Pixmap, String> {
     let d = prepare(doc, ids, opts.scale)?;
-    let mut r = Renderer::default();
-    let pm = r.render_opts(&d, !opts.transparent);
+    Ok(render_prepared(&mut Renderer::default(), &d, opts))
+}
+
+/// Render a document that `prepare` already scaled, re-using `r`'s cache (animation frames).
+pub fn render_prepared(r: &mut Renderer, d: &Document, opts: &Options) -> Pixmap {
+    let pm = r.render_opts(d, !opts.transparent);
     if !(opts.npr && d.any_look()) {
-        return Ok(pm);
+        return pm;
     }
-    let runs = r.render_runs(&d);
+    let runs = r.render_runs(d);
     let mut out = npr::compose(&runs, d.width, d.height, d.background, opts.scale);
     if opts.transparent {
         // the look is painted on white paper; keep the original transparency
@@ -134,10 +142,10 @@ pub fn render(doc: &Document, ids: Option<&[u64]>, opts: &Options) -> Result<Pix
             o[3] = src[3];
         }
     }
-    Ok(out)
+    out
 }
 
-fn straight_rgba(pm: &Pixmap) -> Vec<u8> {
+pub(crate) fn straight_rgba(pm: &Pixmap) -> Vec<u8> {
     let mut v = Vec::with_capacity(pm.data().len());
     for px in pm.data().chunks_exact(4) {
         let a = px[3] as f32 / 255.0;

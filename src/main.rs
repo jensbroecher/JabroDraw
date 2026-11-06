@@ -6,6 +6,7 @@
 //! quad, and the whole picture can be rendered through an NPR "look".
 
 mod ai;
+mod anim;
 mod app;
 mod brush;
 mod canvas;

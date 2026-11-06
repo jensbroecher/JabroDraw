@@ -943,6 +943,9 @@ pub struct Object {
     pub npr_mode: NprMode,
     #[serde(default)]
     pub npr_own: NprSettings,
+    /// Animation keyframes (sorted by frame). Empty = the object does not move.
+    #[serde(default)]
+    pub keys: Vec<Keyframe>,
     #[serde(skip)]
     pub rev: u64,
 }
@@ -974,6 +977,7 @@ impl Object {
             instance_of: None,
             npr_mode: NprMode::Inherit,
             npr_own: NprSettings::default(),
+            keys: Vec::new(),
             rev: next_rev(),
         }
     }
@@ -1191,6 +1195,7 @@ impl Object {
             && self.npr_mode == o.npr_mode
             && self.npr_own == o.npr_own
             && self.visible == o.visible
+            && self.keys == o.keys
             && paint_same
     }
 }
@@ -1346,6 +1351,100 @@ pub struct Document {
     /// Further looks painted on top of `npr` (e.g. ink outlines over watercolor).
     #[serde(default)]
     pub npr_stack: Vec<NprSettings>,
+    #[serde(default)]
+    pub anim: Animation,
+}
+
+/// Where an object is at one frame of the animation.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Keyframe {
+    pub frame: u32,
+    pub quad: [Pt; 4],
+    pub opacity: f32,
+}
+
+/// Document-wide animation settings.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Animation {
+    pub frames: u32,
+    pub fps: u32,
+    /// Ease in and out of each keyframe instead of moving at constant speed.
+    pub ease: bool,
+    /// Frame shown in the editor.
+    pub current: u32,
+}
+
+impl Default for Animation {
+    fn default() -> Self {
+        Self { frames: 48, fps: 12, ease: true, current: 0 }
+    }
+}
+
+impl Object {
+    /// Interpolated placement and opacity at `frame` (None if the object has no keyframes).
+    pub fn state_at(&self, frame: u32, ease: bool) -> Option<([Pt; 4], f32)> {
+        let first = self.keys.first()?;
+        let last = self.keys.last()?;
+        if frame <= first.frame {
+            return Some((first.quad, first.opacity));
+        }
+        if frame >= last.frame {
+            return Some((last.quad, last.opacity));
+        }
+        let i = self.keys.partition_point(|k| k.frame <= frame);
+        let (a, b) = (&self.keys[i - 1], &self.keys[i]);
+        let mut t = (frame - a.frame) as f32 / (b.frame - a.frame).max(1) as f32;
+        if ease {
+            t = t * t * (3.0 - 2.0 * t);
+        }
+        let quad = [0, 1, 2, 3].map(|c| a.quad[c].lerp(b.quad[c], t));
+        Some((quad, a.opacity + (b.opacity - a.opacity) * t))
+    }
+
+    /// Record the current placement and opacity as the keyframe at `frame`.
+    pub fn set_key(&mut self, frame: u32) {
+        let k = Keyframe { frame, quad: self.quad, opacity: self.opacity };
+        match self.keys.binary_search_by_key(&frame, |k| k.frame) {
+            Ok(i) => self.keys[i] = k,
+            Err(i) => self.keys.insert(i, k),
+        }
+    }
+
+    /// Move the object (and its whole animation path) by `d`.
+    pub fn translate(&mut self, d: Pt) {
+        self.quad = self.quad.map(|c| c + d);
+        for k in &mut self.keys {
+            k.quad = k.quad.map(|c| c + d);
+        }
+    }
+
+    pub fn has_key_at(&self, frame: u32) -> bool {
+        self.keys.iter().any(|k| k.frame == frame)
+    }
+}
+
+impl Document {
+    /// Put every animated object where it is at `frame`. Returns whether anything moved.
+    pub fn apply_frame(&mut self, frame: u32) -> bool {
+        let ease = self.anim.ease;
+        let mut moved = false;
+        for o in &mut self.objects {
+            if let Some((quad, opacity)) = o.state_at(frame, ease) {
+                if o.quad != quad || o.opacity != opacity {
+                    o.quad = quad;
+                    o.opacity = opacity;
+                    o.update_size_from_quad();
+                    moved = true;
+                }
+            }
+        }
+        moved
+    }
+
+    pub fn is_animated(&self) -> bool {
+        self.objects.iter().any(|o| !o.keys.is_empty())
+    }
 }
 
 impl Document {
@@ -1360,6 +1459,7 @@ impl Document {
             next_id: 1,
             guides: Vec::new(),
             npr_stack: Vec::new(),
+            anim: Animation::default(),
         }
     }
 
@@ -1388,6 +1488,7 @@ impl Document {
             && self.npr == o.npr
             && self.guides == o.guides
             && self.npr_stack == o.npr_stack
+            && self.anim == o.anim
             && self.objects.len() == o.objects.len()
             && self
                 .objects

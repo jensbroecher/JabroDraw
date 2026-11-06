@@ -107,6 +107,14 @@ Styles: `none watercolor oil impressionist pointillism pencil colorpencil comic`
   get its own look (properties › NPR look). The look bar can layer up to three looks, such as
   watercolor washes with comic-ink outlines on top. Strokes spill slightly past an object's edges,
   like real paint.
+- **Animation** (View › Animation timeline): select objects, press **Add keyframe**, go to another
+  frame and move, scale, rotate, perspective-bend or fade them. That frame keys itself. Play it
+  back with easing, scrub the keyframe strip, and export an animated GIF or numbered PNG frames for
+  a video editor (File › Export animation, or Export… in the timeline), optionally with the NPR
+  look and at a larger size.
+- **Painting time-lapse** (File › Painting time-lapse…): while you work, Jabro Draw records small
+  snapshots of the canvas (one per change, and a few during long brush strokes). Save them as a GIF
+  or PNG frames of any length. The recording lasts for the session and is not saved in the file.
 - **Never lose work**: unsaved changes are written to a recovery file every minute, in the
   background. If Jabro Draw is closed unexpectedly, the next start offers to recover the drawing.
   File › **Open recent** lists the last 10 files.

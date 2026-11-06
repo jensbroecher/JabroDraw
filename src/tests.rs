@@ -863,3 +863,70 @@ fn extrude_adds_lit_sides_behind_the_face() {
     let tapered = Renderer::default().render(&extrude_doc(0.9));
     assert!(tapered.pixel(155, 155).unwrap().demultiply().green() > 240, "a vanishing back stays small");
 }
+
+// ------------------------------------------------------------------ animation export
+
+fn moving_box_doc() -> Document {
+    let mut doc = Document::new(120, 80);
+    let id = doc.alloc_id();
+    let mut o = Object::new(id, ShapeKind::Rect { corner: 0.0 }, 10.0, 20.0, 30.0, 30.0);
+    o.fill.a = [200, 30, 30, 255];
+    o.set_key(0);
+    o.quad = Object::rect_quad(80.0, 20.0, 30.0, 30.0);
+    o.set_key(5);
+    doc.objects.push(o);
+    doc.anim.frames = 6;
+    doc.anim.ease = false;
+    doc
+}
+
+fn gif_frames(path: &std::path::Path) -> Vec<image::Frame> {
+    use image::AnimationDecoder;
+    let f = std::io::BufReader::new(std::fs::File::open(path).unwrap());
+    image::codecs::gif::GifDecoder::new(f).unwrap().into_frames().collect_frames().unwrap()
+}
+
+#[test]
+fn animation_exports_every_frame_as_gif_and_png_sequence() {
+    use crate::anim::{self, AnimFormat};
+    let doc = moving_box_doc();
+    let (tx, _rx) = std::sync::mpsc::channel();
+    let gif = std::env::temp_dir().join("jabro_anim_test.gif");
+    anim::export_animation(&doc, &export::Options::default(), AnimFormat::Gif, &gif, &tx).unwrap();
+    let frames = gif_frames(&gif);
+    let _ = std::fs::remove_file(&gif);
+    assert_eq!(frames.len(), 6);
+    let red = |f: &image::Frame, x: u32| f.buffer().get_pixel(x, 35)[1] < 100;
+    assert!(red(&frames[0], 20) && !red(&frames[0], 95), "starts on the left");
+    assert!(!red(&frames[5], 20) && red(&frames[5], 95), "ends on the right");
+
+    let png = std::env::temp_dir().join("jabro_anim_seq.png");
+    anim::export_animation(&doc, &export::Options::default(), AnimFormat::PngSequence, &png, &tx).unwrap();
+    for i in 0..6 {
+        let p = anim::frame_path(&png, i);
+        assert!(p.exists(), "{} written", p.display());
+        let _ = std::fs::remove_file(p);
+    }
+    // the document itself is untouched by exporting
+    assert_eq!(doc.objects[0].quad[0], Pt::new(80.0, 20.0));
+}
+
+#[test]
+fn timelapse_export_holds_the_last_frame() {
+    use crate::anim::{self, AnimFormat};
+    let mut doc = moving_box_doc();
+    let mut shots = Vec::new();
+    for f in [0, 2, 5] {
+        doc.apply_frame(f);
+        let pm = Renderer::default().render(&doc);
+        shots.push(Arc::new(anim::snapshot(&pm, 640, doc.background).unwrap()));
+    }
+    let (tx, _rx) = std::sync::mpsc::channel();
+    let gif = std::env::temp_dir().join("jabro_timelapse_test.gif");
+    anim::export_timelapse(&shots, 3.0, AnimFormat::Gif, &gif, &tx).unwrap();
+    let frames = gif_frames(&gif);
+    let _ = std::fs::remove_file(&gif);
+    assert_eq!(frames.len(), 3);
+    let (n, d) = frames[2].delay().numer_denom_ms();
+    assert!(n / d >= 2000, "the finished picture stays a while");
+}

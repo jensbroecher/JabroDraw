@@ -8,7 +8,7 @@ use crate::ai::{self, AiJob, AiModel, AiWorker};
 use crate::canvas::{self, Settings};
 use crate::render::Renderer;
 use crate::vector::{self, BoolOp};
-use crate::{demo, export, imageops, io, shapes, styles};
+use crate::{anim, demo, export, imageops, io, shapes, styles};
 use eframe::egui::{self, Color32, Modifiers, Pos2, Rect, Sense, Shape, Stroke, Vec2};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -522,6 +522,20 @@ pub struct JabroApp {
     gen: u64,
     npr_preview: bool,
     npr_pending: bool,
+    // animation
+    show_timeline: bool,
+    /// Playback clock: (time it started, frame it started from).
+    playing: Option<(f64, u32)>,
+    anim_job: Option<std::sync::mpsc::Receiver<anim::Msg>>,
+    anim_progress: (u32, u32),
+    anim_scale: f32,
+    anim_npr: bool,
+    /// Canvas snapshots for the painting time-lapse (PNG bytes, oldest first), this session only.
+    timelapse: Vec<Arc<Vec<u8>>>,
+    timelapse_due: bool,
+    timelapse_at: f64,
+    timelapse_seconds: f32,
+    show_timelapse: bool,
     npr_busy: bool,
     worker: NprWorker,
     status: String,
@@ -627,6 +641,17 @@ impl JabroApp {
             gen: 0,
             npr_preview: true,
             npr_pending: false,
+            show_timeline: false,
+            playing: None,
+            anim_job: None,
+            anim_progress: (0, 0),
+            anim_scale: 1.0,
+            anim_npr: true,
+            timelapse: Vec::new(),
+            timelapse_due: true,
+            timelapse_at: 0.0,
+            timelapse_seconds: 12.0,
+            show_timelapse: false,
             npr_busy: false,
             worker,
             status: "Welcome to Jabro Draw — this demo scene is fully editable.".into(),
@@ -656,6 +681,7 @@ impl JabroApp {
     // ---------------------------------------------------------------- history
 
     fn push_undo(&mut self, d: Document) {
+        self.timelapse_due = true;
         self.undo.push(d);
         if self.undo.len() > 80 {
             self.undo.remove(0);
@@ -1135,6 +1161,8 @@ impl JabroApp {
         self.saved_doc = doc.clone();
         self.doc = doc;
         self.renderer.clear();
+        self.timelapse.clear();
+        self.playing = None;
         self.selected = None;
         self.fit_pending = true;
         self.dirty = true;
@@ -1156,7 +1184,7 @@ impl JabroApp {
         let h = h.clamp(canvas::MIN_SIZE, canvas::MAX_SIZE);
         if offset != Pt::default() {
             for o in &mut self.doc.objects {
-                o.quad = o.quad.map(|c| c + offset);
+                o.translate(offset);
             }
         }
         // keep content at the same spot on screen: origin_new = origin_old - offset * zoom
@@ -1525,7 +1553,17 @@ impl JabroApp {
     }
 
     fn has_unsaved_changes(&self) -> bool {
-        self.pen.is_some() || !self.doc.same_content(&self.saved_doc)
+        if self.pen.is_some() {
+            return true;
+        }
+        if self.doc.anim.current != self.saved_doc.anim.current && self.doc.is_animated() {
+            // just looking at another frame of the animation is not a change
+            let mut d = self.doc.clone();
+            d.anim.current = self.saved_doc.anim.current;
+            d.apply_frame(d.anim.current);
+            return !d.same_content(&self.saved_doc);
+        }
+        !self.doc.same_content(&self.saved_doc)
     }
 
     fn doc_name(&self) -> String {
@@ -1729,19 +1767,27 @@ impl JabroApp {
     }
 
     fn refresh(&mut self, ctx: &egui::Context) {
+        let pointer_down = ctx.input(|i| i.pointer.any_down());
+        let now = ctx.input(|i| i.time);
         if self.dirty {
+            self.autokey();
             self.sync_instances();
             let pm = self.renderer.render(&self.doc);
             self.gen += 1;
             self.upload(ctx, &pm);
+            // time-lapse: one snapshot per finished change, and a few while a stroke goes on
+            if self.playing.is_none()
+                && (self.timelapse_due && !pointer_down || pointer_down && now - self.timelapse_at > 0.7)
+            {
+                self.record_timelapse(&pm, now);
+            }
             self.raw = Some(pm);
             self.dirty = false;
-            self.npr_pending = self.npr_preview && self.doc.any_look();
+            self.npr_pending = self.npr_preview && self.doc.any_look() && self.playing.is_none();
             if !self.npr_pending {
                 self.npr_busy = false;
             }
         }
-        let pointer_down = ctx.input(|i| i.pointer.any_down());
         if self.npr_pending && !pointer_down {
             let runs = self.renderer.render_runs(&self.doc);
             self.worker.submit(NprJob {
@@ -2529,7 +2575,7 @@ impl JabroApp {
             let mut c = self.doc.objects[i].clone();
             c.id = new_id;
             c.name = format!("{} (clone)", c.name.trim_end_matches(" (clone)"));
-            c.quad = c.quad.map(|p| p + Pt::new(20.0, 20.0));
+            c.translate(Pt::new(20.0, 20.0));
             c.group = c.group.map(|g| *group_map.entry(g).or_insert_with(|| self.doc.alloc_id()));
             c.touch();
             self.doc.objects.push(c);
@@ -2803,7 +2849,7 @@ impl JabroApp {
             let id = self.doc.alloc_id();
             let mut o = src;
             o.id = id;
-            o.quad = o.quad.map(|c| c + off);
+            o.translate(off);
             o.instance_of = None;
             o.group = o.group.map(|g| *group_map.entry(g).or_insert_with(|| self.doc.alloc_id()));
             o.touch();
@@ -3541,7 +3587,7 @@ impl JabroApp {
             o.name = format!("{} copy", o.name);
             o.instance_of = None;
             o.group = o.group.map(|g| *group_map.entry(g).or_insert_with(|| self.doc.alloc_id()));
-            o.quad = o.quad.map(|p| p + Pt::new(20.0, 20.0));
+            o.translate(Pt::new(20.0, 20.0));
             o.touch();
             self.doc.objects.insert(i + 1, o);
             if Some(old) == primary {
@@ -3792,6 +3838,14 @@ impl JabroApp {
                     ui.close_menu();
                     self.open_export_dialog();
                 }
+                if ui.button("Export animation (GIF)…").clicked() {
+                    ui.close_menu();
+                    self.export_animation_dialog(anim::AnimFormat::Gif);
+                }
+                if ui.button("Painting time-lapse…").clicked() {
+                    ui.close_menu();
+                    self.show_timelapse = true;
+                }
                 ui.separator();
                 if ui.button("Load demo scene").clicked() {
                     self.replace_doc(demo::demo_document());
@@ -3949,6 +4003,7 @@ impl JabroApp {
                     ui.close_menu();
                 }
                 ui.checkbox(&mut self.npr_preview, "Show NPR look");
+                ui.checkbox(&mut self.show_timeline, "Animation timeline");
                 ui.separator();
                 let before = self.settings.clone();
                 ui.checkbox(&mut self.settings.snap, "Snap to objects, canvas and guides")
@@ -5953,9 +6008,15 @@ impl eframe::App for JabroApp {
         self.update_title(ctx);
         self.shortcuts(ctx);
         self.read_pressure(ctx);
+        self.poll_anim_job(ctx);
+        self.tick_playback(ctx);
+        self.timelapse_window(ctx);
         egui::TopBottomPanel::top("menu").show(ctx, |ui| self.menu_bar(ui, ctx));
         egui::TopBottomPanel::top("look").show(ctx, |ui| self.look_bar(ui));
         egui::TopBottomPanel::bottom("status").show(ctx, |ui| self.status_bar(ui));
+        if self.show_timeline {
+            egui::TopBottomPanel::bottom("timeline").show(ctx, |ui| self.timeline_panel(ui));
+        }
         egui::SidePanel::left("tools")
             .resizable(false)
             .exact_width(190.0)
@@ -5988,6 +6049,275 @@ impl eframe::App for JabroApp {
                 });
             self.show_about = open;
         }
+    }
+}
+
+// -------------------------------------------------------------------- animation & time-lapse
+impl JabroApp {
+    /// Show `frame`: animated objects move to where they are then.
+    fn set_frame(&mut self, frame: u32) {
+        let f = frame.min(self.doc.anim.frames.saturating_sub(1));
+        self.doc.anim.current = f;
+        if self.doc.apply_frame(f) {
+            self.dirty = true;
+        }
+    }
+
+    /// Moving or fading an animated object records a keyframe at the current frame.
+    fn autokey(&mut self) {
+        let (f, ease) = (self.doc.anim.current, self.doc.anim.ease);
+        for id in self.selection() {
+            if let Some(o) = self.doc.find_mut(id) {
+                if o.state_at(f, ease).is_some_and(|(q, op)| q != o.quad || op != o.opacity) {
+                    o.set_key(f);
+                }
+            }
+        }
+    }
+
+    fn add_keyframes(&mut self) {
+        let ids = self.selection();
+        if ids.is_empty() {
+            self.status = "Select the objects to animate first.".into();
+            return;
+        }
+        self.checkpoint();
+        let f = self.doc.anim.current;
+        for id in &ids {
+            if let Some(o) = self.doc.find_mut(*id) {
+                o.set_key(f);
+            }
+        }
+        self.dirty = true;
+        self.status = format!(
+            "Keyframe at frame {} for {} object(s). Go to another frame and move, scale, bend or fade them — that frame keys itself.",
+            f + 1,
+            ids.len()
+        );
+    }
+
+    fn delete_keyframes(&mut self, all: bool) {
+        let ids = self.selection();
+        let f = self.doc.anim.current;
+        let hit = ids
+            .iter()
+            .filter_map(|id| self.doc.find(*id))
+            .any(|o| if all { !o.keys.is_empty() } else { o.has_key_at(f) });
+        if !hit {
+            return;
+        }
+        self.checkpoint();
+        for id in ids {
+            if let Some(o) = self.doc.find_mut(id) {
+                if all {
+                    o.keys.clear();
+                } else {
+                    o.keys.retain(|k| k.frame != f);
+                }
+            }
+        }
+        self.set_frame(f);
+        self.dirty = true;
+    }
+
+    fn tick_playback(&mut self, ctx: &egui::Context) {
+        let Some((t0, f0)) = self.playing else { return };
+        let a = &self.doc.anim;
+        let n = a.frames.max(1);
+        let f = (f0 + ((ctx.input(|i| i.time) - t0) * a.fps.max(1) as f64) as u32) % n;
+        if f != self.doc.anim.current {
+            self.set_frame(f);
+        }
+        ctx.request_repaint();
+    }
+
+    fn poll_anim_job(&mut self, ctx: &egui::Context) {
+        let Some(rx) = &self.anim_job else { return };
+        let mut done = None;
+        while let Ok(m) = rx.try_recv() {
+            match m {
+                anim::Msg::Progress(i, n) => self.anim_progress = (i, n),
+                anim::Msg::Done(s) => done = Some(s),
+                anim::Msg::Failed(e) => done = Some(format!("Export failed: {e}")),
+            }
+        }
+        if let Some(s) = done {
+            self.status = s;
+            self.anim_job = None;
+        } else {
+            ctx.request_repaint_after(std::time::Duration::from_millis(150));
+        }
+    }
+
+    fn export_animation_dialog(&mut self, format: anim::AnimFormat) {
+        if !self.doc.is_animated() {
+            self.status = "Nothing moves yet: select objects, press Add keyframe, then change frame and move them.".into();
+            return;
+        }
+        let (ext, label) = match format {
+            anim::AnimFormat::Gif => ("gif", "Animated GIF"),
+            anim::AnimFormat::PngSequence => ("png", "PNG frames"),
+        };
+        let Some(path) = rfd::FileDialog::new().add_filter(label, &[ext]).set_file_name(format!("animation.{ext}")).save_file()
+        else {
+            return;
+        };
+        let doc = self.doc.clone();
+        let opts = export::Options { scale: self.anim_scale, npr: self.anim_npr, ..Default::default() };
+        self.anim_progress = (0, doc.anim.frames);
+        self.anim_job = Some(anim::spawn(move |tx| anim::export_animation(&doc, &opts, format, &path, tx)));
+    }
+
+    fn record_timelapse(&mut self, pm: &Pixmap, now: f64) {
+        self.timelapse_due = false;
+        self.timelapse_at = now;
+        let Some(png) = anim::snapshot(pm, 640, self.doc.background) else { return };
+        if self.timelapse.last().is_some_and(|l| **l == png) {
+            return;
+        }
+        self.timelapse.push(Arc::new(png));
+        if self.timelapse.len() > 1500 {
+            // keep memory in check: thin out the middle, keep the first and the latest
+            let last = self.timelapse.len() - 1;
+            let mut i = 0;
+            self.timelapse.retain(|_| {
+                i += 1;
+                i == 1 || (i - 1) % 2 == 0 || i - 1 == last
+            });
+        }
+    }
+
+    fn timeline_panel(&mut self, ui: &mut egui::Ui) {
+        let frames = self.doc.anim.frames.max(1);
+        ui.horizontal(|ui| {
+            let playing = self.playing.is_some();
+            if ui.button(if playing { "⏸ Pause" } else { "▶ Play" }).clicked() {
+                self.playing = if playing { None } else { Some((ui.input(|i| i.time), self.doc.anim.current)) };
+                if playing {
+                    self.dirty = true; // bring the NPR look back
+                }
+            }
+            if ui.button("⏮").on_hover_text("First frame").clicked() {
+                self.playing = None;
+                self.set_frame(0);
+            }
+            let mut f = self.doc.anim.current + 1;
+            if ui.add(egui::Slider::new(&mut f, 1..=frames).text("frame")).changed() {
+                self.playing = None;
+                self.set_frame(f - 1);
+            }
+            ui.label(format!("{:.2} s", self.doc.anim.current as f32 / self.doc.anim.fps.max(1) as f32));
+            ui.separator();
+            if ui.button("◆ Add keyframe").on_hover_text("Remember where the selected objects are at this frame").clicked() {
+                self.add_keyframes();
+            }
+            if ui.button("Delete keyframe").clicked() {
+                self.delete_keyframes(false);
+            }
+            if ui.button("Clear animation").on_hover_text("Remove all keyframes of the selected objects").clicked() {
+                self.delete_keyframes(true);
+            }
+            ui.separator();
+            let mut a = self.doc.anim.clone();
+            ui.add(egui::DragValue::new(&mut a.frames).range(2..=1200).suffix(" frames"));
+            ui.add(egui::DragValue::new(&mut a.fps).range(1..=60).suffix(" fps"));
+            ui.checkbox(&mut a.ease, "Ease");
+            if a != self.doc.anim {
+                self.doc.anim = a;
+                let cur = self.doc.anim.current;
+                self.set_frame(cur);
+                self.dirty = true;
+            }
+            ui.separator();
+            if let Some((i, n)) = self.anim_job.as_ref().map(|_| self.anim_progress) {
+                ui.spinner();
+                ui.label(format!("Exporting {i} / {n}"));
+            } else {
+                ui.menu_button("Export…", |ui| {
+                    ui.add(egui::Slider::new(&mut self.anim_scale, 0.25..=4.0).text("Size ×"));
+                    ui.checkbox(&mut self.anim_npr, "Include the NPR look");
+                    if ui.button("Animated GIF…").clicked() {
+                        ui.close_menu();
+                        self.export_animation_dialog(anim::AnimFormat::Gif);
+                    }
+                    if ui.button("PNG frames (for video)…").clicked() {
+                        ui.close_menu();
+                        self.export_animation_dialog(anim::AnimFormat::PngSequence);
+                    }
+                });
+            }
+        });
+        // keyframe strip: diamonds for the selection, ticks for everything else; click to jump
+        let (rect, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 18.0), egui::Sense::click_and_drag());
+        let p = ui.painter_at(rect);
+        p.rect_filled(rect, 3.0, Color32::from_gray(38));
+        let x_of = |f: u32| rect.left() + 8.0 + (rect.width() - 16.0) * f as f32 / (frames - 1).max(1) as f32;
+        let sel = self.selection();
+        for o in &self.doc.objects {
+            let mine = sel.contains(&o.id);
+            for k in &o.keys {
+                let c = Pos2::new(x_of(k.frame), rect.center().y);
+                if mine {
+                    let d = 5.0;
+                    p.add(egui::Shape::convex_polygon(
+                        vec![c + Vec2::new(0.0, -d), c + Vec2::new(d, 0.0), c + Vec2::new(0.0, d), c + Vec2::new(-d, 0.0)],
+                        Color32::from_rgb(255, 200, 60),
+                        egui::Stroke::NONE,
+                    ));
+                } else {
+                    p.line_segment([c + Vec2::new(0.0, -4.0), c + Vec2::new(0.0, 4.0)], egui::Stroke::new(1.0_f32, Color32::from_gray(120)));
+                }
+            }
+        }
+        let cx = x_of(self.doc.anim.current);
+        p.line_segment([Pos2::new(cx, rect.top()), Pos2::new(cx, rect.bottom())], egui::Stroke::new(2.0_f32, Color32::from_rgb(90, 170, 255)));
+        if let Some(pos) = resp.interact_pointer_pos() {
+            let t = ((pos.x - rect.left() - 8.0) / (rect.width() - 16.0)).clamp(0.0, 1.0);
+            self.playing = None;
+            self.set_frame((t * (frames - 1) as f32).round() as u32);
+        }
+    }
+
+    fn timelapse_window(&mut self, ctx: &egui::Context) {
+        if !self.show_timelapse {
+            return;
+        }
+        let mut open = true;
+        egui::Window::new("Painting time-lapse").open(&mut open).resizable(false).show(ctx, |ui| {
+            ui.label(format!(
+                "{} snapshots recorded since this drawing was opened. Every change adds one, and long brush strokes add a few.",
+                self.timelapse.len()
+            ));
+            ui.add(egui::Slider::new(&mut self.timelapse_seconds, 3.0..=60.0).text("Length (seconds)"));
+            if let Some((i, n)) = self.anim_job.as_ref().map(|_| self.anim_progress) {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label(format!("Exporting {i} / {n}"));
+                });
+            } else {
+                ui.horizontal(|ui| {
+                    for (format, label, ext) in
+                        [(anim::AnimFormat::Gif, "Save GIF…", "gif"), (anim::AnimFormat::PngSequence, "Save PNG frames…", "png")]
+                    {
+                        if ui.add_enabled(self.timelapse.len() > 1, egui::Button::new(label)).clicked() {
+                            if let Some(path) = rfd::FileDialog::new()
+                                .add_filter(label.trim_end_matches('…'), &[ext])
+                                .set_file_name(format!("timelapse.{ext}"))
+                                .save_file()
+                            {
+                                let frames = self.timelapse.clone();
+                                let secs = self.timelapse_seconds;
+                                self.anim_progress = (0, frames.len() as u32);
+                                self.anim_job =
+                                    Some(anim::spawn(move |tx| anim::export_timelapse(&frames, secs, format, &path, tx)));
+                            }
+                        }
+                    }
+                });
+            }
+            ui.small("The recording lives in memory for this session; it is not stored in the .jabro file.");
+        });
+        self.show_timelapse = open;
     }
 }
 
@@ -6779,6 +7109,56 @@ mod tests {
         app.undo();
         assert_eq!(app.doc.objects.len(), 1);
         assert!(app.doc.objects[0].visible);
+    }
+
+    #[test]
+    fn keyframes_move_objects_between_frames_and_moving_keys_itself() {
+        let mut app = app_with(vec![rect(1, 100.0, 100.0)]);
+        app.select_only(Some(1));
+        app.add_keyframes();
+        app.set_frame(24);
+        drag(&mut app, Pt::new(150.0, 150.0), Pt::new(350.0, 150.0), Modifiers::NONE);
+        app.autokey();
+        let o = app.doc.find(1).unwrap();
+        assert_eq!(o.keys.iter().map(|k| k.frame).collect::<Vec<_>>(), vec![0, 24]);
+        app.set_frame(12);
+        let x = app.doc.find(1).unwrap().quad[0].x;
+        assert!((x - 200.0).abs() < 0.5, "halfway at frame 12: {x}");
+        app.doc.anim.ease = false;
+        app.set_frame(6);
+        assert!((app.doc.find(1).unwrap().quad[0].x - 150.0).abs() < 0.5, "linear without easing");
+        app.set_frame(40);
+        assert!((app.doc.find(1).unwrap().quad[0].x - 300.0).abs() < 0.5, "holds after the last key");
+        // scrubbing is not an unsaved change
+        app.saved_doc = app.doc.clone();
+        app.set_frame(3);
+        assert!(!app.has_unsaved_changes());
+        // fading keys itself too, and deleting a key brings the old path back
+        app.set_frame(24);
+        app.doc.find_mut(1).unwrap().opacity = 0.2;
+        app.autokey();
+        app.set_frame(12);
+        assert!((app.doc.find(1).unwrap().opacity - 0.6).abs() < 0.05);
+        app.set_frame(24);
+        app.delete_keyframes(false);
+        assert_eq!(app.doc.find(1).unwrap().keys.len(), 1);
+        assert!((app.doc.find(1).unwrap().quad[0].x - 100.0).abs() < 0.5, "back to the only key");
+        app.delete_keyframes(true);
+        assert!(app.doc.find(1).unwrap().keys.is_empty());
+    }
+
+    #[test]
+    fn timelapse_skips_identical_snapshots() {
+        let mut app = app_with(vec![rect(1, 100.0, 100.0)]);
+        let pm = Renderer::default().render(&app.doc);
+        app.record_timelapse(&pm, 1.0);
+        app.record_timelapse(&pm, 2.0);
+        assert_eq!(app.timelapse.len(), 1);
+        app.doc.objects[0].fill.a = [0, 200, 0, 255];
+        app.doc.objects[0].touch();
+        let pm = Renderer::default().render(&app.doc);
+        app.record_timelapse(&pm, 3.0);
+        assert_eq!(app.timelapse.len(), 2);
     }
 
     #[test]
