@@ -1258,19 +1258,62 @@ pub enum NprStyle {
     Pencil,
     ColorPencil,
     ComicInk,
+    Linocut,
+    Risograph,
+    PopArt,
+    Engraving,
+    Gouache,
+    Pastel,
+    StainedGlass,
+    SumiE,
+    PaperCut,
+    Chalkboard,
+    Blueprint,
 }
 
 impl NprStyle {
-    pub const ALL: [NprStyle; 8] = [
+    pub const ALL: [NprStyle; 19] = [
         NprStyle::None,
         NprStyle::Watercolor,
         NprStyle::OilPaint,
+        NprStyle::Gouache,
         NprStyle::Impressionist,
         NprStyle::Pointillism,
+        NprStyle::Pastel,
         NprStyle::Pencil,
         NprStyle::ColorPencil,
+        NprStyle::SumiE,
         NprStyle::ComicInk,
+        NprStyle::PopArt,
+        NprStyle::Linocut,
+        NprStyle::Engraving,
+        NprStyle::Risograph,
+        NprStyle::PaperCut,
+        NprStyle::StainedGlass,
+        NprStyle::Chalkboard,
+        NprStyle::Blueprint,
     ];
+    /// What the "Brush" slider sets for this look.
+    pub fn brush_label(self) -> &'static str {
+        match self {
+            NprStyle::PopArt => "Dots",
+            NprStyle::Engraving | NprStyle::Blueprint => "Lines",
+            NprStyle::StainedGlass => "Pieces",
+            NprStyle::Risograph => "Grain",
+            NprStyle::PaperCut => "Pieces",
+            NprStyle::Linocut => "Cuts",
+            _ => "Brush",
+        }
+    }
+    /// What the "Paper" slider sets for this look.
+    pub fn paper_label(self) -> &'static str {
+        match self {
+            NprStyle::StainedGlass => "Glass",
+            NprStyle::Chalkboard => "Dust",
+            NprStyle::OilPaint | NprStyle::Gouache | NprStyle::Impressionist | NprStyle::Pointillism => "Canvas",
+            _ => "Paper",
+        }
+    }
     pub fn label(self) -> &'static str {
         match self {
             NprStyle::None => "None (clean)",
@@ -1281,6 +1324,17 @@ impl NprStyle {
             NprStyle::Pencil => "Pencil sketch",
             NprStyle::ColorPencil => "Colored pencil",
             NprStyle::ComicInk => "Comic ink",
+            NprStyle::Linocut => "Linocut / woodcut",
+            NprStyle::Risograph => "Risograph print",
+            NprStyle::PopArt => "Pop-art halftone",
+            NprStyle::Engraving => "Engraving (cross-hatch)",
+            NprStyle::Gouache => "Gouache (poster paint)",
+            NprStyle::Pastel => "Pastel & charcoal",
+            NprStyle::StainedGlass => "Stained glass",
+            NprStyle::SumiE => "Sumi-e ink wash",
+            NprStyle::PaperCut => "Paper cut-out",
+            NprStyle::Chalkboard => "Chalkboard",
+            NprStyle::Blueprint => "Blueprint",
         }
     }
     pub fn from_name(s: &str) -> Option<NprStyle> {
@@ -1294,6 +1348,17 @@ impl NprStyle {
             "pencil" => NprStyle::Pencil,
             "colorpencil" | "colourpencil" => NprStyle::ColorPencil,
             "comic" | "ink" => NprStyle::ComicInk,
+            "linocut" | "woodcut" => NprStyle::Linocut,
+            "riso" | "risograph" => NprStyle::Risograph,
+            "popart" | "halftone" => NprStyle::PopArt,
+            "engraving" | "hatch" | "crosshatch" => NprStyle::Engraving,
+            "gouache" | "poster" => NprStyle::Gouache,
+            "pastel" | "chalk" => NprStyle::Pastel,
+            "glass" | "stainedglass" | "mosaic" => NprStyle::StainedGlass,
+            "sumie" | "sumi" | "inkwash" => NprStyle::SumiE,
+            "papercut" | "cutout" | "collage" => NprStyle::PaperCut,
+            "chalkboard" | "blackboard" => NprStyle::Chalkboard,
+            "blueprint" | "cyanotype" => NprStyle::Blueprint,
             _ => return None,
         })
     }
@@ -1353,6 +1418,24 @@ pub struct Document {
     pub npr_stack: Vec<NprSettings>,
     #[serde(default)]
     pub anim: Animation,
+    /// Set when this document is an item of the object gallery.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gallery: Option<GalleryMeta>,
+}
+
+/// Name and filing of a gallery item. It travels inside the item's .jabro file, so an item
+/// stays complete when it is copied, e-mailed or shared.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct GalleryMeta {
+    /// Stable id (32 hex digits): the same item keeps it through renaming and sharing.
+    pub id: String,
+    pub name: String,
+    pub category: String,
+    /// When it was added, in seconds since 1970 (UTC).
+    pub created: u64,
+    /// Jabro Draw version that made it.
+    pub app: String,
 }
 
 /// Where an object is at one frame of the animation.
@@ -1460,6 +1543,7 @@ impl Document {
             guides: Vec::new(),
             npr_stack: Vec::new(),
             anim: Animation::default(),
+            gallery: None,
         }
     }
 
@@ -1489,6 +1573,7 @@ impl Document {
             && self.guides == o.guides
             && self.npr_stack == o.npr_stack
             && self.anim == o.anim
+            && self.gallery == o.gallery
             && self.objects.len() == o.objects.len()
             && self
                 .objects

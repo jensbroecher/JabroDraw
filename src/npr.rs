@@ -1,5 +1,6 @@
 //! NPR (non-photorealistic rendering) "looks" applied to the finished picture:
-//! watercolor, oil, impressionist strokes, pointillism, pencil, colored pencil, comic ink.
+//! watercolor, oil, impressionist strokes, pointillism, pencil, colored pencil, comic ink,
+//! and the print and craft styles in `looks`.
 //! Runs on a background worker thread so the UI stays responsive.
 
 use crate::doc::{NprSettings, NprStyle, Rgba};
@@ -81,11 +82,11 @@ impl Img {
     }
 }
 
-fn dist3(a: [f32; 3], b: [f32; 3]) -> f32 {
+pub(crate) fn dist3(a: [f32; 3], b: [f32; 3]) -> f32 {
     ((a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2) + (a[2] - b[2]).powi(2)).sqrt()
 }
 
-fn saturate(img: &mut Img, k: f32) {
+pub(crate) fn saturate(img: &mut Img, k: f32) {
     for i in 0..img.w * img.h {
         let l = 0.299 * img.p[0][i] + 0.587 * img.p[1][i] + 0.114 * img.p[2][i];
         for c in 0..3 {
@@ -94,7 +95,7 @@ fn saturate(img: &mut Img, k: f32) {
     }
 }
 
-fn paper_grain(w: usize, h: usize, seed: u32, k: f32) -> Vec<f32> {
+pub(crate) fn paper_grain(w: usize, h: usize, seed: u32, k: f32) -> Vec<f32> {
     let mut g = Vec::with_capacity(w * h);
     for y in 0..h {
         for x in 0..w {
@@ -170,7 +171,7 @@ pub fn kuwahara(img: &Img, r: usize) -> Img {
     out
 }
 
-fn sobel(l: &[f32], w: usize, h: usize) -> (Vec<f32>, Vec<f32>) {
+pub(crate) fn sobel(l: &[f32], w: usize, h: usize) -> (Vec<f32>, Vec<f32>) {
     let mut gx = vec![0.0; w * h];
     let mut gy = vec![0.0; w * h];
     let at = |x: isize, y: isize| -> f32 {
@@ -191,7 +192,7 @@ fn sobel(l: &[f32], w: usize, h: usize) -> (Vec<f32>, Vec<f32>) {
 }
 
 /// Smoothed edge-tangent field from the structure tensor (falls back to a noise flow).
-fn tangent_field(l: &[f32], w: usize, h: usize, sigma: f32, seed: u32) -> (Vec<f32>, Vec<f32>) {
+pub(crate) fn tangent_field(l: &[f32], w: usize, h: usize, sigma: f32, seed: u32) -> (Vec<f32>, Vec<f32>) {
     let (gx, gy) = sobel(l, w, h);
     let mut e: Vec<f32> = gx.iter().map(|v| v * v).collect();
     let mut f: Vec<f32> = gx.iter().zip(&gy).map(|(a, b)| a * b).collect();
@@ -219,7 +220,7 @@ fn tangent_field(l: &[f32], w: usize, h: usize, sigma: f32, seed: u32) -> (Vec<f
 }
 
 /// Line integral convolution of white noise along the tangent field: brush-stroke streaks.
-fn lic(noise: &[f32], tx: &[f32], ty: &[f32], w: usize, h: usize, len: usize) -> Vec<f32> {
+pub(crate) fn lic(noise: &[f32], tx: &[f32], ty: &[f32], w: usize, h: usize, len: usize) -> Vec<f32> {
     let mut out = vec![0.0; w * h];
     for py in 0..h {
         for px in 0..w {
@@ -622,6 +623,17 @@ pub fn apply(src: &Pixmap, s: &NprSettings) -> Pixmap {
         NprStyle::Pencil => pencil(&img, s, false),
         NprStyle::ColorPencil => pencil(&img, s, true),
         NprStyle::ComicInk => comic(&img, s),
+        NprStyle::Linocut => crate::looks::linocut(&img, s),
+        NprStyle::Risograph => crate::looks::risograph(&img, s),
+        NprStyle::PopArt => crate::looks::pop_art(&img, s),
+        NprStyle::Engraving => crate::looks::engraving(&img, s),
+        NprStyle::Gouache => crate::looks::gouache(&img, s),
+        NprStyle::Pastel => crate::looks::pastel(&img, s),
+        NprStyle::StainedGlass => crate::looks::stained_glass(&img, s),
+        NprStyle::SumiE => crate::looks::sumi_e(&img, s),
+        NprStyle::PaperCut => crate::looks::paper_cut(&img, s),
+        NprStyle::Chalkboard => crate::looks::chalkboard(&img, s),
+        NprStyle::Blueprint => crate::looks::blueprint(&img, s),
     };
     let t = s.strength.clamp(0.0, 1.0);
     if t >= 0.999 {

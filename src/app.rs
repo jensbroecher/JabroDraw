@@ -484,8 +484,8 @@ fn look_controls(ui: &mut egui::Ui, id: impl std::hash::Hash, s: &mut NprSetting
         return;
     }
     ui.add(egui::Slider::new(&mut s.strength, 0.0..=1.0).text("Strength"));
-    ui.add(egui::Slider::new(&mut s.brush, 0.0..=1.0).text("Brush"));
-    ui.add(egui::Slider::new(&mut s.paper, 0.0..=1.0).text("Paper"));
+    ui.add(egui::Slider::new(&mut s.brush, 0.0..=1.0).text(s.style.brush_label()));
+    ui.add(egui::Slider::new(&mut s.paper, 0.0..=1.0).text(s.style.paper_label()));
     if ui.small_button("Vary").on_hover_text("New random seed for the strokes").clicked() {
         s.seed = s.seed.wrapping_add(1);
     }
@@ -500,6 +500,13 @@ fn rgba_label(ui: &mut egui::Ui, label: &str, c: &mut Rgba) {
         ui.color_edit_button_srgba_unmultiplied(c);
         ui.label(label);
     });
+}
+
+/// The small window for adding, renaming or removing gallery items.
+enum GalleryDialog {
+    Add { name: String, category: String },
+    Edit { file: String, name: String, category: String },
+    Remove { file: String, name: String },
 }
 
 /// A path being drawn with the pen tool (node coordinates are canvas pixels).
@@ -626,6 +633,22 @@ pub struct JabroApp {
     last_autosave: std::time::Instant,
     autosaved_gen: Option<u64>,
     recovery: Option<Vec<PathBuf>>,
+    // object gallery
+    /// Opened on first use (tests set their own folder).
+    gallery: Option<crate::gallery::Gallery>,
+    show_gallery: bool,
+    gallery_search: String,
+    /// Category shown (None = all).
+    gallery_category: Option<String>,
+    /// Thumbnail textures by file name and file stamp.
+    gallery_thumbs: std::collections::HashMap<(String, u64), egui::TextureHandle>,
+    /// Item being dragged onto the canvas.
+    gallery_drag: Option<String>,
+    gallery_dialog: Option<GalleryDialog>,
+    /// Category the last item was added to.
+    gallery_last_category: String,
+    /// Where the gallery panel is on screen (for files dropped onto it).
+    gallery_rect: Rect,
 }
 
 impl JabroApp {
@@ -641,6 +664,7 @@ impl JabroApp {
         app.select = crate::sam::SelectWorker::new(move || ctx3.request_repaint());
         app.upscaler = crate::upscale::UpscaleWorker::new(move || ctx4.request_repaint());
         app.settings = Settings::load();
+        app.show_gallery = app.settings.gallery;
         app.system_clipboard = true;
         app.persist = true;
         let orphans = Self::find_orphans();
@@ -748,6 +772,15 @@ impl JabroApp {
             last_autosave: std::time::Instant::now(),
             autosaved_gen: None,
             recovery: None,
+            gallery: None,
+            show_gallery: false,
+            gallery_search: String::new(),
+            gallery_category: None,
+            gallery_thumbs: Default::default(),
+            gallery_drag: None,
+            gallery_dialog: None,
+            gallery_last_category: "My objects".into(),
+            gallery_rect: Rect::NOTHING,
         }
     }
 
@@ -3317,19 +3350,26 @@ impl JabroApp {
         if dropped.is_empty() {
             return;
         }
-        let at = ctx
-            .input(|i| i.pointer.latest_pos())
-            .filter(|p| self.canvas_rect.contains(*p))
-            .map(|p| self.to_doc(p));
+        let pos = ctx.input(|i| i.pointer.latest_pos());
+        let at = pos.filter(|p| self.canvas_rect.contains(*p)).map(|p| self.to_doc(p));
+        let onto_gallery = self.show_gallery && pos.is_some_and(|p| self.gallery_rect.contains(p));
+        let mut for_gallery = Vec::new();
         for f in dropped {
             let Some(path) = f.path else { continue };
             if path.extension().is_some_and(|e| e.eq_ignore_ascii_case("jabro")) {
-                self.open_path(path);
+                if onto_gallery {
+                    for_gallery.push(path);
+                } else {
+                    self.open_path(path);
+                }
             } else if imageops::is_image_path(&path) {
                 self.import_image_object(&path, at);
             } else {
                 self.status = format!("Can't import {}", path.display());
             }
+        }
+        if !for_gallery.is_empty() {
+            self.import_to_gallery(for_gallery);
         }
     }
 
@@ -4237,6 +4277,15 @@ impl JabroApp {
                     ui.close_menu();
                 }
                 ui.separator();
+                if ui
+                    .add_enabled(has_sel, egui::Button::new("Add to gallery…"))
+                    .on_hover_text("Keep the selected objects to use them again in other drawings")
+                    .clicked()
+                {
+                    self.add_to_gallery_dialog();
+                    ui.close_menu();
+                }
+                ui.separator();
                 if ui.add_enabled(!self.undo.is_empty(), egui::Button::new("Undo  (Ctrl+Z)")).clicked() {
                     self.undo();
                     ui.close_menu();
@@ -4329,6 +4378,10 @@ impl JabroApp {
                     ui.close_menu();
                     self.import_image_dialog();
                 }
+                if ui.button("From the gallery…").clicked() {
+                    ui.close_menu();
+                    self.set_show_gallery(true);
+                }
                 ui.separator();
                 for s in crate::library::LibShape::ALL {
                     if ui.button(s.label()).clicked() {
@@ -4376,6 +4429,10 @@ impl JabroApp {
                 }
                 ui.checkbox(&mut self.npr_preview, "Show NPR look");
                 ui.checkbox(&mut self.show_timeline, "Animation timeline");
+                let mut g = self.show_gallery;
+                if ui.checkbox(&mut g, "Gallery").on_hover_text("Objects kept for reuse in other drawings").changed() {
+                    self.set_show_gallery(g);
+                }
                 ui.separator();
                 let before = self.settings.clone();
                 ui.checkbox(&mut self.settings.snap, "Snap to objects, canvas and guides")
@@ -6496,6 +6553,7 @@ impl eframe::App for JabroApp {
         self.poll_anim_job(ctx);
         self.tick_playback(ctx);
         self.timelapse_window(ctx);
+        self.gallery_dialog_ui(ctx);
         egui::TopBottomPanel::top("menu").show(ctx, |ui| self.menu_bar(ui, ctx));
         egui::TopBottomPanel::top("look").show(ctx, |ui| self.look_bar(ui));
         egui::TopBottomPanel::bottom("status").show(ctx, |ui| self.status_bar(ui));
@@ -6509,10 +6567,21 @@ impl eframe::App for JabroApp {
         egui::SidePanel::right("props")
             .default_width(310.0)
             .show(ctx, |ui| self.right_panel(ui));
+        self.gallery_rect = if self.show_gallery {
+            egui::SidePanel::right("gallery")
+                .default_width(214.0)
+                .width_range(120.0..=520.0)
+                .show(ctx, |ui| self.gallery_panel(ui))
+                .response
+                .rect
+        } else {
+            Rect::NOTHING
+        };
         egui::CentralPanel::default()
             .frame(egui::Frame::default().fill(Color32::from_gray(52)))
             .show(ctx, |ui| self.canvas(ui));
         self.poll_npr(ctx);
+        self.gallery_drag_tick(ctx);
         if self.show_about {
             let mut open = true;
             egui::Window::new("About Jabro Draw")
@@ -6535,6 +6604,432 @@ impl eframe::App for JabroApp {
                     ui.label("Text objects use the fonts installed on this computer; they are not part of Jabro Draw.");
                 });
             self.show_about = open;
+        }
+    }
+}
+
+// -------------------------------------------------------------------- object gallery
+impl JabroApp {
+    /// The gallery, opened from the user's folder on first use.
+    fn gallery_mut(&mut self) -> Option<&mut crate::gallery::Gallery> {
+        if self.gallery.is_none() && self.persist {
+            let opened = canvas::gallery_dir()
+                .ok_or_else(|| "there is no folder for it".to_string())
+                .and_then(|d| crate::gallery::Gallery::open(&d));
+            match opened {
+                Ok(g) => self.gallery = Some(g),
+                Err(e) => self.status = format!("The gallery can't be opened: {e}"),
+            }
+        }
+        self.gallery.as_mut()
+    }
+
+    fn set_show_gallery(&mut self, on: bool) {
+        self.show_gallery = on;
+        if self.persist && self.settings.gallery != on {
+            self.settings.gallery = on;
+            self.settings.save();
+        }
+    }
+
+    /// Ask for a name, then keep the selected objects in the gallery.
+    fn add_to_gallery_dialog(&mut self) {
+        if self.selection().is_empty() {
+            self.status = "Select the objects to keep in the gallery first.".into();
+            return;
+        }
+        let name = self
+            .selected
+            .and_then(|id| self.doc.find(id))
+            .map(|o| o.name.clone())
+            .unwrap_or_else(|| "Objects".into());
+        self.gallery_dialog = Some(GalleryDialog::Add { name, category: self.gallery_last_category.clone() });
+    }
+
+    /// Keep the selected objects in the gallery. Returns the new item's file name.
+    fn add_selection_to_gallery(&mut self, name: &str, category: &str) -> Option<String> {
+        let objs: Vec<Object> = self.selection().iter().filter_map(|id| self.doc.find(*id).cloned()).collect();
+        if objs.is_empty() {
+            self.status = "Select the objects to keep in the gallery first.".into();
+            return None;
+        }
+        let anim = self.doc.anim.clone();
+        let added = self.gallery_mut()?.add(&objs, &anim, name, category);
+        match added {
+            Ok(file) => {
+                self.gallery_last_category = category.trim().to_string();
+                self.set_show_gallery(true);
+                self.gallery_search.clear();
+                if self.gallery_category.as_deref().is_some_and(|c| c != category.trim()) {
+                    self.gallery_category = None;
+                }
+                self.status = format!(
+                    "Added \u{201c}{}\u{201d} to the gallery. Click it or drag it onto the canvas to use it again.",
+                    name.trim()
+                );
+                Some(file)
+            }
+            Err(e) => {
+                self.status = format!("Could not add to the gallery: {e}");
+                None
+            }
+        }
+    }
+
+    /// Put a gallery item into the drawing at `at` (or in the middle of the view).
+    fn insert_gallery_item(&mut self, file: &str, at: Option<Pt>) {
+        let Some(g) = self.gallery_mut() else { return };
+        let item = match g.load(file) {
+            Ok(d) => d,
+            Err(e) => {
+                self.status = format!("Could not load the gallery item: {e}");
+                return;
+            }
+        };
+        let at = at.unwrap_or_else(|| self.view_center());
+        self.checkpoint();
+        let mut ids = crate::gallery::place(&mut self.doc, &item, at);
+        let primary = ids.pop();
+        self.select_only(primary);
+        self.multi = ids;
+        self.set_tool(Tool::Select);
+        self.dirty = true;
+        let name = item.gallery.map(|m| m.name).unwrap_or_default();
+        self.status = format!("\u{201c}{name}\u{201d} added from the gallery.");
+    }
+
+    /// Copy .jabro files (items someone sent, or whole drawings) into the gallery.
+    fn import_to_gallery(&mut self, paths: Vec<PathBuf>) {
+        let Some(g) = self.gallery_mut() else { return };
+        let (mut added, mut problem) = (0, None);
+        for p in &paths {
+            match g.import(p) {
+                Ok(_) => added += 1,
+                Err(e) => problem = Some(e),
+            }
+        }
+        if added > 0 {
+            self.set_show_gallery(true);
+            self.gallery_category = None;
+            self.gallery_search.clear();
+        }
+        self.status = match (added, problem) {
+            (0, Some(e)) => e,
+            (n, Some(e)) => format!("Added {n} item(s) to the gallery. {e}."),
+            (n, None) => format!("Added {n} item(s) to the gallery."),
+        };
+    }
+
+    fn import_to_gallery_dialog(&mut self) {
+        if let Some(paths) = rfd::FileDialog::new().add_filter("Jabro Draw", &["jabro"]).pick_files() {
+            self.import_to_gallery(paths);
+        }
+    }
+
+    /// Save a copy of an item to send to someone.
+    fn export_gallery_item(&mut self, file: &str) {
+        let Some(item) = self.gallery.as_ref().and_then(|g| g.find(file)).cloned() else { return };
+        let safe: String = item.name.chars().map(|c| if "<>:\"/\\|?*".contains(c) { '-' } else { c }).collect();
+        let Some(to) = rfd::FileDialog::new()
+            .add_filter("Jabro Draw", &["jabro"])
+            .set_file_name(format!("{safe}.jabro"))
+            .save_file()
+        else {
+            return;
+        };
+        self.status = match self.gallery.as_ref().map(|g| g.export(file, &to)) {
+            Some(Ok(())) => format!(
+                "Saved a copy of \u{201c}{}\u{201d}. Whoever gets it can drop it onto their gallery.",
+                item.name
+            ),
+            Some(Err(e)) => format!("Could not save the copy: {e}"),
+            None => return,
+        };
+    }
+
+    /// Thumbnail texture of an item (loaded once per version of its file).
+    fn gallery_texture(&mut self, ctx: &egui::Context, item: &crate::gallery::Item) -> Option<egui::TextureHandle> {
+        let key = (item.file.clone(), item.stamp());
+        if let Some(t) = self.gallery_thumbs.get(&key) {
+            return Some(t.clone());
+        }
+        let path = self.gallery.as_ref()?.thumb_path(&item.file);
+        let img = image::open(&path).ok()?.to_rgba8();
+        let ci = egui::ColorImage::from_rgba_unmultiplied([img.width() as usize, img.height() as usize], img.as_raw());
+        let t = ctx.load_texture(format!("gallery:{}", item.file), ci, egui::TextureOptions::LINEAR);
+        self.gallery_thumbs.retain(|(f, _), _| *f != item.file);
+        self.gallery_thumbs.insert(key, t.clone());
+        Some(t)
+    }
+
+    fn gallery_panel(&mut self, ui: &mut egui::Ui) {
+        let mut hide = false;
+        ui.horizontal(|ui| {
+            ui.strong("Gallery");
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.small_button("✕").on_hover_text("Hide the gallery (View › Gallery)").clicked() {
+                    hide = true;
+                }
+            });
+        });
+        if hide {
+            self.set_show_gallery(false);
+            return;
+        }
+        let has_sel = !self.selection().is_empty();
+        let mut import = false;
+        ui.horizontal(|ui| {
+            if ui
+                .add_enabled(has_sel, egui::Button::new("+ Add selection"))
+                .on_hover_text("Keep the selected objects for other drawings")
+                .on_disabled_hover_text("Select the objects to keep first")
+                .clicked()
+            {
+                self.add_to_gallery_dialog();
+            }
+            if ui
+                .button("Import…")
+                .on_hover_text("Add .jabro files: items someone sent you, or any drawing")
+                .clicked()
+            {
+                import = true;
+            }
+        });
+        if import {
+            self.import_to_gallery_dialog();
+        }
+        if self.gallery_mut().is_none() {
+            ui.weak("The gallery is not available.");
+            return;
+        }
+        let categories = self.gallery.as_ref().map(|g| g.categories()).unwrap_or_default();
+        if self.gallery_category.as_ref().is_some_and(|c| !categories.contains(c)) {
+            self.gallery_category = None;
+        }
+        ui.add(egui::TextEdit::singleline(&mut self.gallery_search).hint_text("Search").desired_width(f32::INFINITY));
+        if !categories.is_empty() {
+            egui::ComboBox::from_id_salt("gallery_category")
+                .width(ui.available_width() - 8.0)
+                .selected_text(self.gallery_category.clone().unwrap_or_else(|| "All categories".into()))
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut self.gallery_category, None, "All categories");
+                    for c in &categories {
+                        ui.selectable_value(&mut self.gallery_category, Some(c.clone()), c);
+                    }
+                });
+        }
+        ui.add_space(4.0);
+        let (items, total) = {
+            let g = self.gallery.as_ref().expect("opened above");
+            let shown: Vec<crate::gallery::Item> =
+                g.filtered(&self.gallery_search, self.gallery_category.as_deref()).into_iter().cloned().collect();
+            (shown, g.items.len())
+        };
+        if total == 0 {
+            ui.weak(
+                "Keep objects here to use them again in other drawings: select them and press \
+                 + Add selection. Items are files, so you can also send them to others and drop \
+                 the .jabro files you get onto this panel.",
+            );
+            return;
+        }
+        if items.is_empty() {
+            ui.weak("Nothing matches.");
+            return;
+        }
+        let mut insert = None;
+        let mut edit = None;
+        let mut export = None;
+        let mut remove = None;
+        let tile = Vec2::new(92.0, 116.0);
+        egui::ScrollArea::vertical().id_salt("gallery_items").auto_shrink([false, false]).show(ui, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing = Vec2::splat(6.0);
+                for item in &items {
+                    let tex = self.gallery_texture(ui.ctx(), item);
+                    let (rect, resp) = ui.allocate_exact_size(tile, Sense::click_and_drag());
+                    let lit = resp.hovered() || self.gallery_drag.as_deref() == Some(item.file.as_str());
+                    let painter = ui.painter_at(rect);
+                    painter.rect_filled(rect, 6.0, Color32::from_gray(if lit { 84 } else { 62 }));
+                    let pic = Rect::from_min_size(rect.min + Vec2::splat(4.0), Vec2::splat(tile.x - 8.0));
+                    if let Some(t) = &tex {
+                        let sz = t.size_vec2();
+                        let k = (pic.width() / sz.x).min(pic.height() / sz.y);
+                        let uv = Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0));
+                        painter.image(t.id(), Rect::from_center_size(pic.center(), sz * k), uv, Color32::WHITE);
+                    }
+                    let name = painter.layout(
+                        item.name.clone(),
+                        egui::FontId::proportional(11.5),
+                        Color32::from_gray(225),
+                        tile.x - 8.0,
+                    );
+                    painter.galley(Pos2::new(rect.min.x + 4.0, pic.max.y + 2.0), name, Color32::WHITE);
+                    let category = if item.category.is_empty() { "No category" } else { item.category.as_str() };
+                    let resp = resp.on_hover_text(format!(
+                        "{}\n{category} · {}×{} px · {} object(s)\n\nClick to add it to the picture, or drag it onto the canvas. Right-click for more.",
+                        item.name, item.size[0], item.size[1], item.objects
+                    ));
+                    if resp.clicked() {
+                        insert = Some(item.file.clone());
+                    }
+                    if resp.drag_started() {
+                        self.gallery_drag = Some(item.file.clone());
+                    }
+                    resp.context_menu(|ui| {
+                        if ui.button("Add to the picture").clicked() {
+                            insert = Some(item.file.clone());
+                            ui.close_menu();
+                        }
+                        if ui.button("Rename / category…").clicked() {
+                            edit = Some(item.clone());
+                            ui.close_menu();
+                        }
+                        if ui.button("Save a copy to share…").clicked() {
+                            export = Some(item.file.clone());
+                            ui.close_menu();
+                        }
+                        ui.separator();
+                        if ui.button("Remove…").clicked() {
+                            remove = Some(item.clone());
+                            ui.close_menu();
+                        }
+                    });
+                }
+            });
+        });
+        if let Some(f) = insert {
+            self.insert_gallery_item(&f, None);
+        }
+        if let Some(i) = edit {
+            self.gallery_dialog = Some(GalleryDialog::Edit { file: i.file, name: i.name, category: i.category });
+        }
+        if let Some(f) = export {
+            self.export_gallery_item(&f);
+        }
+        if let Some(i) = remove {
+            self.gallery_dialog = Some(GalleryDialog::Remove { file: i.file, name: i.name });
+        }
+    }
+
+    /// While a gallery item is dragged its thumbnail follows the pointer; letting go over the
+    /// canvas puts it there.
+    fn gallery_drag_tick(&mut self, ctx: &egui::Context) {
+        let Some(file) = self.gallery_drag.clone() else { return };
+        let (pos, down) = ctx.input(|i| (i.pointer.latest_pos(), i.pointer.primary_down()));
+        if down {
+            if let Some(p) = pos {
+                ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
+                let tex = self.gallery_thumbs.iter().find(|((f, _), _)| *f == file).map(|(_, t)| t.clone());
+                if let Some(t) = tex {
+                    let painter = ctx.layer_painter(egui::LayerId::new(egui::Order::Tooltip, egui::Id::new("gallery_drag")));
+                    let sz = t.size_vec2();
+                    let k = (80.0 / sz.x.max(sz.y)).min(1.0) * self.zoom.clamp(0.25, 1.5);
+                    let uv = Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0));
+                    painter.image(t.id(), Rect::from_center_size(p, sz * k), uv, Color32::from_white_alpha(210));
+                }
+            }
+            return;
+        }
+        self.gallery_drag = None;
+        if let Some(p) = pos.filter(|p| self.canvas_rect.contains(*p)) {
+            let at = self.to_doc(p);
+            self.insert_gallery_item(&file, Some(at));
+        }
+    }
+
+    fn gallery_dialog_ui(&mut self, ctx: &egui::Context) {
+        let Some(mut dlg) = self.gallery_dialog.take() else { return };
+        let categories = self.gallery.as_ref().map(|g| g.categories()).unwrap_or_default();
+        let (mut ok, mut cancel) = (false, false);
+        let title = match &dlg {
+            GalleryDialog::Add { .. } => "Add to gallery",
+            GalleryDialog::Edit { .. } => "Gallery item",
+            GalleryDialog::Remove { .. } => "Remove from gallery",
+        };
+        egui::Window::new(title)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
+            .show(ctx, |ui| match &mut dlg {
+                GalleryDialog::Add { name, category } | GalleryDialog::Edit { name, category, .. } => {
+                    let adding = title == "Add to gallery";
+                    egui::Grid::new("gallery_dialog").num_columns(2).spacing([8.0, 6.0]).show(ui, |ui| {
+                        ui.label("Name");
+                        let r = ui.add(egui::TextEdit::singleline(name).desired_width(210.0));
+                        if ui.memory(|m| m.focused().is_none()) {
+                            r.request_focus();
+                        }
+                        if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                            ok = true;
+                        }
+                        ui.end_row();
+                        ui.label("Category");
+                        ui.horizontal(|ui| {
+                            let r = ui.add(egui::TextEdit::singleline(category).desired_width(178.0).hint_text("e.g. Logos"));
+                            if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                                ok = true;
+                            }
+                            if !categories.is_empty() {
+                                ui.menu_button("▾", |ui| {
+                                    for c in &categories {
+                                        if ui.button(c).clicked() {
+                                            *category = c.clone();
+                                            ui.close_menu();
+                                        }
+                                    }
+                                });
+                            }
+                        });
+                        ui.end_row();
+                    });
+                    if adding {
+                        ui.small("The objects are saved as they are now, with their paint, effects and animation.");
+                    }
+                    ui.horizontal(|ui| {
+                        if ui.button(if adding { "Add" } else { "Save" }).clicked() {
+                            ok = true;
+                        }
+                        if ui.button("Cancel").clicked() {
+                            cancel = true;
+                        }
+                    });
+                }
+                GalleryDialog::Remove { name, .. } => {
+                    ui.label(format!("Remove \u{201c}{name}\u{201d} from the gallery? Its file is deleted."));
+                    ui.horizontal(|ui| {
+                        if ui.button("Remove").clicked() {
+                            ok = true;
+                        }
+                        if ui.button("Cancel").clicked() {
+                            cancel = true;
+                        }
+                    });
+                }
+            });
+        if cancel || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            return;
+        }
+        if !ok {
+            self.gallery_dialog = Some(dlg);
+            return;
+        }
+        match dlg {
+            GalleryDialog::Add { name, category } => {
+                self.add_selection_to_gallery(&name, &category);
+            }
+            GalleryDialog::Edit { file, name, category } => {
+                if let Some(Err(e)) = self.gallery_mut().map(|g| g.update(&file, &name, &category)) {
+                    self.status = format!("Could not change the item: {e}");
+                }
+            }
+            GalleryDialog::Remove { file, name } => {
+                self.status = match self.gallery_mut().map(|g| g.remove(&file)) {
+                    Some(Ok(())) => format!("Removed \u{201c}{name}\u{201d} from the gallery."),
+                    Some(Err(e)) => format!("Could not remove it: {e}"),
+                    None => return,
+                };
+            }
         }
     }
 }
@@ -7428,6 +7923,52 @@ mod tests {
         app.select_only(Some(1));
         app.duplicate_selected();
         assert!(app.doc.objects.iter().all(|o| o.instance_of.is_none()));
+    }
+
+    #[test]
+    fn gallery_keeps_objects_and_puts_them_back() {
+        let dir = std::env::temp_dir().join(format!("jabro_app_gallery_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut a = rect(1, 100.0, 100.0);
+        a.fill.a = [200, 30, 30, 255];
+        a.name = "Red".into();
+        let mut b = rect(2, 150.0, 220.0);
+        b.group = Some(9);
+        a.group = Some(9);
+        let mut app = app_with(vec![a, b, rect(3, 600.0, 400.0)]);
+        // tests never open the user's gallery: `persist` is off, so without a folder there is none
+        assert!(app.gallery_mut().is_none());
+        app.gallery = Some(crate::gallery::Gallery::open(&dir).unwrap());
+        app.select_only(Some(1));
+        app.multi = vec![2];
+        let file = app.add_selection_to_gallery("Pair", "Test").unwrap();
+        assert!(app.show_gallery && app.gallery_last_category == "Test");
+        let item = app.gallery.as_ref().unwrap().find(&file).unwrap().clone();
+        assert_eq!((item.objects, item.size), (2, [154, 224]));
+        // put it back at a point: new objects, new ids, same group, centred there
+        app.select_only(None);
+        app.insert_gallery_item(&file, Some(Pt::new(500.0, 300.0)));
+        assert_eq!(app.doc.objects.len(), 5);
+        let new: Vec<&Object> = app.doc.objects.iter().skip(3).collect();
+        assert_eq!(app.selection().len(), 2);
+        assert!(new.iter().all(|o| o.id > 3 && o.id != 9));
+        assert!(new[0].group.is_some() && new[0].group == new[1].group && new[0].group != Some(9));
+        assert_eq!(new[0].name, "Red");
+        let (lo, hi) = (new[0].bounds().0, new[1].bounds().1);
+        let mid = (lo + hi) * 0.5;
+        assert!((mid.x - 500.0).abs() < 1.5 && (mid.y - 300.0).abs() < 1.5, "{mid:?}");
+        app.undo();
+        assert_eq!(app.doc.objects.len(), 3);
+        // a drawing dropped onto the gallery becomes an item too
+        let mut sent = Document::new(300, 300);
+        sent.objects.push(rect(1, 20.0, 20.0));
+        let path = dir.join("..").join(format!("jabro_sent_{}.jabro", std::process::id()));
+        io::save(&sent, &path).unwrap();
+        app.import_to_gallery(vec![path.clone()]);
+        assert_eq!(app.gallery.as_ref().unwrap().items.len(), 2);
+        assert!(app.status.starts_with("Added 1 item"), "{}", app.status);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

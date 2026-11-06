@@ -10,9 +10,9 @@
   painterly looks and offline AI tools in one program.
 </p>
 
-Jabro Draw keeps the playful workflow of classic hybrid editors such as Real-DRAW PRO alive in a
-modern 64-bit program. It is an independent project, and no code or assets are shared with any
-other program.
+Jabro Draw brings the playful workflow of the classic hybrid drawing programs of the 2000s into a
+modern 64-bit program. It is written from scratch and shares no code or assets with any other
+program.
 
 - Draw **vector shapes and text** that stay editable.
 - Give them **materials**: bevels (round, chisel, cove, ridge, pillow), gloss, chrome reflection,
@@ -20,8 +20,11 @@ other program.
   **3D extrusion**.
 - **Paint on them** with brushes. The paint is clipped to the shape and stays attached to it.
 - Bend any object into **perspective**, warp or liquify it, and the paint follows.
-- Render the whole picture through an **NPR look**: watercolor, oil paint, impressionist
-  strokes, pointillism, pencil, colored pencil or comic ink.
+- Render the whole picture through one of **18 NPR looks**: watercolor, oil, gouache,
+  impressionist strokes, pointillism, pastel, pencil, colored pencil, sumi-e ink wash, comic ink,
+  pop-art halftone, linocut, engraving, risograph, paper cut-out, stained glass, chalkboard
+  and blueprint.
+- Keep objects in a **gallery** and reuse them in any drawing, or send them to someone as a file.
 
 > **Status:** early preview (0.1). Everything described here works, but expect rough edges.
 > Bug reports and ideas are welcome in the issues.
@@ -36,6 +39,18 @@ other program.
 and the star oil-painted on its own.
 
 ![](docs/look-mixed.png)
+
+**Print and craft looks:**
+
+| Pop-art halftone | Linocut | Engraving |
+|---|---|---|
+| ![](docs/look-popart.png) | ![](docs/look-linocut.png) | ![](docs/look-engraving.png) |
+| **Risograph** | **Paper cut-out** | **Stained glass** |
+| ![](docs/look-riso.png) | ![](docs/look-papercut.png) | ![](docs/look-glass.png) |
+| **Gouache** | **Pastel & charcoal** | **Sumi-e** |
+| ![](docs/look-gouache.png) | ![](docs/look-pastel.png) | ![](docs/look-sumie.png) |
+| **Chalkboard** | **Blueprint** | |
+| ![](docs/look-chalkboard.png) | ![](docs/look-blueprint.png) | |
 
 ## Highlights
 
@@ -52,6 +67,8 @@ and the star oil-painted on its own.
 - **Files**: opens PNG, JPEG, WebP, JPEG XL, QOI, BMP, GIF, TIFF, TGA and ICO, plus HEIC, AVIF
   and camera RAW through Windows' own codecs. Exports PNG, JPEG, WebP, AVIF, SVG and layered PSD
   at up to 8× resolution.
+- **Gallery**: objects you want again, with their paint, effects and animation, one click away in
+  every drawing. Each item is a small `.jabro` file, so a gallery can be shared.
 
 **Private by design:** Jabro Draw never connects to the internet. Your pictures stay on your
 computer, and there is no account, telemetry or update check.
@@ -92,7 +109,8 @@ The editor opens with an editable demo scene. Headless render of the demo scene 
 cargo run --release -- --render-demo out.png watercolor
 ```
 
-Styles: `none watercolor oil impressionist pointillism pencil colorpencil comic`.
+Styles: `none watercolor oil gouache impressionist pointillism pastel pencil colorpencil sumie comic
+popart linocut engraving riso papercut glass chalkboard blueprint` (or `mixed` for the picture above).
 
 ## Using it
 
@@ -165,11 +183,27 @@ Styles: `none watercolor oil impressionist pointillism pencil colorpencil comic`
 - **Blend modes and colour adjustments** per object: 16 blend modes (multiply, screen, overlay, soft
   light, colour…) plus non-destructive hue, saturation, lightness, contrast and levels (black point,
   white point, midtones).
+- **NPR looks**: besides the painterly looks (watercolor, oil, gouache, impressionist,
+  pointillism, pastel) and the drawn ones (pencil, colored pencil, sumi-e, comic ink), there are
+  print and craft looks: **pop-art halftone** (flat colours from dot screens with black
+  outlines), **linocut** (black ink and a flat second colour, gouged lines in the mid-tones),
+  **engraving** (lines that swell with the shadows and bulge over the forms), **risograph**
+  (three grainy inks out of register), **paper cut-out** (flat paper layers with drop shadows),
+  **stained glass** (pieces that follow the edges, set in lead), **chalkboard** and
+  **blueprint**. The two sliders mean what fits the look (brush size, dot size, line spacing, piece
+  size; paper, canvas, glass texture, chalk dust), and **Vary** rolls new marks.
 - **NPR per object and stacked looks**: every object can follow the document's look, stay clean, or
   get its own look (properties › NPR look). The look bar can layer up to three looks, such as
   watercolor washes with comic-ink outlines on top. Strokes spill slightly past an object's edges,
   like real paint. The look shows up as a quick preview first and is then painted at full
   quality. When the preview keeps up, it stays live while you drag.
+- **Gallery** (View › Gallery, or Edit › Add to gallery…): select objects and press **+ Add
+  selection** to keep them, with a name and a category. Click an item to put it into the
+  picture, or drag it onto the canvas where you want it; it comes back as editable objects with
+  its paint, effects, groups and animation. Right-click an item to rename or remove it, or to
+  **save a copy to share**: every item is a small `.jabro` file, so you can e-mail it, and
+  whoever gets it drops it onto their gallery (or uses **Import…**). Any drawing can be imported
+  as an item too. The gallery lives in `%APPDATA%\JabroDraw\gallery`.
 - **Animation** (View › Animation timeline): select objects, press **Add keyframe**, go to another
   frame and move, scale, rotate, perspective-bend or fade them. That frame keys itself. Play it
   back with easing, scrub the keyframe strip, and export an animated GIF or numbered PNG frames for
@@ -215,8 +249,7 @@ Styles: `none watercolor oil impressionist pointillism pencil colorpencil comic`
 cargo test --release
 ```
 
-See [docs/DESIGN.md](docs/DESIGN.md) for the research notes on Real-DRAW PRO, the architecture
-and the roadmap.
+See [docs/DESIGN.md](docs/DESIGN.md) for the design notes, the architecture and the roadmap.
 
 ## Licenses
 
@@ -228,6 +261,3 @@ with their licenses in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md). Ship th
 The AI model files (about 230 MB) are too big for git. The first build downloads them once from
 their publishers (the rembg project on GitHub, MobileSAM and Real-ESRGAN on Hugging Face) and
 verifies their checksums (`crates/jabro-models/build.rs`).
-
-Real-DRAW is a name of Mediachance, used here only to describe where the idea comes from. Jabro
-Draw is not affiliated with or endorsed by Mediachance.

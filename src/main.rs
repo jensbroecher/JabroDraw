@@ -15,6 +15,7 @@ mod doc;
 mod effects;
 mod export;
 mod fonts;
+mod gallery;
 mod geom;
 mod icon;
 #[path = "../tools/install.rs"]
@@ -22,6 +23,7 @@ mod install;
 mod imageops;
 mod io;
 mod library;
+mod looks;
 mod npr;
 mod raster;
 mod render;

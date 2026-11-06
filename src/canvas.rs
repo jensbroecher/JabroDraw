@@ -149,6 +149,8 @@ pub struct Settings {
     pub rulers: bool,
     /// Recently opened / saved documents, newest first.
     pub recent: Vec<String>,
+    /// Show the gallery panel.
+    pub gallery: bool,
 }
 
 impl Default for Settings {
@@ -160,6 +162,7 @@ impl Default for Settings {
             grid_size: 20.0,
             rulers: true,
             recent: Vec::new(),
+            gallery: false,
         }
     }
 }
@@ -176,6 +179,11 @@ impl Settings {
 /// Folder for autosave / recovery files.
 pub fn autosave_dir() -> Option<std::path::PathBuf> {
     settings_path().and_then(|p| p.parent().map(|d| d.join("autosave")))
+}
+
+/// Folder of the object gallery.
+pub fn gallery_dir() -> Option<std::path::PathBuf> {
+    settings_path().and_then(|p| p.parent().map(|d| d.join("gallery")))
 }
 
 /// Snap `v` to the nearest of `targets` within `tol`: (snapped value, target).
