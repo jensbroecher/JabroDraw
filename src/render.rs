@@ -367,9 +367,16 @@ impl Renderer {
     }
 
     pub fn render(&mut self, doc: &Document) -> Pixmap {
+        self.render_opts(doc, true)
+    }
+
+    /// Render with or without the page background (transparent exports, clipboard images).
+    pub fn render_opts(&mut self, doc: &Document, background: bool) -> Pixmap {
         let mut out = Pixmap::new(doc.width.max(1), doc.height.max(1)).expect("canvas");
-        let bg = doc.background;
-        out.fill(Color::from_rgba8(bg[0], bg[1], bg[2], 255));
+        if background {
+            let bg = doc.background;
+            out.fill(Color::from_rgba8(bg[0], bg[1], bg[2], 255));
+        }
         let mut live = HashSet::new();
         for obj in &doc.objects {
             live.insert(obj.id);

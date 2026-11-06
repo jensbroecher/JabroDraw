@@ -1878,6 +1878,7 @@ name = "jabro-draw"
 version = "0.1.0"
 dependencies = [
  "ab_glyph",
+ "arboard",
  "base64",
  "eframe",
  "i_overlay",

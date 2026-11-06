@@ -136,6 +136,65 @@ enum PropAction {
     Back,
 }
 
+/// Cheap fingerprint of a picture, to recognise our own copy on the system clipboard.
+fn image_signature(img: &Pixmap) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325 ^ ((img.width() as u64) << 32 | img.height() as u64);
+    for (i, b) in img.data().iter().enumerate().step_by(61) {
+        h = (h ^ (*b as u64 ^ i as u64)).wrapping_mul(0x100_0000_01b3);
+    }
+    h
+}
+
+fn set_clipboard_image(img: &Pixmap) -> Result<(), String> {
+    let mut bytes = Vec::with_capacity(img.data().len());
+    for px in img.data().chunks_exact(4) {
+        let c = tiny_skia::PremultipliedColorU8::from_rgba(px[0], px[1], px[2], px[3])
+            .map(|c| c.demultiply())
+            .map_or([0, 0, 0, 0], |c| [c.red(), c.green(), c.blue(), c.alpha()]);
+        bytes.extend_from_slice(&c);
+    }
+    let data = arboard::ImageData {
+        width: img.width() as usize,
+        height: img.height() as usize,
+        bytes: bytes.into(),
+    };
+    arboard::Clipboard::new()
+        .and_then(|mut cb| cb.set_image(data))
+        .map_err(|e| e.to_string())
+}
+
+/// A picture on the system clipboard (screenshots, images copied in other programs).
+fn get_clipboard_image() -> Option<Pixmap> {
+    let img = arboard::Clipboard::new().ok()?.get_image().ok()?;
+    let (w, h) = (img.width as u32, img.height as u32);
+    let mut pm = Pixmap::new(w, h)?;
+    for (d, s) in pm.data_mut().chunks_exact_mut(4).zip(img.bytes.chunks_exact(4)) {
+        let a = s[3] as u32;
+        d[0] = ((s[0] as u32 * a + 127) / 255) as u8;
+        d[1] = ((s[1] as u32 * a + 127) / 255) as u8;
+        d[2] = ((s[2] as u32 * a + 127) / 255) as u8;
+        d[3] = s[3];
+    }
+    Some(pm)
+}
+
+/// Is Ctrl+V held right now? egui reports no paste event when the clipboard holds only a
+/// picture, so on Windows the key state is checked directly.
+#[cfg(windows)]
+fn ctrl_v_down() -> bool {
+    #[link(name = "user32")]
+    extern "system" {
+        fn GetAsyncKeyState(vkey: i32) -> i16;
+    }
+    // SAFETY: plain Win32 call without pointers.
+    unsafe { GetAsyncKeyState(0x11) < 0 && GetAsyncKeyState(0x56) < 0 }
+}
+
+#[cfg(not(windows))]
+fn ctrl_v_down() -> bool {
+    false
+}
+
 /// State of the New document / Canvas size dialog.
 struct CanvasDialog {
     new_doc: bool,
@@ -323,6 +382,14 @@ pub struct JabroApp {
     show_about: bool,
     settings: Settings,
     canvas_dialog: Option<CanvasDialog>,
+    /// Objects copied with Ctrl+C / Ctrl+X (pasted back as editable objects).
+    clipboard: Vec<Object>,
+    paste_count: u32,
+    /// Fingerprint of the picture we put on the system clipboard.
+    clip_image_sig: Option<u64>,
+    /// Use the system clipboard (off in tests so they never touch it).
+    system_clipboard: bool,
+    ctrl_v_was_down: bool,
 }
 
 impl JabroApp {
@@ -335,6 +402,7 @@ impl JabroApp {
             AiWorker::new(move || ctx2.request_repaint()),
         );
         app.settings = Settings::load();
+        app.system_clipboard = true;
         app
     }
 
@@ -398,6 +466,11 @@ impl JabroApp {
             show_about: false,
             settings: Settings::default(),
             canvas_dialog: None,
+            clipboard: Vec::new(),
+            paste_count: 0,
+            clip_image_sig: None,
+            system_clipboard: false,
+            ctrl_v_was_down: false,
         }
     }
 
@@ -1692,6 +1765,123 @@ impl JabroApp {
         );
     }
 
+    // ---------------------------------------------------------------- clipboard
+
+    /// Copy the selection: objects go to the internal clipboard (pasted back as editable
+    /// objects); other programs get a picture of them on the system clipboard.
+    fn copy_selected(&mut self) -> bool {
+        let ids = self.selection();
+        if ids.is_empty() {
+            return false;
+        }
+        self.clipboard = ids.iter().filter_map(|id| self.doc.find(*id).cloned()).collect();
+        self.paste_count = 0;
+        if self.system_clipboard {
+            if let Some(img) = self.selection_image() {
+                self.clip_image_sig = Some(image_signature(&img));
+                let _ = set_clipboard_image(&img);
+            }
+        }
+        self.status = format!("Copied {} object(s)", self.clipboard.len());
+        true
+    }
+
+    fn cut_selected(&mut self) {
+        if self.copy_selected() {
+            self.delete_selected();
+            self.status = format!("Cut {} object(s)", self.clipboard.len());
+        }
+    }
+
+    /// The selected objects rendered on a transparent background, cropped to their extent.
+    fn selection_image(&self) -> Option<Pixmap> {
+        let objs: Vec<Object> = self.selection().iter().filter_map(|id| self.doc.find(*id).cloned()).collect();
+        let mut tmp = Document::new(1, 1);
+        tmp.objects = objs;
+        let (lo, hi) = canvas::content_bounds(&tmp)?;
+        tmp.width = ((hi.x - lo.x).ceil() as u32 + 2).clamp(1, canvas::MAX_SIZE);
+        tmp.height = ((hi.y - lo.y).ceil() as u32 + 2).clamp(1, canvas::MAX_SIZE);
+        for o in &mut tmp.objects {
+            o.quad = o.quad.map(|c| c - lo + Pt::new(1.0, 1.0));
+        }
+        Some(Renderer::default().render_opts(&tmp, false))
+    }
+
+    /// Paste: text from other programs becomes a text object, pictures become picture objects,
+    /// and what was copied here comes back as editable objects.
+    fn paste(&mut self, text: Option<String>) {
+        if let Some(t) = text.map(|t| t.trim().to_string()).filter(|t| !t.is_empty()) {
+            self.paste_text(&t);
+            return;
+        }
+        if self.system_clipboard {
+            if let Some(img) = get_clipboard_image() {
+                if self.clip_image_sig != Some(image_signature(&img)) || self.clipboard.is_empty() {
+                    let at = self.view_center();
+                    self.add_picture_object(img, "Pasted picture".into(), Some(at));
+                    return;
+                }
+            }
+        }
+        self.paste_objects();
+    }
+
+    fn paste_objects(&mut self) {
+        if self.clipboard.is_empty() {
+            self.status = "Nothing to paste".into();
+            return;
+        }
+        self.checkpoint();
+        self.paste_count += 1;
+        let off = Pt::new(20.0, 20.0) * self.paste_count as f32;
+        let mut new_ids = Vec::new();
+        for src in self.clipboard.clone() {
+            let id = self.doc.alloc_id();
+            let mut o = src;
+            o.id = id;
+            o.quad = o.quad.map(|c| c + off);
+            o.touch();
+            self.doc.objects.push(o);
+            new_ids.push(id);
+        }
+        let primary = new_ids.pop();
+        self.select_only(primary);
+        self.multi = new_ids;
+        self.dirty = true;
+        self.status = format!("Pasted {} object(s)", self.selection().len());
+    }
+
+    fn paste_text(&mut self, text: &str) {
+        let text: String = text.chars().take(400).collect();
+        let font = self.text_font;
+        let aspect = shapes::text_aspect(&text, font).unwrap_or(3.0);
+        let h = (60.0 * text.lines().count().max(1) as f32).min(400.0);
+        let w = (h * aspect).min(self.doc.width as f32 * 0.9);
+        let c = self.view_center();
+        self.checkpoint();
+        let id = self.doc.alloc_id();
+        let mut o = Object::new(id, ShapeKind::Text { text, font }, c.x - w / 2.0, c.y - h / 2.0, w, h);
+        o.fill = FillStyle {
+            kind: FillKind::Solid,
+            a: self.color_a,
+            ..Default::default()
+        };
+        o.fit_text_width();
+        self.doc.objects.push(o);
+        self.select_only(Some(id));
+        self.dirty = true;
+        self.status = "Pasted text as a text object".into();
+    }
+
+    /// Canvas point in the middle of the visible area (clamped to the page).
+    fn view_center(&self) -> Pt {
+        let c = self.to_doc(self.canvas_rect.center());
+        Pt::new(
+            c.x.clamp(0.0, self.doc.width as f32),
+            c.y.clamp(0.0, self.doc.height as f32),
+        )
+    }
+
     /// Import a picture as a new object, scaled to fit the page (`at` = where to centre it).
     fn import_image_object(&mut self, path: &std::path::Path, at: Option<Pt>) {
         let img = match imageops::load_image(path) {
@@ -1701,6 +1891,14 @@ impl JabroApp {
                 return;
             }
         };
+        let name = path
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "Picture".into());
+        self.add_picture_object(img, name, at);
+    }
+
+    fn add_picture_object(&mut self, img: Pixmap, name: String, at: Option<Pt>) {
         let (iw, ih) = (img.width() as f32, img.height() as f32);
         let (dw, dh) = (self.doc.width as f32, self.doc.height as f32);
         let k = (0.8 * dw / iw).min(0.8 * dh / ih).min(1.0);
@@ -1713,20 +1911,16 @@ impl JabroApp {
         let img = Arc::new(img);
         obj.original = Some(ImageData(img.clone()));
         obj.paint = Some(img);
-        obj.name = path
-            .file_stem()
-            .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "Picture".into());
+        self.status = format!(
+            "Added {name} ({}×{} px). Remove its background in the properties panel.",
+            iw as u32,
+            ih as u32
+        );
+        obj.name = name;
         self.doc.objects.push(obj);
         self.select_only(Some(id));
         self.set_tool(Tool::Select);
         self.dirty = true;
-        self.status = format!(
-            "Imported {} ({}×{} px). Remove its background in the properties panel.",
-            path.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default(),
-            iw as u32,
-            ih as u32
-        );
     }
 
     fn import_image_dialog(&mut self) {
@@ -2268,8 +2462,36 @@ impl JabroApp {
         if cmd(Key::N) {
             self.open_canvas_dialog(true);
         }
+        // Ctrl+V with only a picture on the clipboard produces no egui event: watch the keys.
+        let v_down = ctrl_v_down() && ctx.input(|i| i.focused);
+        let v_pressed = v_down && !self.ctrl_v_was_down;
+        self.ctrl_v_was_down = v_down;
         if ctx.wants_keyboard_input() {
             return;
+        }
+        let clip_events: Vec<egui::Event> = ctx.input(|i| {
+            i.events
+                .iter()
+                .filter(|e| matches!(e, egui::Event::Copy | egui::Event::Cut | egui::Event::Paste(_)))
+                .cloned()
+                .collect()
+        });
+        let mut pasted = false;
+        for e in clip_events {
+            match e {
+                egui::Event::Copy => {
+                    self.copy_selected();
+                }
+                egui::Event::Cut => self.cut_selected(),
+                egui::Event::Paste(text) => {
+                    pasted = true;
+                    self.paste(Some(text));
+                }
+                _ => {}
+            }
+        }
+        if v_pressed && !pasted {
+            self.paste(None);
         }
         if ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND | Modifiers::SHIFT, Key::Z)) || cmd(Key::Y) {
             self.redo();
@@ -2389,6 +2611,28 @@ impl JabroApp {
                 }
             });
             ui.menu_button("Edit", |ui| {
+                let has_sel = self.selected.is_some();
+                if ui.add_enabled(has_sel, egui::Button::new("Cut  (Ctrl+X)")).clicked() {
+                    self.cut_selected();
+                    ui.close_menu();
+                }
+                if ui.add_enabled(has_sel, egui::Button::new("Copy  (Ctrl+C)")).clicked() {
+                    self.copy_selected();
+                    ui.close_menu();
+                }
+                if ui.button("Paste  (Ctrl+V)").clicked() {
+                    let text = if self.system_clipboard {
+                        arboard::Clipboard::new().ok().and_then(|mut c| c.get_text().ok())
+                    } else {
+                        None
+                    };
+                    // our own copy, a picture, or text from another program
+                    let own = self.clip_image_sig.is_some()
+                        && get_clipboard_image().is_some_and(|i| Some(image_signature(&i)) == self.clip_image_sig);
+                    self.paste(if own { None } else { text });
+                    ui.close_menu();
+                }
+                ui.separator();
                 if ui.add_enabled(!self.undo.is_empty(), egui::Button::new("Undo  (Ctrl+Z)")).clicked() {
                     self.undo();
                     ui.close_menu();
@@ -4460,6 +4704,48 @@ mod tests {
         assert!((lo.x - 16.0).abs() < 1.0 && (lo.y - 16.0).abs() < 1.0, "{lo:?}");
         assert!(hi.x <= app.doc.width as f32 - 15.0 && hi.y <= app.doc.height as f32 - 15.0);
         assert!(app.doc.width < 200 && app.doc.height < 200, "{}x{}", app.doc.width, app.doc.height);
+    }
+
+    #[test]
+    fn copy_cut_and_paste_objects_and_text() {
+        let mut app = app_with(vec![rect(1, 10.0, 10.0), rect(2, 200.0, 10.0), rect(3, 400.0, 10.0)]);
+        app.select_only(Some(1));
+        app.toggle_in_selection(2);
+        assert!(app.copy_selected());
+        app.paste(None);
+        assert_eq!(app.doc.objects.len(), 5);
+        let pasted: Vec<&Object> = app.doc.objects[3..].iter().collect();
+        assert!(pasted[0].quad[0].dist(Pt::new(30.0, 30.0)) < 1e-3, "offset copy of object 1");
+        assert!(pasted[1].quad[0].dist(Pt::new(220.0, 30.0)) < 1e-3);
+        assert_eq!(app.selection().len(), 2, "the pasted copies are selected");
+        app.paste(None);
+        assert!(app.doc.objects[5].quad[0].dist(Pt::new(50.0, 50.0)) < 1e-3, "each paste steps further");
+        app.undo();
+        app.undo();
+        assert_eq!(app.doc.objects.len(), 3);
+
+        app.select_only(Some(3));
+        app.cut_selected();
+        assert_eq!(app.doc.objects.len(), 2);
+        app.paste(None);
+        assert_eq!(app.doc.objects.len(), 3, "cut + paste brings it back");
+
+        app.paste(Some("Hello there".into()));
+        let o = app.doc.objects.last().unwrap();
+        assert!(matches!(&o.kind, ShapeKind::Text { text, .. } if text == "Hello there"));
+    }
+
+    #[test]
+    fn copied_selection_becomes_a_cropped_transparent_picture() {
+        let mut app = app_with(vec![rect(1, 100.0, 50.0)]);
+        app.select_only(Some(1));
+        let img = app.selection_image().unwrap();
+        assert_eq!((img.width(), img.height()), (102, 102));
+        assert_eq!(img.pixel(50, 50).unwrap().alpha(), 255);
+        let mut app = app_with(vec![Object::new(1, ShapeKind::Ellipse, 0.0, 0.0, 100.0, 100.0)]);
+        app.select_only(Some(1));
+        let img = app.selection_image().unwrap();
+        assert_eq!(img.pixel(1, 1).unwrap().alpha(), 0, "corners outside the ellipse are transparent");
     }
 
     #[test]

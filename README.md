@@ -73,6 +73,10 @@ Styles: `none watercolor oil impressionist pointillism pencil colorpencil comic`
   anchor for which side the canvas grows from. **Fit canvas to content** wraps the canvas around
   everything, and **Grow automatically** (a remembered setting) extends the canvas when you drop an
   object past its edge. The status bar shows the size; click it to change it.
+- **Copy / cut / paste** (Ctrl+C / X / V): objects paste back as editable objects, even into
+  another document. Other programs receive a transparent picture of the selection. Pasting a
+  screenshot or an image copied elsewhere adds it as a picture, and pasting text creates a text
+  object.
 - **Objects list**: drag a row up or down to change the stacking order; dragging a selected row
   moves the whole selection. Shift+click adds to the selection, and the checkbox hides an object.
 - **Path menu**: Union / Subtract / Intersect / Exclude on 2+ selected objects (also in the properties
