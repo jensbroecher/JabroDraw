@@ -1,11 +1,12 @@
 # Jabro Draw — design notes
 
-## 1. What Real-DRAW PRO did (research summary)
+## 1. What the classic hybrid editors did (research summary)
 
-Sources: mediachance.com help/feature pages, the Alphr review of v5 and forum snippets.
-Archived pages could not be fetched, so items marked *(unconfirmed)* are inferred.
+Sources: help and feature pages, reviews and forum snippets about the classic hybrid
+vector/bitmap editors of the 2000s. Archived pages could not be fetched, so items marked
+*(unconfirmed)* are inferred.
 
-| Area | Real-DRAW PRO |
+| Area | Classic hybrid editors |
 |---|---|
 | Object model | **"VectorBit"**: every object is vector-editable (shape, order, resize, envelope) but carries bitmap-based properties. You could paint with brushes directly on vector objects; strokes were masked by the shape, and strokes could themselves become objects with effects. Groups were called **Packages** (nestable, effects on the whole package, clones). There was no classic layer panel. |
 | Effects | Non-destructive per-object properties: colour, texture, outline, lights, material, transparency (incl. texture transparency), 3D bevel & extrude, drop shadow, glow, motion blur, sparkle, lens flare, bump mapping, per-object colour correction. Multiple point / spot / distant lights per object + material (metallic). Texture library + GenetX procedural textures, "area gradients". |
@@ -89,13 +90,13 @@ pen pressure (if the tablet driver reports it through Windows touch/pen events);
   - Still to do: true curve fitting for boolean results; booleans that keep paint layers; a
     continue-path pen mode; join/break nodes; stroke-to-path.
 - **Packages** (groups) that take effects and NPR as a unit, plus clones/instances.
-- **Per-object NPR override** (Real-DRAW's best trick): each object chooses "inherit / none / style X".
+- **Per-object NPR override** (the classics' best trick): each object chooses "inherit / none / style X".
 - Envelope + mesh warp in addition to the 4-corner perspective.
 - Multi-stop gradient editor, transparency gradients, blend modes, inner shadow / inner glow,
   multiple coloured lights, bump map from texture.
 - Import PNG / JPG as bitmap objects; use any image as a texture.
 
-- ✅ **v0.3** Real-DRAW-style object **transparency** (flat, linear, radial, texture, picture),
+- ✅ **v0.3** classic-style object **transparency** (flat, linear, radial, texture, picture),
   per-object **lights** (point, spot, distant, which also shade the bevel relief), richer **outlines**
   (inside, centred or outside; dashed or dotted; traced around paint), **pictures** (import or drop
   a file, use as a fill or transparency texture), a non-destructive painted **transparency mask**
@@ -120,7 +121,7 @@ pen pressure (if the tablet driver reports it through Windows touch/pen events);
 - **Mega render**: export at 2–8× resolution, since everything except paint layers is resolution-independent.
 - SVG export of vector parts, PSD export with one layer per object (+ shadow layers), layered PNG.
 
-### Own ideas beyond Real-DRAW
+### Own ideas beyond the classics
 - **NPR stacks**: combine looks (e.g. watercolor wash + ink outlines), with per-object strength.
 - **Painting replay**: record the impressionist / watercolor stroke generation and export a
   time-lapse video of the picture "being painted".

@@ -101,7 +101,6 @@ assets from other drawing programs are used.
 
 ## Name
 
-Jabro Draw is an independent program. It is inspired by the workflow of classic hybrid
-vector/bitmap editors, but it does not use their code, artwork, UI design or trademarks. The
-research notes in `docs/DESIGN.md` mention Real-DRAW PRO only to describe the features that
-inspired this project. Any trademarks named there belong to their owners.
+Jabro Draw is an independent program, written from scratch. It is inspired by the workflow of
+the classic hybrid vector/bitmap editors, but it does not use their code, artwork, UI design or
+trademarks.
