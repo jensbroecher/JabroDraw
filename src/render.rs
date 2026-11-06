@@ -419,6 +419,41 @@ impl Renderer {
         Some(s[3] / 255.0)
     }
 
+    /// Group the visible objects (bottom to top) into runs that share the same NPR looks.
+    pub fn render_runs(&mut self, doc: &Document) -> Vec<crate::npr::LookRun> {
+        let (w, h) = (doc.width.max(1), doc.height.max(1));
+        let doc_looks = doc.looks();
+        let mut runs: Vec<crate::npr::LookRun> = Vec::new();
+        for obj in &doc.objects {
+            if !obj.visible || obj.opacity <= 0.0 {
+                continue;
+            }
+            let looks = doc.looks_for(obj);
+            if runs.last().is_none_or(|r| r.looks != looks) {
+                let base = runs.is_empty() && !looks.is_empty() && looks == doc_looks;
+                runs.push(crate::npr::LookRun {
+                    layer: Pixmap::new(w, h).expect("run layer"),
+                    looks,
+                    base,
+                });
+            }
+            self.ensure(obj, w, h);
+            if let (Some(run), Some(Entry { layer: Some((lp, x, y)), .. })) = (runs.last_mut(), self.cache.get(&obj.id)) {
+                let paint = PixmapPaint {
+                    opacity: obj.opacity.clamp(0.0, 1.0),
+                    blend_mode: BlendMode::SourceOver,
+                    quality: FilterQuality::Nearest,
+                };
+                run.layer.draw_pixmap(*x, *y, lp.as_ref(), &paint, Transform::identity(), None);
+            }
+        }
+        if runs.is_empty() && !doc_looks.is_empty() {
+            // an empty page still gets its paper look
+            runs.push(crate::npr::LookRun { layer: Pixmap::new(w, h).expect("run layer"), looks: doc_looks, base: true });
+        }
+        runs
+    }
+
     /// One object's finished layer (with shadow and glow) and its top-left position.
     pub fn object_layer(&mut self, obj: &Object, dw: u32, dh: u32) -> Option<(Pixmap, i32, i32)> {
         self.ensure(obj, dw, dh);

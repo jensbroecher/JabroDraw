@@ -553,3 +553,61 @@ fn svg_keeps_plain_shapes_as_vectors() {
     assert_eq!(svg.matches("<image").count(), 1, "beveled ball embedded as a picture");
     assert!(svg.contains("data:image/png;base64,"));
 }
+
+// ------------------------------------------------------------------ per-object looks
+
+fn saturation_at(pm: &tiny_skia::Pixmap, x: u32, y: u32) -> i32 {
+    let c = pm.pixel(x, y).unwrap().demultiply();
+    let (r, g, b) = (c.red() as i32, c.green() as i32, c.blue() as i32);
+    r.max(g).max(b) - r.min(g).min(b)
+}
+
+fn two_red_boxes() -> Document {
+    let mut d = Document::new(240, 120);
+    for (i, x) in [(1, 20.0), (2, 140.0)] {
+        let mut o = Object::new(i, ShapeKind::Rect { corner: 0.0 }, x, 20.0, 80.0, 80.0);
+        o.fill.a = [220, 30, 30, 255];
+        d.objects.push(o);
+    }
+    d
+}
+
+fn compose_doc(d: &Document) -> tiny_skia::Pixmap {
+    let mut r = Renderer::default();
+    let runs = r.render_runs(d);
+    crate::npr::compose(&runs, d.width, d.height, d.background, 1.0)
+}
+
+#[test]
+fn an_object_can_stay_clean_under_a_document_look() {
+    let mut d = two_red_boxes();
+    d.npr.style = NprStyle::Pencil; // greyscale look
+    d.objects[1].npr_mode = NprMode::Off;
+    let out = compose_doc(&d);
+    assert!(saturation_at(&out, 60, 60) < 30, "box 1 is pencil-grey");
+    assert!(saturation_at(&out, 180, 60) > 150, "box 2 stays red");
+}
+
+#[test]
+fn an_object_can_have_its_own_look() {
+    let mut d = two_red_boxes();
+    d.objects[0].npr_mode = NprMode::Own;
+    d.objects[0].npr_own = NprSettings { style: NprStyle::Pencil, ..Default::default() };
+    assert_eq!(d.looks_for(&d.objects[1]), vec![], "no document look");
+    let out = compose_doc(&d);
+    assert!(saturation_at(&out, 60, 60) < 30, "box 1 sketched");
+    assert!(saturation_at(&out, 180, 60) > 150, "box 2 clean");
+    assert!(lum(&out, 120, 110) > 0.95, "page untouched far from the sketch");
+}
+
+#[test]
+fn looks_stack_on_top_of_each_other() {
+    let mut d = two_red_boxes();
+    d.npr.style = NprStyle::Watercolor;
+    let single = compose_doc(&d);
+    d.npr_stack.push(NprSettings { style: NprStyle::ComicInk, ..Default::default() });
+    assert_eq!(d.looks().len(), 2);
+    let stacked = compose_doc(&d);
+    let diff = single.data().iter().zip(stacked.data()).filter(|(a, b)| (**a as i32 - **b as i32).abs() > 20).count();
+    assert!(diff > 1000, "the second look changes the picture ({diff})");
+}

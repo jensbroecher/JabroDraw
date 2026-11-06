@@ -305,15 +305,49 @@ pub fn demo_document() -> Document {
     d
 }
 
+/// "mixed": watercolor + ink outlines for the page, a clean title and an oil-painted star.
+pub fn mixed_looks(doc: &mut Document) {
+    doc.npr.style = NprStyle::Watercolor;
+    doc.npr_stack = vec![NprSettings {
+        style: NprStyle::ComicInk,
+        strength: 0.55,
+        brush: 0.2,
+        paper: 0.0,
+        ..Default::default()
+    }];
+    for o in &mut doc.objects {
+        match o.name.as_str() {
+            "Title" => o.npr_mode = NprMode::Off,
+            "Chrome star" => {
+                o.npr_mode = NprMode::Own;
+                o.npr_own = NprSettings {
+                    style: NprStyle::OilPaint,
+                    brush: 0.5,
+                    ..Default::default()
+                };
+            }
+            _ => {}
+        }
+    }
+}
+
 pub fn render_demo_to_png(path: &str, style: &str) -> Result<(), String> {
     let mut doc = demo_document();
-    let style = NprStyle::from_name(style).ok_or_else(|| format!("unknown style '{style}'"))?;
-    doc.npr.style = style;
+    if style == "mixed" {
+        mixed_looks(&mut doc);
+    } else {
+        doc.npr.style = NprStyle::from_name(style).ok_or_else(|| format!("unknown style '{style}'"))?;
+    }
     let mut r = Renderer::default();
     let t0 = std::time::Instant::now();
     let pm = r.render(&doc);
     let t1 = t0.elapsed();
-    let out = npr::apply(&pm, &doc.npr);
+    let out = if doc.any_look() {
+        let runs = r.render_runs(&doc);
+        npr::compose(&runs, doc.width, doc.height, doc.background, 1.0)
+    } else {
+        pm
+    };
     println!("render {:?}, npr {:?}", t1, t0.elapsed() - t1);
     out.save_png(path).map_err(|e| e.to_string())
 }

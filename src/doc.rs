@@ -631,6 +631,11 @@ pub struct Object {
     /// Linked clones share an instance id: editing one updates all of them.
     #[serde(default)]
     pub instance_of: Option<u64>,
+    /// How the NPR look treats this object: like the document, not at all, or its own look.
+    #[serde(default)]
+    pub npr_mode: NprMode,
+    #[serde(default)]
+    pub npr_own: NprSettings,
     #[serde(skip)]
     pub rev: u64,
 }
@@ -657,6 +662,8 @@ impl Object {
             paint_is_original: false,
             group: None,
             instance_of: None,
+            npr_mode: NprMode::Inherit,
+            npr_own: NprSettings::default(),
             rev: next_rev(),
         }
     }
@@ -775,6 +782,8 @@ impl Object {
             && self.transparency == o.transparency
             && self.original == o.original
             && self.opacity == o.opacity
+            && self.npr_mode == o.npr_mode
+            && self.npr_own == o.npr_own
             && same(&self.paint, &o.paint)
             && same(&self.mask, &o.mask)
     }
@@ -788,6 +797,8 @@ impl Object {
         self.transparency = src.transparency.clone();
         self.original = src.original.clone();
         self.opacity = src.opacity;
+        self.npr_mode = src.npr_mode;
+        self.npr_own = src.npr_own.clone();
         self.paint = src.paint.clone();
         self.mask = src.mask.clone();
     }
@@ -813,8 +824,58 @@ impl Object {
             && self.group == o.group
             && self.instance_of == o.instance_of
             && self.opacity == o.opacity
+            && self.npr_mode == o.npr_mode
+            && self.npr_own == o.npr_own
             && self.visible == o.visible
             && paint_same
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum NprMode {
+    /// Painted with the document's look.
+    #[default]
+    Inherit,
+    /// Stays clean even when the document has a look.
+    Off,
+    /// Painted with its own look.
+    Own,
+}
+
+impl NprMode {
+    pub const ALL: [NprMode; 3] = [NprMode::Inherit, NprMode::Off, NprMode::Own];
+    pub fn label(self) -> &'static str {
+        match self {
+            NprMode::Inherit => "Document look",
+            NprMode::Off => "No look (stay clean)",
+            NprMode::Own => "Its own look",
+        }
+    }
+}
+
+impl Document {
+    /// The looks the document paints with (main look first, then the stack), ignoring "None".
+    pub fn looks(&self) -> Vec<NprSettings> {
+        std::iter::once(&self.npr)
+            .chain(&self.npr_stack)
+            .filter(|s| s.style != NprStyle::None && s.strength > 0.0)
+            .cloned()
+            .collect()
+    }
+
+    /// The looks a given object is painted with.
+    pub fn looks_for(&self, o: &Object) -> Vec<NprSettings> {
+        match o.npr_mode {
+            NprMode::Inherit => self.looks(),
+            NprMode::Off => Vec::new(),
+            NprMode::Own if o.npr_own.style != NprStyle::None => vec![o.npr_own.clone()],
+            NprMode::Own => Vec::new(),
+        }
+    }
+
+    /// Is any look painted anywhere?
+    pub fn any_look(&self) -> bool {
+        !self.looks().is_empty() || self.objects.iter().any(|o| o.visible && !self.looks_for(o).is_empty())
     }
 }
 
@@ -918,6 +979,9 @@ pub struct Document {
     pub next_id: u64,
     #[serde(default)]
     pub guides: Vec<Guide>,
+    /// Further looks painted on top of `npr` (e.g. ink outlines over watercolor).
+    #[serde(default)]
+    pub npr_stack: Vec<NprSettings>,
 }
 
 impl Document {
@@ -931,6 +995,7 @@ impl Document {
             npr: NprSettings::default(),
             next_id: 1,
             guides: Vec::new(),
+            npr_stack: Vec::new(),
         }
     }
 
@@ -958,6 +1023,7 @@ impl Document {
             && self.background == o.background
             && self.npr == o.npr
             && self.guides == o.guides
+            && self.npr_stack == o.npr_stack
             && self.objects.len() == o.objects.len()
             && self
                 .objects

@@ -17,6 +17,11 @@ hybrid editors such as Real-DRAW PRO (an independent program — no code or asse
 | **Impressionist** | **Pencil** | **Comic ink** |
 | ![](docs/look-impressionist.png) | ![](docs/look-pencil.png) | ![](docs/look-comic.png) |
 
+**Mixed looks in one picture:** watercolor with ink outlines for the page, the title kept clean,
+and the star oil-painted on its own.
+
+![](docs/look-mixed.png)
+
 ## Build & run
 
 Requires Rust (stable) and, on Windows, the MSVC build tools.
@@ -78,6 +83,10 @@ Styles: `none watercolor oil impressionist pointillism pencil colorpencil comic`
   the match, and Alt bypasses snapping. **Rulers**: drag from a ruler to make a guide, drop it back
   to remove it. **Arrange** (properties panel): align left, centre, right, top, middle or bottom (a
   single object aligns to the canvas), and give 3+ objects equal spacing.
+- **NPR per object and stacked looks**: every object can follow the document's look, stay clean, or
+  get its own look (properties › NPR look). The look bar can layer up to three looks, such as
+  watercolor washes with comic-ink outlines on top. Strokes spill slightly past an object's edges,
+  like real paint.
 - **Never lose work**: unsaved changes are written to a recovery file every minute, in the
   background. If Jabro Draw is closed unexpectedly, the next start offers to recover the drawing.
   File › **Open recent** lists the last 10 files.

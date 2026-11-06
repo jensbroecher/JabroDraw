@@ -117,13 +117,13 @@ pub fn prepare(doc: &Document, ids: Option<&[u64]>, k: f32) -> Result<Document, 
 /// Finished raster picture.
 pub fn render(doc: &Document, ids: Option<&[u64]>, opts: &Options) -> Result<Pixmap, String> {
     let d = prepare(doc, ids, opts.scale)?;
-    let pm = Renderer::default().render_opts(&d, !opts.transparent);
-    if !(opts.npr && d.npr.style != NprStyle::None) {
+    let mut r = Renderer::default();
+    let pm = r.render_opts(&d, !opts.transparent);
+    if !(opts.npr && d.any_look()) {
         return Ok(pm);
     }
-    let mut s = d.npr.clone();
-    s.px_scale = opts.scale;
-    let mut out = npr::apply(&pm, &s);
+    let runs = r.render_runs(&d);
+    let mut out = npr::compose(&runs, d.width, d.height, d.background, opts.scale);
     if opts.transparent {
         // the look is painted on white paper; keep the original transparency
         for (o, src) in out.data_mut().chunks_exact_mut(4).zip(pm.data().chunks_exact(4)) {

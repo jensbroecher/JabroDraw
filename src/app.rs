@@ -316,6 +316,24 @@ fn doc_to_layer(obj: &Object, p: Pt, lw: u32, lh: u32) -> Option<((f32, f32), f3
     Some((((lx * kx) as f32, (ly * ky) as f32), ((sx + sy) * 0.5) as f32))
 }
 
+/// Style, strength, brush size, paper and a "Vary" button for one look.
+fn look_controls(ui: &mut egui::Ui, id: impl std::hash::Hash, s: &mut NprSettings) {
+    egui::ComboBox::from_id_salt(id).selected_text(s.style.label()).show_ui(ui, |ui| {
+        for st in NprStyle::ALL {
+            ui.selectable_value(&mut s.style, st, st.label());
+        }
+    });
+    if s.style == NprStyle::None {
+        return;
+    }
+    ui.add(egui::Slider::new(&mut s.strength, 0.0..=1.0).text("Strength"));
+    ui.add(egui::Slider::new(&mut s.brush, 0.0..=1.0).text("Brush"));
+    ui.add(egui::Slider::new(&mut s.paper, 0.0..=1.0).text("Paper"));
+    if ui.small_button("Vary").on_hover_text("New random seed for the strokes").clicked() {
+        s.seed = s.seed.wrapping_add(1);
+    }
+}
+
 fn pct_slider(v: &mut f32) -> egui::Slider<'_> {
     egui::Slider::new(v, 0.0..=1.0).custom_formatter(|n, _| format!("{:.0}%", n * 100.0))
 }
@@ -1334,7 +1352,7 @@ impl JabroApp {
         let mut go = false;
         let mut cancel = false;
         let has_sel = self.selected.is_some();
-        let has_look = self.doc.npr.style != NprStyle::None;
+        let has_look = self.doc.any_look();
         egui::Window::new("Export")
             .open(&mut open)
             .collapsible(false)
@@ -1459,28 +1477,29 @@ impl JabroApp {
             self.upload(ctx, &pm);
             self.raw = Some(pm);
             self.dirty = false;
-            self.npr_pending = self.npr_preview && self.doc.npr.style != NprStyle::None;
+            self.npr_pending = self.npr_preview && self.doc.any_look();
             if !self.npr_pending {
                 self.npr_busy = false;
             }
         }
         let pointer_down = ctx.input(|i| i.pointer.any_down());
         if self.npr_pending && !pointer_down {
-            if let Some(raw) = &self.raw {
-                self.worker.submit(NprJob {
-                    gen: self.gen,
-                    img: raw.clone(),
-                    settings: self.doc.npr.clone(),
-                });
-                self.npr_busy = true;
-            }
+            let runs = self.renderer.render_runs(&self.doc);
+            self.worker.submit(NprJob {
+                gen: self.gen,
+                runs,
+                w: self.doc.width,
+                h: self.doc.height,
+                bg: self.doc.background,
+            });
+            self.npr_busy = true;
             self.npr_pending = false;
         }
     }
 
     fn poll_npr(&mut self, ctx: &egui::Context) {
         while let Ok(res) = self.worker.rx.try_recv() {
-            if res.gen == self.gen && self.npr_preview && self.doc.npr.style != NprStyle::None {
+            if res.gen == self.gen && self.npr_preview && self.doc.any_look() {
                 self.upload(ctx, &res.img);
                 self.npr_busy = false;
             }
@@ -3542,30 +3561,44 @@ impl JabroApp {
     }
 
     fn look_bar(&mut self, ui: &mut egui::Ui) {
-        let before = self.doc.npr.clone();
+        let before = (self.doc.npr.clone(), self.doc.npr_stack.clone());
         let preview_before = self.npr_preview;
         ui.horizontal(|ui| {
             ui.strong("NPR look");
-            egui::ComboBox::from_id_salt("npr_style")
-                .selected_text(self.doc.npr.style.label())
-                .show_ui(ui, |ui| {
-                    for s in NprStyle::ALL {
-                        ui.selectable_value(&mut self.doc.npr.style, s, s.label());
-                    }
-                });
-            ui.add(egui::Slider::new(&mut self.doc.npr.strength, 0.0..=1.0).text("Strength"));
-            ui.add(egui::Slider::new(&mut self.doc.npr.brush, 0.0..=1.0).text("Brush size"));
-            ui.add(egui::Slider::new(&mut self.doc.npr.paper, 0.0..=1.0).text("Paper"));
-            if ui.button("Vary").on_hover_text("New random seed for the strokes").clicked() {
-                self.doc.npr.seed = self.doc.npr.seed.wrapping_add(1);
-            }
+            look_controls(ui, "npr_main", &mut self.doc.npr);
             ui.checkbox(&mut self.npr_preview, "Preview");
             if self.npr_busy {
                 ui.spinner();
                 ui.label("painting…");
             }
         });
-        if before != self.doc.npr || preview_before != self.npr_preview {
+        let mut remove = None;
+        for (i, look) in self.doc.npr_stack.iter_mut().enumerate() {
+            ui.horizontal(|ui| {
+                ui.label("   then");
+                look_controls(ui, ("npr_stack", i), look);
+                if ui.small_button("✕").on_hover_text("Remove this look").clicked() {
+                    remove = Some(i);
+                }
+            });
+        }
+        if let Some(i) = remove {
+            self.doc.npr_stack.remove(i);
+        }
+        if self.doc.npr.style != NprStyle::None
+            && self.doc.npr_stack.len() < 3
+            && ui
+                .small_button("+ Add a look on top")
+                .on_hover_text("Layer looks, e.g. Comic ink outlines over a Watercolor")
+                .clicked()
+        {
+            self.doc.npr_stack.push(NprSettings {
+                style: NprStyle::ComicInk,
+                strength: 0.6,
+                ..Default::default()
+            });
+        }
+        if before != (self.doc.npr.clone(), self.doc.npr_stack.clone()) || preview_before != self.npr_preview {
             self.dirty = true;
         }
     }
@@ -5152,6 +5185,21 @@ fn object_props(
         });
         ui.small("Or use the Lights tool (L): click on the object to place a light, drag it to move or aim it.");
     });
+
+    egui::CollapsingHeader::new("NPR look")
+        .default_open(obj.npr_mode != NprMode::Inherit)
+        .show(ui, |ui| {
+            for m in NprMode::ALL {
+                ui.radio_value(&mut obj.npr_mode, m, m.label());
+            }
+            if obj.npr_mode == NprMode::Own {
+                if obj.npr_own.style == NprStyle::None {
+                    obj.npr_own.style = NprStyle::Pencil;
+                }
+                ui.horizontal_wrapped(|ui| look_controls(ui, ("obj_npr", obj.id), &mut obj.npr_own));
+            }
+            ui.small("Mix looks in one picture: a clean logo on a watercolor, a pencil-sketched object on a photo…");
+        });
 
     egui::CollapsingHeader::new("Drop shadow").default_open(false).show(ui, |ui| {
         let s = &mut obj.effects.shadow;

@@ -2,7 +2,7 @@
 //! watercolor, oil, impressionist strokes, pointillism, pencil, colored pencil, comic ink.
 //! Runs on a background worker thread so the UI stays responsive.
 
-use crate::doc::{NprSettings, NprStyle};
+use crate::doc::{NprSettings, NprStyle, Rgba};
 use crate::raster::gaussian;
 use crate::textures::{fbm, rand01, smoothstep, value_noise, Rng};
 use std::sync::mpsc::{channel, Receiver, Sender};
@@ -594,10 +594,65 @@ pub fn apply(src: &Pixmap, s: &NprSettings) -> Pixmap {
     mixed.to_pixmap()
 }
 
+/// Consecutive objects (bottom to top) that are painted with the same looks.
+pub struct LookRun {
+    /// The run's objects on a transparent, canvas-sized layer.
+    pub layer: Pixmap,
+    pub looks: Vec<NprSettings>,
+    /// The bottom run in the document's look: it also paints the page (paper) itself.
+    pub base: bool,
+}
+
+/// Paint every run with its looks and stack them. Outside a run (plus a little spill, like
+/// real paint) the picture underneath stays as it was, so a clean logo can sit on a watercolor
+/// and a pencil-sketched object can sit on a clean photo.
+pub fn compose(runs: &[LookRun], w: u32, h: u32, bg: Rgba, px_scale: f32) -> Pixmap {
+    let mut canvas = Pixmap::new(w.max(1), h.max(1)).expect("canvas");
+    canvas.fill(Color::from_rgba8(bg[0], bg[1], bg[2], 255));
+    let over = tiny_skia::PixmapPaint::default();
+    for run in runs {
+        let mut with = canvas.clone();
+        with.draw_pixmap(0, 0, run.layer.as_ref(), &over, Transform::identity(), None);
+        if run.looks.is_empty() {
+            canvas = with;
+            continue;
+        }
+        let mut styled = with.clone();
+        for look in &run.looks {
+            let mut l = look.clone();
+            l.px_scale = px_scale;
+            styled = apply(&styled, &l);
+        }
+        if run.base {
+            canvas = styled;
+            continue;
+        }
+        let brush = run.looks.iter().map(|l| l.brush).fold(0.0, f32::max);
+        let spread = (2.0 + 6.0 * brush) * px_scale;
+        let (wu, hu) = (w as usize, h as usize);
+        let alpha = crate::raster::alpha_of(&run.layer);
+        let mut m = alpha.clone();
+        gaussian(&mut m, wu, hu, spread, false);
+        let out = with.data().to_vec();
+        let st = styled.data();
+        let dst = canvas.data_mut();
+        for i in 0..wu * hu {
+            let k = (m[i] * 2.5).min(1.0).max(alpha[i]);
+            for c in 0..4 {
+                let p = i * 4 + c;
+                dst[p] = (out[p] as f32 * (1.0 - k) + st[p] as f32 * k + 0.5) as u8;
+            }
+        }
+    }
+    canvas
+}
+
 pub struct NprJob {
     pub gen: u64,
-    pub img: Pixmap,
-    pub settings: NprSettings,
+    pub runs: Vec<LookRun>,
+    pub w: u32,
+    pub h: u32,
+    pub bg: Rgba,
 }
 
 pub struct NprResult {
@@ -620,7 +675,7 @@ impl NprWorker {
                 while let Ok(newer) = jrx.try_recv() {
                     job = newer;
                 }
-                let img = apply(&job.img, &job.settings);
+                let img = compose(&job.runs, job.w, job.h, job.bg, 1.0);
                 if rtx.send(NprResult { gen: job.gen, img }).is_err() {
                     break;
                 }
