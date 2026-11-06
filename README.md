@@ -1,15 +1,30 @@
-# Jabro Draw
+<p align="center">
+  <img src="assets/icon-256.png" width="112" alt="Jabro Draw icon">
+</p>
 
-A hybrid **vector + paint** graphics editor written in Rust, inspired by the workflow of classic
-hybrid editors such as Real-DRAW PRO (an independent program — no code or assets are shared):
+<h1 align="center">Jabro Draw</h1>
 
-- draw **vector shapes and text** that stay editable
-- give them **materials**: bevels (round, chisel, cove, ridge, pillow), gloss, chrome reflection,
-  procedural textures (wood, marble, stone, canvas, clouds…), drop shadows and glows
-- **paint on them** with brushes. The paint is clipped to the shape and stays attached to it.
-- bend any object into **perspective** by dragging its corners, and the paint follows
-- render the whole picture through an **NPR look**: watercolor, oil paint, impressionist
-  strokes, pointillism, pencil, colored pencil or comic ink
+<p align="center">
+  <b>Vector shapes you can paint on.</b><br>
+  A hybrid vector + paint editor for Windows, written in Rust: bevels, textures, 3D, perspective,
+  painterly looks and offline AI tools in one program.
+</p>
+
+Jabro Draw keeps the playful workflow of classic hybrid editors such as Real-DRAW PRO alive in a
+modern 64-bit program. It is an independent project, and no code or assets are shared with any
+other program.
+
+- Draw **vector shapes and text** that stay editable.
+- Give them **materials**: bevels (round, chisel, cove, ridge, pillow), gloss, chrome reflection,
+  procedural textures (wood, marble, stone, canvas, clouds…), lights, drop shadows, glows and
+  **3D extrusion**.
+- **Paint on them** with brushes. The paint is clipped to the shape and stays attached to it.
+- Bend any object into **perspective**, warp or liquify it, and the paint follows.
+- Render the whole picture through an **NPR look**: watercolor, oil paint, impressionist
+  strokes, pointillism, pencil, colored pencil or comic ink.
+
+> **Status:** early preview (0.1). Everything described here works, but expect rough edges.
+> Bug reports and ideas are welcome in the issues.
 
 | Clean | Watercolor | Oil |
 |---|---|---|
@@ -22,7 +37,36 @@ and the star oil-painted on its own.
 
 ![](docs/look-mixed.png)
 
-## Build & run
+## Highlights
+
+- **Vector tools**: pen with Bézier curves, node editing, union / subtract / intersect / exclude,
+  text with spacing, alignment, arcs and **text on a path**, and a library of ready-made shapes.
+- **Painting**: round, airbrush, chalk, smudge and eraser brushes, wet **watercolor** that pools
+  and mixes, a **scatter** brush for leaves, grass and stars, and **symmetry** painting (mirror,
+  4-way, radial, kaleidoscope).
+- **Pictures with offline AI**: background removal, **click-to-select** an object in a photo,
+  **2× / 4× enlarging** with real detail, and **trace to vectors**. The AI models are built into the
+  program and run on your own computer.
+- **Animation**: keyframes for position, size, rotation, perspective and opacity, exported as
+  an animated GIF or PNG frames, plus a **painting time-lapse** of your work.
+- **Files**: opens PNG, JPEG, WebP, JPEG XL, QOI, BMP, GIF, TIFF, TGA and ICO, plus HEIC, AVIF
+  and camera RAW through Windows' own codecs. Exports PNG, JPEG, WebP, AVIF, SVG and layered PSD
+  at up to 8× resolution.
+
+**Private by design:** Jabro Draw never connects to the internet. Your pictures stay on your
+computer, and there is no account, telemetry or update check.
+
+## Download
+
+Jabro Draw runs on 64-bit Windows (it is developed and tested on Windows 11).
+
+1. Download `Jabro-Draw-<version>-Setup.exe` from the [Releases](../../releases) page.
+2. Run it. Windows may say "Windows protected your PC" because the installer is not signed with a
+   paid certificate: click **More info → Run anyway**.
+3. It installs for your user only, without admin rights, and adds Start menu and desktop
+   shortcuts and the `.jabro` file type. Uninstall it from **Settings › Apps**.
+
+## Build from source
 
 Requires Rust (stable) and, on Windows, the MSVC build tools.
 
@@ -30,7 +74,9 @@ Requires Rust (stable) and, on Windows, the MSVC build tools.
 cargo run --release
 ```
 
-To make an installer you can send to someone (`distJabro-Draw-<version>-Setup.exe`, which
+The first build downloads the AI models once (see [Licenses](#licenses)).
+
+To make an installer you can send to someone (`dist\Jabro-Draw-<version>-Setup.exe`, which
 installs per user without admin rights and adds Start menu entries, an uninstaller and the
 `.jabro` file type):
 
@@ -175,9 +221,13 @@ and the roadmap.
 ## Licenses
 
 Jabro Draw has no license chosen yet (all rights reserved by its author). The open-source parts it
-is built from, including the embedded U²-Net AI model, are listed with their licenses in
-[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md). Ship that file and the `licenses/` folder with
-every copy of the program you distribute.
+is built from, including the embedded AI models (U²-Net, MobileSAM and Real-ESRGAN), are listed
+with their licenses in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md). Ship that file and the
+`licenses/` folder with every copy of the program you distribute.
 
-The AI model files (176 MB) are too big for git. The first build downloads them once from the
-rembg project and verifies their checksums (`crates/jabro-models/build.rs`).
+The AI model files (about 230 MB) are too big for git. The first build downloads them once from
+their publishers (the rembg project on GitHub, MobileSAM and Real-ESRGAN on Hugging Face) and
+verifies their checksums (`crates/jabro-models/build.rs`).
+
+Real-DRAW is a name of Mediachance, used here only to describe where the idea comes from. Jabro
+Draw is not affiliated with or endorsed by Mediachance.
